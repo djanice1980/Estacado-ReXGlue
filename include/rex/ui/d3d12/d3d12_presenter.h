@@ -18,6 +18,8 @@
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_submission_tracker.h>
+#include <rex/ui/host_frame_limiter.h>
+#include <rex/ui/present_statistics.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/surface.h>
 
@@ -101,8 +103,13 @@ class D3D12Presenter final : public Presenter {
                               uint32_t frontbuffer_height,
                               std::function<bool(GuestOutputRefreshContext& context)> refresher,
                               bool& is_8bpc_out) override;
+  // Signals the refresher submission on the direct queue; runs after all the
+  // refresher's command lists have been queued (inline or deferred).
+  void CompleteGuestOutputRefreshImpl(uint32_t mailbox_index) override;
 
   PaintResult PaintAndPresentImpl(bool execute_ui_drawers) override;
+  // display_present_gpu_timing: accumulates the slot's completed paint.
+  void ReadPaintGpuTiming(size_t paint_slot);
 
  private:
   struct GuestOutputPaintRectangleConstants {
@@ -132,12 +139,10 @@ class D3D12Presenter final : public Presenter {
 
   enum GuestOutputPaintRootSignatureIndex : size_t {
     kGuestOutputPaintRootSignatureIndexBilinear,
-#if defined(REX_HAS_FIDELITYFX_SDK)
     kGuestOutputPaintRootSignatureIndexCasSharpen,
     kGuestOutputPaintRootSignatureIndexCasResample,
     kGuestOutputPaintRootSignatureIndexFsrEasu,
     kGuestOutputPaintRootSignatureIndexFsrRcas,
-#endif
 
     kGuestOutputPaintRootSignatureCount,
   };
@@ -148,7 +153,6 @@ class D3D12Presenter final : public Presenter {
       case GuestOutputPaintEffect::kBilinear:
       case GuestOutputPaintEffect::kBilinearDither:
         return kGuestOutputPaintRootSignatureIndexBilinear;
-#if defined(REX_HAS_FIDELITYFX_SDK)
       case GuestOutputPaintEffect::kCasSharpen:
       case GuestOutputPaintEffect::kCasSharpenDither:
         return kGuestOutputPaintRootSignatureIndexCasSharpen;
@@ -160,7 +164,6 @@ class D3D12Presenter final : public Presenter {
       case GuestOutputPaintEffect::kFsrRcas:
       case GuestOutputPaintEffect::kFsrRcasDither:
         return kGuestOutputPaintRootSignatureIndexFsrRcas;
-#endif
       default:
         assert_unhandled_case(effect);
         return kGuestOutputPaintRootSignatureCount;
@@ -220,6 +223,19 @@ class D3D12Presenter final : public Presenter {
         command_allocators;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> command_list;
 
+    // display_present_gpu_timing (diagnostic, off by default): two timestamps
+    // around each paint submission, read back when its allocator is reused.
+    Microsoft::WRL::ComPtr<ID3D12QueryHeap> timing_query_heap;
+    Microsoft::WRL::ComPtr<ID3D12Resource> timing_readback;
+    UINT64 timing_frequency = 0;
+    std::array<bool, kSwapChainBufferCount> timing_written{};
+    std::array<uint32_t, kSwapChainBufferCount> timing_effect_counts{};
+    uint64_t timing_ticks = 0;
+    uint64_t timing_max_ticks = 0;
+    uint32_t timing_paints = 0;
+    uint32_t timing_effect_count = 0;
+    uint64_t timing_window_start_ms = 0;
+
     // Descriptor heaps for views of the current resources related to the guest
     // output and to painting, updated either during painting or during
     // connection lifetime management if outdated after awaiting usage
@@ -251,6 +267,7 @@ class D3D12Presenter final : public Presenter {
     uint32_t swap_chain_width = 0;
     uint32_t swap_chain_height = 0;
     bool swap_chain_allows_tearing = false;
+    uint32_t swap_chain_maximum_frame_latency = 0;
     Microsoft::WRL::ComPtr<IDXGISwapChain3> swap_chain;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kSwapChainBufferCount> swap_chain_buffers;
   };
@@ -311,6 +328,11 @@ class D3D12Presenter final : public Presenter {
   // DisconnectPaintingFromSurfaceFromUIThreadImpl) by the thread doing it, as
   // well as by presenter initialization and shutdown.
   PaintContext paint_context_;
+  HostFrameLimiter host_frame_limiter_;
+  // display_present_statistics (test launches): displayed images and missed
+  // refreshes from swap-chain frame statistics, logged every half second.
+  void RecordPresentStatistics(uint32_t sync_interval);
+  PresentStatisticsWindow present_statistics_;
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   void* temporal_upscaler_context_ = nullptr;

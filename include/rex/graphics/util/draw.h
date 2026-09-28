@@ -508,6 +508,11 @@ struct ResolveInfo {
   uint32_t copy_dest_extent_start;
   uint32_t copy_dest_extent_length;
 
+  // CPU-only, pre-base-adjustment destination rectangle. Scaled storage page
+  // bounds are not sufficient to distinguish native/scaled regions in an atlas.
+  uint32_t copy_dest_original_base;
+  uint32_t copy_dest_rect[4];  // left, top, right, bottom in guest texels
+
   // The clear shaders always write to a uint4 view of EDRAM.
   uint32_t rb_depth_clear;
   uint32_t rb_color_clear;

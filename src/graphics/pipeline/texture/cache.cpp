@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdint>
 #include <utility>
 
@@ -19,6 +20,8 @@
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/cache.h>
+#include <rex/graphics/pipeline/render_target/native_shader_scale_policy.h>
+#include <rex/graphics/pipeline/texture/scaled_resolve_util.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
@@ -26,6 +29,11 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 
+// A texture fetch constant rewritten with the same six words keeps its binding
+// (key, swizzle, signs and textures depend only on it; outdated textures still
+// reset every binding). Read per draw, so it can be switched live.
+REXCVAR_DEFINE_BOOL(gpu_texture_binding_memo, false, "GPU",
+                    "Keep texture bindings whose fetch constant was rewritten unchanged");
 REXCVAR_DEFINE_INT32(texture_cache_memory_limit_render_to_texture, 24, "GPU",
                      "Texture cache memory limit for render-to-texture (MB)")
     .range(1, 256)
@@ -64,21 +72,29 @@ REXCVAR_DEFINE_INT32(anisotropic_override, 3, "GPU",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_INT32(draw_resolution_scale_x, 1, "GPU", "Draw resolution scale X (1 = no scaling)")
-    .range(1, 8)
+    .range(1, int32_t(rex::graphics::TextureCache::kMaxDrawResolutionScaleAlongAxis))
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_INT32(draw_resolution_scale_y, 1, "GPU", "Draw resolution scale Y (1 = no scaling)")
-    .range(1, 8)
+    .range(1, int32_t(rex::graphics::TextureCache::kMaxDrawResolutionScaleAlongAxis))
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_INT32(resolution_scale, 1, "GPU",
                      "Draw resolution scale for both X and Y axes (same as setting "
                      "draw_resolution_scale_x and draw_resolution_scale_y)")
-    .range(1, 8)
+    .range(1, int32_t(rex::graphics::TextureCache::kMaxDrawResolutionScaleAlongAxis))
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
                     "Pre-mask scaled resolve L2 blocks to the write range before iterating");
+
+REXCVAR_DEFINE_BOOL(native_resolve_region_tracking, false, "GPU",
+                    "Track exact native-authored atlas regions separately from scaled storage")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(native_resolve_region_sampling, false, "GPU",
+                    "Reconstruct proven native regions within mixed 2x resolve textures")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 // DEFINE_int32(
 //     draw_resolution_scale_x, 1,
@@ -126,6 +142,38 @@ REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
 //     "GPU");
 
 namespace rex::graphics {
+
+constexpr bool kPromptTextureDiagnosticsEnabled = false;
+
+bool TextureCache::IsPromptBackgroundDiagnosticTexture(const Texture& texture) {
+  const TextureKey& key = texture.key();
+  return kPromptTextureDiagnosticsEnabled &&
+         key.format == xenos::TextureFormat::k_DXT1 && key.tiled &&
+         key.dimension == xenos::DataDimension::k2DOrStacked && key.GetWidth() == 512 &&
+         key.GetHeight() == 191;
+}
+
+void TextureCache::RecordPromptBackgroundTextureLifecycle(
+    SharedMemory::TextureLifecycleDiagnosticEventType type, const Texture& texture,
+    bool load_base, bool load_mips, bool hash_source) const {
+  if (!IsPromptBackgroundDiagnosticTexture(texture)) {
+    return;
+  }
+  const uint32_t base = texture.key().base_page << 12;
+  const uint32_t bytes = texture.GetGuestBaseSize();
+  // The 512x191 tiled DXT1 image touches [0, 0xF800) of the 64 KiB guest
+  // allocation. Keep write-order diagnostics scoped to bytes that can affect
+  // the decoded image so unrelated allocator padding writes can't flood the
+  // bounded lifecycle trace.
+  constexpr uint32_t kPromptBackgroundGuestSourceSpan = 0xF800;
+  shared_memory().BeginTextureLifecycleDiagnostic(
+      base, std::min(bytes, kPromptBackgroundGuestSourceSpan));
+  const uint64_t flags = uint64_t(texture.outdated_mask()) |
+                         (uint64_t(load_base ? 1u : 0u) << 32) |
+                         (uint64_t(load_mips ? 1u : 0u) << 33);
+  shared_memory().RecordTextureLifecycleDiagnosticEvent(type, base, bytes, flags, 0,
+                                                        hash_source);
+}
 
 const TextureCache::LoadShaderInfo TextureCache::load_shader_info_[kLoadShaderCount] = {
     // k8bpb
@@ -212,9 +260,15 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
   assert_true(draw_resolution_scale_y <= kMaxDrawResolutionScaleAlongAxis);
 
   if (draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1) {
+    constexpr uint32_t kScaledResolvePageCount =
+        SharedMemory::kBufferSize / 4096;
     constexpr uint32_t kScaledResolvePageDwordCount = SharedMemory::kBufferSize / 4096 / 32;
     scaled_resolve_pages_ = std::unique_ptr<uint32_t[]>(new uint32_t[kScaledResolvePageDwordCount]);
     std::memset(scaled_resolve_pages_.get(), 0, kScaledResolvePageDwordCount * sizeof(uint32_t));
+    scaled_resolve_page_layouts_ =
+        std::unique_ptr<uint8_t[]>(new uint8_t[kScaledResolvePageCount]);
+    std::memset(scaled_resolve_page_layouts_.get(), 0,
+                kScaledResolvePageCount * sizeof(uint8_t));
     std::memset(scaled_resolve_pages_l2_, 0, sizeof(scaled_resolve_pages_l2_));
     scaled_resolve_global_watch_handle_ =
         shared_memory.RegisterGlobalWatch(ScaledResolveGlobalWatchCallbackThunk, this);
@@ -247,6 +301,8 @@ bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out
 
 void TextureCache::ClearCache() {
   DestroyAllTextures();
+  auto lock = global_critical_region_.Acquire();
+  native_resolve_regions_.Clear();
 }
 
 void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_index) {
@@ -314,19 +370,60 @@ void TextureCache::BeginFrame() {
   ResetTextureBindings();
 }
 
-void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled) {
+void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled,
+                                       uint32_t length_unscaled,
+                                       uint32_t bytes_per_block_log2,
+                                       bool resolution_scaled,
+                                       const native_resolve::Write* exact_write) {
   if (length_unscaled == 0) {
     return;
   }
+  assert_true(bytes_per_block_log2 <= 4);
   start_unscaled &= 0x1FFFFFFF;
   length_unscaled = std::min(length_unscaled, 0x20000000 - start_unscaled);
+
+  // Keep exact provenance and its write notification atomic. The mutex is the
+  // same recursive global lock used by SharedMemory and CPU write callbacks.
+  auto provenance_lock = global_critical_region_.AcquireDeferred();
+  const bool tracking = IsDrawResolutionScaled() &&
+                        REXCVAR_GET(native_resolve_region_tracking);
+  if (tracking) {
+    provenance_lock.lock();
+    if (exact_write && exact_write->extent_start == start_unscaled &&
+        exact_write->extent_length == length_unscaled) {
+      native_resolve_regions_.Record(*exact_write, !resolution_scaled);
+    } else {
+      native_resolve_regions_.Invalidate(start_unscaled, length_unscaled);
+    }
+  }
 
   if (IsDrawResolutionScaled()) {
     uint32_t page_first = start_unscaled >> 12;
     uint32_t page_last = (start_unscaled + length_unscaled - 1) >> 12;
     uint32_t block_first = page_first >> 5;
     uint32_t block_last = page_last >> 5;
+    uint32_t mismatching_page_count = 0;
+    uint32_t first_mismatching_page = UINT32_MAX;
+    uint32_t first_old_bytes_per_block_log2 = UINT32_MAX;
+    const uint8_t new_layout_tag =
+        resolution_scaled ? uint8_t(bytes_per_block_log2 + 1) : 0;
     auto global_lock = global_critical_region_.Acquire();
+    for (uint32_t page = page_first; page <= page_last; ++page) {
+      const bool was_scaled =
+          (scaled_resolve_pages_[page >> 5] &
+           (UINT32_C(1) << (page & 31))) != 0;
+      const uint8_t old_layout_tag = scaled_resolve_page_layouts_[page];
+      if (resolution_scaled && was_scaled &&
+          old_layout_tag != new_layout_tag) {
+        ++mismatching_page_count;
+        if (first_mismatching_page == UINT32_MAX) {
+          first_mismatching_page = page;
+          first_old_bytes_per_block_log2 =
+              old_layout_tag ? uint32_t(old_layout_tag - 1) : UINT32_MAX;
+        }
+      }
+      scaled_resolve_page_layouts_[page] = new_layout_tag;
+    }
     for (uint32_t i = block_first; i <= block_last; ++i) {
       uint32_t add_bits = UINT32_MAX;
       if (i == block_first) {
@@ -335,14 +432,125 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
       if (i == block_last && (page_last & 31) != 31) {
         add_bits &= (UINT32_C(1) << ((page_last & 31) + 1)) - 1;
       }
-      scaled_resolve_pages_[i] |= add_bits;
-      scaled_resolve_pages_l2_[i >> 6] |= UINT64_C(1) << (i & 63);
+      if (resolution_scaled) {
+        scaled_resolve_pages_[i] |= add_bits;
+        scaled_resolve_pages_l2_[i >> 6] |= UINT64_C(1) << (i & 63);
+      } else {
+        // Native threshold resolves live in authoritative shared memory.
+        // Clear stale scaled ownership exactly like a CPU write watch does.
+        scaled_resolve_pages_[i] &= ~add_bits;
+        if (!scaled_resolve_pages_[i]) {
+          scaled_resolve_pages_l2_[i >> 6] &= ~(UINT64_C(1) << (i & 63));
+        }
+      }
+    }
+    if (mismatching_page_count) {
+      static uint64_t mismatch_ordinal = 0;
+      const uint64_t ordinal = ++mismatch_ordinal;
+      if (ordinal <= 16 || !(ordinal & (ordinal - 1))) {
+        std::fprintf(
+            stderr,
+            "REX_EMBEDDED_SCALED_RESOLVE_LAYOUT_OVERWRITE ordinal=%llu "
+            "start=0x%08X length=%u new_bpb_log2=%u mismatch_pages=%u "
+            "first_page=0x%05X old_bpb_log2=%u\n",
+            static_cast<unsigned long long>(ordinal), start_unscaled,
+            length_unscaled, bytes_per_block_log2,
+            mismatching_page_count, first_mismatching_page,
+            first_old_bytes_per_block_log2);
+        std::fflush(stderr);
+      }
     }
   }
 
   // Invalidate textures. Toggling individual textures between scaled and
   // unscaled also relies on invalidation through shared memory.
-  shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
+  shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled,
+      tracking ? scaled_resolve_global_watch_handle_ : nullptr);
+}
+
+bool TextureCache::IsNativeResolveSamplingEnabled() const {
+  return draw_resolution_scale_x() == 2 && draw_resolution_scale_y() == 2 &&
+         REXCVAR_GET(native_resolve_region_tracking) &&
+         REXCVAR_GET(native_resolve_region_sampling);
+}
+
+bool TextureCache::GetActiveNativeResolveRegion(
+    uint32_t index, native_resolve::Rect& out, bool for_sampling) {
+  out = {};
+  if (!IsDrawResolutionScaled() || !REXCVAR_GET(native_resolve_region_tracking)) return false;
+  if (for_sampling) {
+    if (!IsNativeResolveSamplingEnabled()) return false;
+    const auto fetch = register_file_.GetTextureFetch(index);
+    if (!render_target::native_shader_scale_policy::FilterSamplingSupported(
+            draw_resolution_scale_x(), draw_resolution_scale_y(),
+            fetch.min_filter == xenos::TextureFilter::kLinear &&
+                fetch.mag_filter == xenos::TextureFilter::kLinear &&
+                fetch.aniso_filter == xenos::AnisoFilter::kDisabled,
+            fetch.mip_max_level,
+            fetch.sign_x == xenos::TextureSign::kUnsigned &&
+                fetch.sign_y == xenos::TextureSign::kUnsigned &&
+                fetch.sign_z == xenos::TextureSign::kUnsigned &&
+                fetch.sign_w == xenos::TextureSign::kUnsigned,
+            fetch.clamp_x == xenos::ClampMode::kClampToEdge &&
+                fetch.clamp_y == xenos::ClampMode::kClampToEdge)) return false;
+  }
+  const auto* binding = GetValidTextureBinding(index);
+  if (!binding || !binding->texture) return false;
+  const auto& key = binding->texture->key();
+  if (!key.scaled_resolve || !key.tiled || key.mip_max_level ||
+      key.depth_or_array_size_minus_1 || key.dimension != xenos::DataDimension::k2DOrStacked) return false;
+  const auto& format = *FormatInfo::Get(key.format);
+  if (format.block_width != 1 || format.block_height != 1 || format.bits_per_pixel < 8) return false;
+  const native_resolve::Layout layout{uint32_t(key.base_page) << 12, uint32_t(key.pitch) << 5,
+      uint32_t(key.format), uint32_t(key.endianness), rex::log2_floor(format.bits_per_pixel >> 3)};
+  auto lock = global_critical_region_.Acquire();
+  return native_resolve_regions_.Latest(layout, out);
+}
+
+void TextureCache::GetUnscaledResolvePageRanges(
+    uint32_t start_unscaled, uint32_t length_unscaled,
+    std::vector<std::pair<uint32_t, uint32_t>>& ranges_out) {
+  if (!IsDrawResolutionScaled()) {
+    ranges_out.clear();
+    return;
+  }
+  start_unscaled &= 0x1FFFFFFF;
+  auto global_lock = global_critical_region_.Acquire();
+  scaled_resolve_util::CollectUnscaledPageRanges(
+      start_unscaled, length_unscaled, SharedMemory::kBufferSize,
+      [this](uint32_t page) {
+        return (scaled_resolve_pages_[page >> 5] &
+                (UINT32_C(1) << (page & 31))) != 0;
+      },
+      ranges_out);
+}
+
+scaled_resolve_util::PageLayoutSummary
+TextureCache::GetScaledResolvePageLayoutSummary(
+    uint32_t start_unscaled, uint32_t length_unscaled,
+    uint32_t expected_bytes_per_block_log2) {
+  scaled_resolve_util::PageLayoutSummary summary;
+  if (!IsDrawResolutionScaled() || expected_bytes_per_block_log2 > 4) {
+    return summary;
+  }
+  start_unscaled = std::min(start_unscaled, SharedMemory::kBufferSize);
+  length_unscaled = std::min(length_unscaled,
+                             SharedMemory::kBufferSize - start_unscaled);
+  if (!length_unscaled) {
+    return summary;
+  }
+  const uint32_t page_first = start_unscaled >> 12;
+  const uint32_t page_last = (start_unscaled + length_unscaled - 1) >> 12;
+  auto global_lock = global_critical_region_.Acquire();
+  return scaled_resolve_util::SummarizePageLayouts(
+      page_first, page_last, expected_bytes_per_block_log2,
+      [this](uint32_t page) {
+        return (scaled_resolve_pages_[page >> 5] &
+                (UINT32_C(1) << (page & 31))) != 0;
+      },
+      [this](uint32_t page) {
+        return scaled_resolve_page_layouts_[page];
+      });
 }
 
 uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_format_swizzle) {
@@ -384,6 +592,10 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
   if (!base_outdated && !mips_outdated) {
     return false;
   }
+
+  RecordPromptBackgroundTextureLifecycle(
+      SharedMemory::TextureLifecycleDiagnosticEventType::kPrepare, texture, base_outdated,
+      mips_outdated, true);
 
   pending_load_out.texture = &texture;
   pending_load_out.load_base = base_outdated;
@@ -431,8 +643,12 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
     }
   }
 
-  if (!LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
-                                             pending_load.load_mips)) {
+  RecordPromptBackgroundTextureLifecycle(
+      SharedMemory::TextureLifecycleDiagnosticEventType::kCommitBeforeLoad, texture,
+      pending_load.load_base, pending_load.load_mips, true);
+  const bool load_succeeded = LoadTextureDataFromResidentMemoryImpl(
+      texture, pending_load.load_base, pending_load.load_mips);
+  if (!load_succeeded) {
     return false;
   }
 
@@ -441,6 +657,9 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   // regular texture or a vertex buffer, and thus the scaled resolve version is
   // not up to date anymore.
   texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
+  RecordPromptBackgroundTextureLifecycle(
+      SharedMemory::TextureLifecycleDiagnosticEventType::kWatchInstalled, texture,
+      pending_load.load_base, pending_load.load_mips, true);
   texture.LogAction("Loaded");
 
   return true;
@@ -449,7 +668,10 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {
   const auto& regs = register_file();
 
-  if (texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
+  // The relaxed load skips the locked exchange on the usual draw where no watch
+  // fired; the exchange (and its acquire) still runs whenever the flag is set.
+  if (texture_became_outdated_.load(std::memory_order_relaxed) &&
+      texture_became_outdated_.exchange(false, std::memory_order_acquire)) {
     // A texture has become outdated - make sure whether textures are outdated
     // is rechecked in this draw and in subsequent ones to reload the new data
     // if needed.
@@ -487,6 +709,14 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     textures_remaining &= ~index_bit;
     TextureBinding& binding = texture_bindings_[index];
     xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(index);
+    static_assert(sizeof(fetch) == sizeof(binding.fetch_words));
+    if (binding.fetch_known && REXCVAR_GET(gpu_texture_binding_memo) &&
+        std::memcmp(binding.fetch_words, &fetch, sizeof(binding.fetch_words)) == 0) {
+      texture_bindings_in_sync_ |= index_bit;
+      continue;
+    }
+    std::memcpy(binding.fetch_words, &fetch, sizeof(binding.fetch_words));
+    binding.fetch_known = true;
     TextureKey old_key = binding.key;
     uint8_t old_swizzled_signs = binding.swizzled_signs;
     BindingInfoFromFetchConstant(fetch, binding.key, &binding.swizzled_signs);
@@ -730,6 +960,9 @@ void TextureCache::Texture::MarkAsUsed() {
 
 void TextureCache::Texture::WatchCallback(
     [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip) {
+  texture_cache().RecordPromptBackgroundTextureLifecycle(
+      SharedMemory::TextureLifecycleDiagnosticEventType::kWatchInvalidated, *this, !is_mip,
+      is_mip, true);
   if (is_mip) {
     assert_not_zero(GetGuestMipsSize());
     mips_outdated_ = true;
@@ -760,14 +993,46 @@ void TextureCache::DestroyAllTextures(bool from_destructor) {
 TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   // Check if the texture is a scaled resolve texture.
   if (IsDrawResolutionScaled() && key.tiled && IsScaledResolveSupportedForFormat(key)) {
-    texture_util::TextureGuestLayout scaled_resolve_guest_layout = key.GetGuestLayout();
-    if ((scaled_resolve_guest_layout.base.level_data_extent_bytes &&
-         IsRangeScaledResolved(key.base_page << 12,
-                               scaled_resolve_guest_layout.base.level_data_extent_bytes)) ||
-        (scaled_resolve_guest_layout.mips_total_extent_bytes &&
-         IsRangeScaledResolved(key.mip_page << 12,
-                               scaled_resolve_guest_layout.mips_total_extent_bytes))) {
+    // The guest layout doesn't depend on scaled_resolve, and every texture
+    // stores the layout of its key: take the extents from an existing texture
+    // of either variant rather than recomputing the whole mip layout on each
+    // binding change (9% of the command processor at internal 2x on the
+    // heaviest street view, V307), and check both ranges under one lock.
+    key.scaled_resolve = 0;
+    Texture* unscaled_texture = nullptr;
+    uint32_t base_extent_bytes, mips_extent_bytes;
+    auto unscaled_it = textures_.find(key);
+    if (unscaled_it != textures_.end()) {
+      unscaled_texture = unscaled_it->second.get();
+      base_extent_bytes = unscaled_texture->GetGuestBaseSize();
+      mips_extent_bytes = unscaled_texture->GetGuestMipsSize();
+    } else {
+      TextureKey scaled_key = key;
+      scaled_key.scaled_resolve = 1;
+      auto scaled_it = textures_.find(scaled_key);
+      if (scaled_it != textures_.end()) {
+        base_extent_bytes = scaled_it->second->GetGuestBaseSize();
+        mips_extent_bytes = scaled_it->second->GetGuestMipsSize();
+      } else {
+        texture_util::TextureGuestLayout guest_layout = key.GetGuestLayout();
+        base_extent_bytes = guest_layout.base.level_data_extent_bytes;
+        mips_extent_bytes = guest_layout.mips_total_extent_bytes;
+      }
+    }
+    bool scaled_resolved;
+    {
+      auto global_lock = global_critical_region_.Acquire();
+      scaled_resolved =
+          (base_extent_bytes &&
+           IsRangeScaledResolvedLocked(key.base_page << 12, base_extent_bytes)) ||
+          (mips_extent_bytes && IsRangeScaledResolvedLocked(key.mip_page << 12, mips_extent_bytes));
+    }
+    if (scaled_resolved) {
       key.scaled_resolve = 1;
+    } else if (unscaled_texture) {
+      // Stored under exactly this key, so it passed the host size checks below
+      // when it was created.
+      return unscaled_texture;
     }
   }
 
@@ -1014,7 +1279,12 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
   if (!IsDrawResolutionScaled()) {
     return false;
   }
+  auto global_lock = global_critical_region_.Acquire();
+  return IsRangeScaledResolvedLocked(start_unscaled, length_unscaled);
+}
 
+bool TextureCache::IsRangeScaledResolvedLocked(uint32_t start_unscaled,
+                                               uint32_t length_unscaled) const {
   start_unscaled = std::min(start_unscaled, SharedMemory::kBufferSize);
   length_unscaled = std::min(length_unscaled, SharedMemory::kBufferSize - start_unscaled);
   if (!length_unscaled) {
@@ -1031,7 +1301,6 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t lengt
   uint32_t block_last = page_last >> 5;
   uint32_t l2_block_first = block_first >> 6;
   uint32_t l2_block_last = block_last >> 6;
-  auto global_lock = global_critical_region_.Acquire();
   for (uint32_t i = l2_block_first; i <= l2_block_last; ++i) {
     uint64_t l2_block = scaled_resolve_pages_l2_[i];
     if (i == l2_block_first) {
@@ -1071,6 +1340,10 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
     const std::unique_lock<std::recursive_mutex>& global_lock, uint32_t address_first,
     uint32_t address_last, bool invalidated_by_gpu) {
   assert_true(IsDrawResolutionScaled());
+  // Unknown GPU writes (memexport, aliases, etc.) and every CPU write must drop
+  // sampling provenance. Only our exact resolve notification bypasses this
+  // callback after updating it above; no global ignore-GPU-writes flag exists.
+  native_resolve_regions_.Invalidate(address_first, address_last - address_first + 1);
   if (invalidated_by_gpu) {
     // Resolves themselves do exactly the opposite of what this should do.
     return;
@@ -1110,6 +1383,10 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
         scaled_resolve_pages_l2_[i] &= ~(UINT64_C(1) << resolve_block_relative_index);
       }
     }
+  }
+  for (uint32_t page = resolve_page_first; page <= resolve_page_last;
+       ++page) {
+    scaled_resolve_page_layouts_[page] = 0;
   }
 }
 

@@ -12,11 +12,13 @@
             "generator": "Ninja Multi-Config",
             "binaryDir": "${sourceDir}/out/build/${presetName}",
             "cacheVariables": {
-                "CMAKE_C_COMPILER": "clang",
-                "CMAKE_CXX_COMPILER": "clang++",
-                "CMAKE_C_FLAGS": "-march=x86-64-v3",
-                "CMAKE_CXX_FLAGS": "-march=x86-64-v3",
+                "CMAKE_C_COMPILER": "clang-cl",
+                "CMAKE_CXX_COMPILER": "clang-cl",
+                "CMAKE_C_FLAGS": "/clang:-march=x86-64-v3",
+                "CMAKE_CXX_FLAGS": "/clang:-march=x86-64-v3",
                 "CMAKE_CXX_STANDARD": "23",
+                "REXGLUE_ENABLE_TRACY": false,
+                "REXGLUE_ENABLE_PERF_COUNTERS": false,
                 "CMAKE_CONFIGURATION_TYPES": "Debug;Release;RelWithDebInfo",
                 "CMAKE_CROSS_CONFIGS": "all",
                 "CMAKE_DEFAULT_BUILD_TYPE": "Debug",
@@ -57,8 +59,8 @@
             "hidden": true,
             "inherits": "windows-base",
             "cacheVariables": {
-                "CMAKE_C_FLAGS": "-march=armv8-a",
-                "CMAKE_CXX_FLAGS": "-march=armv8-a"
+                "CMAKE_C_FLAGS": "/clang:-march=armv8-a",
+                "CMAKE_CXX_FLAGS": "/clang:-march=armv8-a"
             }
         },
         {

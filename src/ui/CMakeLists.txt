@@ -13,6 +13,8 @@ set(REXUI_CORE_SOURCES
     presenter.cpp
     renderdoc_api.cpp
     sdl_virtual_key.cpp
+    settings_panel.cpp
+    settings_schema.cpp
     window.cpp
     window_sdl.cpp
     windowed_app.cpp
@@ -26,6 +28,7 @@ set(REXUI_OVERLAY_SOURCES
     overlay/achievement_toast.cpp
     overlay/achievements_overlay.cpp
     overlay/debug_overlay.cpp
+    overlay/host_settings_overlay.cpp
     overlay/console_overlay.cpp
     overlay/console_commands.cpp
     overlay/settings_overlay.cpp
@@ -156,6 +159,8 @@ if(REXGLUE_USE_D3D12)
         dxgi
         dxguid
         dxc-headers
+        # Present statistics diagnostic: desktop compositor vblank counter.
+        dwmapi
     )
 endif()
 

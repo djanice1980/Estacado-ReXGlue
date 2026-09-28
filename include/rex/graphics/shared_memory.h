@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <mutex>
@@ -18,6 +19,11 @@
 
 #include <rex/memory.h>
 #include <rex/thread/mutex.h>
+
+// Set by the rexgpu-xenos build (REXGLUE_GPU_DIAGNOSTICS); player builds: 0.
+#ifndef REX_GPU_DIAGNOSTICS
+#define REX_GPU_DIAGNOSTICS 0
+#endif
 
 namespace rex::graphics {
 
@@ -34,6 +40,15 @@ class SharedMemory {
   virtual void ClearCache();
   void SetSystemPageBlocksValidWithGpuDataWritten();
   void InvalidateAllPages();
+
+#if REX_GPU_DIAGNOSTICS
+  // Upload coherency audit (measurement builds, shared_memory_coherency_audit):
+  // checks that the frame-end page reset (clear_memory_page_state) only
+  // re-uploads pages whose guest data is unchanged, i.e. that every CPU write
+  // reached MemoryInvalidationCallback. Call once per guest frame (command
+  // processor thread); logs REX_UPLOAD_COHERENCY windows.
+  void CoherencyAuditFrameEnd();
+#endif
 
   typedef void (*GlobalWatchCallback)(const std::unique_lock<std::recursive_mutex>& global_lock,
                                       void* context, uint32_t address_first, uint32_t address_last,
@@ -80,12 +95,74 @@ class SharedMemory {
   bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
   bool RequestRange(uint32_t start, uint32_t length);
 
+  // For per-draw residency caches (command processor thread): lock-free, like
+  // the fast path of RequestRanges - every page of the range holds a valid GPU
+  // copy and no plugin host write to it is pending. When false, request it.
+  bool IsRangeResident(uint32_t start, uint32_t length) const;
+  // Read-only view of guest physical memory (texture pack content ids).
+  // nullptr when the range is outside the buffer.
+  const uint8_t* GuestPhysicalForRead(uint32_t start, uint32_t length) const;
+  // Advances with every invalidation (CPU writes, published host writes,
+  // resets); a cache that skips requests re-checks residency when it moves.
+  uint64_t invalidation_epoch() const {
+    return invalidation_epoch_.load(std::memory_order_acquire);
+  }
+
   // Marks the range and, if not exact_range, potentially its surroundings
   // (to up to the first GPU-written page, as an access violation exception
   // count optimization) as modified by the CPU, also invalidating GPU-written
   // pages directly in the range.
   std::pair<uint32_t, uint32_t> MemoryInvalidationCallback(uint32_t physical_address_start,
                                                            uint32_t length, bool exact_range);
+
+  // Host writes of CPU-side data made inside the GPU plugin (XMA output,
+  // command-processor register, fence and query writes), which the host's
+  // guest-store tracker never sees. Marking is lock-free and allowed from any
+  // thread after the write; the pages are published (invalidated in every GPU
+  // cache, through the publisher) on the command processor thread before a
+  // request touches them and by PublishHostWrites, once per frame.
+  using HostWritePublisher = void (*)(void* context, uint32_t start, uint32_t length);
+  void SetHostWritePublisher(HostWritePublisher publisher, void* context) {
+    host_write_publisher_ = publisher;
+    host_write_publisher_context_ = context;
+  }
+  void MarkHostWrite(uint32_t start, uint32_t length);
+  void PublishHostWrites();
+
+  // Bounded, in-memory ordering evidence for one dynamically selected texture
+  // range. Guest write callbacks may be extremely hot, so events are recorded
+  // without synchronous output and dumped later by the draw path.
+  enum class TextureLifecycleDiagnosticEventType : uint32_t {
+    kRangeRegistered,
+    kPrepare,
+    kCommitBeforeLoad,
+    kSharedUploadCopyBegin,
+    kSharedUploadCopyEnd,
+    kD3D12LoadBegin,
+    kHostTextureCreated,
+    kD3D12LoadRecorded,
+    kWatchInstalled,
+    kPhysicalWriteNotify,
+    kInvalidationExecute,
+    kWatchInvalidated,
+    kDescriptorCreated,
+    kDrawBinding,
+    kShaderViewSelected,
+    kCpuUntileExpected,
+    kGpuUntileReadbackQueued,
+    kGpuUntileReadbackReady,
+    kHostTextureReadbackReady,
+  };
+  void BeginTextureLifecycleDiagnostic(uint32_t physical_address_start, uint32_t length);
+  bool TextureLifecycleDiagnosticOverlaps(uint32_t physical_address_start,
+                                          uint32_t length) const;
+  bool CopyTextureLifecycleDiagnosticSource(uint32_t physical_address_start, uint32_t length,
+                                            void* output) const;
+  void RecordTextureLifecycleDiagnosticEvent(TextureLifecycleDiagnosticEventType type,
+                                             uint32_t physical_address_start, uint32_t length,
+                                             uint64_t value0 = 0, uint64_t value1 = 0,
+                                             bool hash_tracked_source = false);
+  void DumpTextureLifecycleDiagnosticEvents();
 
   // Marks the range as containing GPU-generated data (such as resolves),
   // triggering modification callbacks, making it valid (so pages are not
@@ -94,7 +171,12 @@ class SharedMemory {
   // be called, to make sure, if the GPU writes don't overwrite *everything* in
   // the pages they touch, the CPU data is properly loaded to the unmodified
   // regions in those pages.
-  void RangeWrittenByGpu(uint32_t start, uint32_t length);
+  // A producer may have already handled its OWN global watch with more precise
+  // write geometry under the global critical region. Skip only that callback
+  // for this call; all other and per-resource watches still run. Nested/CPU
+  // writes do not inherit the exception. Default preserves all notifications.
+  void RangeWrittenByGpu(uint32_t start, uint32_t length,
+                         GlobalWatchHandle already_handled_watch = nullptr);
 
  protected:
   SharedMemory(memory::Memory& memory);
@@ -141,6 +223,14 @@ class SharedMemory {
   virtual bool UploadRanges(
       const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) = 0;
 
+#if REX_GPU_DIAGNOSTICS
+  bool coherency_audit_enabled() const { return coherency_audit_enabled_; }
+  // Around one uploaded chunk: before MakeRangeValid, remember which pages were
+  // still valid apart from the frame-end reset; after the copy, hash them.
+  void CoherencyAuditBeforeUpload(uint32_t page_first, uint32_t page_count);
+  void CoherencyAuditAfterUpload(uint32_t page_first, uint32_t page_count, const uint8_t* data);
+#endif
+
   const std::vector<std::pair<uint32_t, uint32_t>>& trace_download_ranges() {
     return trace_download_ranges_;
   }
@@ -175,6 +265,20 @@ class SharedMemory {
   // Ranges that need to be uploaded, generated by GetRangesToUpload (a
   // persistently allocated vector).
   std::vector<std::pair<uint32_t, uint32_t>> upload_ranges_;
+  // Sorted/merged request ranges, reused by RequestRanges (command processor
+  // thread) so per-draw buffer requests don't allocate.
+  std::vector<std::pair<uint32_t, uint32_t>> merged_ranges_scratch_;
+
+  // Pending host writes (MarkHostWrite): one bit per 4 KB page, plus one
+  // summary bit per page word. Set with read-modify-writes only (never
+  // skipped), so a publication that consumes a bit also sees the write.
+  static constexpr uint32_t kHostWritePageCount = kBufferSize >> 12;
+  static constexpr uint32_t kHostWriteWordCount = kHostWritePageCount / 64;
+  std::array<std::atomic<uint64_t>, kHostWriteWordCount> host_write_pages_{};
+  std::array<std::atomic<uint64_t>, kHostWriteWordCount / 64> host_write_summary_{};
+  HostWritePublisher host_write_publisher_ = nullptr;
+  void* host_write_publisher_context_ = nullptr;
+  bool HostWritesPendingIn(uint32_t start, uint32_t length) const;
 
   // GPU-written memory downloading for traces. <Start address, length>.
   std::vector<std::pair<uint32_t, uint32_t>> trace_download_ranges_;
@@ -200,6 +304,126 @@ class SharedMemory {
   std::atomic<bool> gpu_written_data_dirty_{false};
   std::atomic<uint32_t> dirty_blocks_{0};
   uint32_t num_system_page_flags_ = 0;
+  // See invalidation_epoch(); advanced (release) after the valid bits change.
+  std::atomic<uint64_t> invalidation_epoch_{0};
+
+#if REX_GPU_DIAGNOSTICS
+  bool coherency_audit_enabled_ = false;
+  // Pages that would still be valid without the frame-end reset: set by
+  // MakeRangeValid, cleared only by invalidation (global critical region).
+  std::vector<uint64_t> audit_tracked_valid_;
+  // Per page: hash of the last CPU upload (0 = none, or GPU-written since).
+  std::vector<uint64_t> audit_page_hash_;
+  // Per page: sequence number of the last invalidation that covered it.
+  std::vector<uint64_t> audit_page_invalidation_;
+  uint64_t audit_invalidation_sequence_ = 0;
+  // The chunk being uploaded (command processor thread).
+  std::vector<uint8_t> audit_chunk_tracked_;
+  std::vector<uint64_t> audit_chunk_hash_;
+  uint64_t audit_chunk_sequence_ = 0;
+  struct AuditMismatch {
+    uint32_t page;
+    uint64_t sequence;
+    uint64_t frame;
+  };
+  // Changed pages whose invalidation may still arrive (a write published at
+  // the next submission boundary); classified at frame end.
+  std::vector<AuditMismatch> audit_pending_mismatches_;
+  struct AuditCounts {
+    uint64_t frames = 0;
+    uint64_t upload_chunks = 0;
+    // Uploads needed anyway: first use, or invalidated by a CPU write.
+    uint64_t tracked_pages = 0;
+    // Uploads caused only by the frame-end reset.
+    uint64_t clear_only_pages = 0;
+    // Invalidated while the chunk was being uploaded.
+    uint64_t racing_pages = 0;
+    uint64_t mismatches = 0;
+    uint64_t late_notified = 0;
+    uint64_t unnotified = 0;
+    // MemoryInvalidationCallback calls (guest drains and plugin host writes).
+    uint64_t invalidations = 0;
+    // Rolling sweep: valid CPU-uploaded pages re-hashed against guest memory,
+    // and those found changed (also counted in mismatches).
+    uint64_t sweep_pages = 0;
+    uint64_t sweep_mismatches = 0;
+    // Invalidated more than kGraceFrames after the change was seen (tracked
+    // writes the guest submitted late), and the longest such delay.
+    uint64_t late_slow = 0;
+    uint64_t late_slow_max_frames = 0;
+    // The GPU requested (or found resident) a page while its change was still
+    // unexplained, attributed when the change is classified: benign when its
+    // invalidation came within kGraceFrames (commands issued before the
+    // write's submission), suspect otherwise (late_slow or unnotified).
+    uint64_t stale_uses = 0;
+    uint64_t stale_uses_suspect = 0;
+  };
+  // Pages with an unexplained change (pending mismatch), for stale uses, and
+  // the uses counted while the change is pending.
+  std::vector<uint8_t> audit_page_mismatch_;
+  std::vector<uint32_t> audit_page_pending_uses_;
+  static constexpr uint32_t kAuditStaleUseAddressCapacity = 8;
+  uint32_t audit_stale_use_addresses_[kAuditStaleUseAddressCapacity] = {};
+  uint32_t audit_stale_use_address_count_ = 0;
+  void CoherencyAuditUsed(uint32_t start, uint32_t length);
+  void CoherencyAuditPushMismatch(uint32_t page);
+
+ public:
+  // Measurement builds: a per-draw cache skipped requesting this range because
+  // it was resident (counts stale uses like RequestRanges does).
+  void CoherencyAuditSkippedRequest(uint32_t start, uint32_t length) {
+    if (coherency_audit_enabled_) {
+      CoherencyAuditUsed(start, length);
+    }
+  }
+
+ private:
+  // Rolling sweep state (command processor thread): next page word to scan.
+  uint32_t audit_sweep_cursor_ = 0;
+  std::vector<uint32_t> audit_sweep_pages_;
+  std::vector<uint64_t> audit_sweep_hashes_;
+  void CoherencyAuditSweep();
+  AuditCounts audit_window_;
+  AuditCounts audit_total_;
+  uint64_t audit_frame_ = 0;
+  static constexpr uint32_t kAuditAddressCapacity = 16;
+  uint32_t audit_unnotified_addresses_[kAuditAddressCapacity] = {};
+  uint32_t audit_unnotified_address_count_ = 0;
+  // Last uploaded bytes of pages that changed without an invalidation, to log
+  // what changed (REX_UPLOAD_COHERENCY_DIFF) the next time they change.
+  static constexpr size_t kAuditPageCopyCapacity = 8;
+  struct AuditPageCopy {
+    uint32_t page;
+    uint32_t diffs;
+    std::vector<uint8_t> bytes;  // Empty until the next upload of the page.
+  };
+  std::vector<AuditPageCopy> audit_page_copies_;
+  uint32_t audit_diff_logs_ = 0;
+  void CoherencyAuditInvalidated(uint32_t page_first, uint32_t page_last);
+  void CoherencyAuditLogDiff(uint32_t page, const uint8_t* old_data, const uint8_t* new_data);
+#endif
+
+  static constexpr uint32_t kTextureLifecycleDiagnosticEventCapacity = 2048;
+  struct TextureLifecycleDiagnosticEvent {
+    std::atomic<uint64_t> ready_sequence{0};
+    uint64_t host_microseconds = 0;
+    TextureLifecycleDiagnosticEventType type =
+        TextureLifecycleDiagnosticEventType::kRangeRegistered;
+    uint32_t address = 0;
+    uint32_t length = 0;
+    uint32_t hash_first = 0;
+    uint32_t hash_second = 0;
+    uint64_t value0 = 0;
+    uint64_t value1 = 0;
+  };
+  std::atomic<uint32_t> texture_lifecycle_diagnostic_base_plus_one_{0};
+  std::atomic<uint32_t> texture_lifecycle_diagnostic_length_{0};
+  std::atomic<uint64_t> texture_lifecycle_diagnostic_event_count_{0};
+  std::atomic<uint64_t> texture_lifecycle_diagnostic_dumped_count_{0};
+  std::atomic<uint32_t> texture_lifecycle_diagnostic_draw_binding_count_{0};
+  std::atomic<uint32_t> texture_lifecycle_diagnostic_shader_view_count_{0};
+  std::array<TextureLifecycleDiagnosticEvent, kTextureLifecycleDiagnosticEventCapacity>
+      texture_lifecycle_diagnostic_events_{};
 
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);
@@ -257,7 +481,8 @@ class SharedMemory {
   WatchNode* watch_node_first_free_ = nullptr;
   // Triggers the watches (global and per-range), removing triggered range
   // watches.
-  void FireWatches(uint32_t page_first, uint32_t page_last, bool invalidated_by_gpu);
+  void FireWatches(uint32_t page_first, uint32_t page_last, bool invalidated_by_gpu,
+                   GlobalWatchHandle already_handled_watch = nullptr);
   // Unlinks and frees the range and its nodes. Call this in the global critical
   // region.
   void UnlinkWatchRange(WatchRange* range);

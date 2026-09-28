@@ -79,6 +79,8 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   void ClearInput();
   void OnKey(KeyEvent& e, bool is_down);
   void UpdateMousePosition(float x, float y);
+  bool AnyMouseButtonDown() const;
+  void ReleaseAllMouseButtons(ImGuiIO& io);
   void SwitchToPhysicalMouseAndUpdateMousePosition(const MouseEvent& e);
 
   bool IsDrawingDialogs() const { return dialog_loop_next_index_ != SIZE_MAX; }
@@ -88,6 +90,8 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   Window* window_;
   size_t z_order_;
+  // Pressed state of the queued mouse button events (capture bookkeeping).
+  bool mouse_buttons_down_[5] = {};
   FontSetupCallback font_setup_;
 
   ImGuiContext* internal_state_ = nullptr;

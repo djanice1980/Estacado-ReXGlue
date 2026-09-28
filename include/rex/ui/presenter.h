@@ -210,13 +210,19 @@ class Presenter {
 
   class GuestOutputPaintConfig {
    public:
+    // FSR 1 (EASU + RCAS) and CAS use precompiled shaders and self-contained
+    // constants, so they are always available; FSR 2/3 need the FidelityFX
+    // SDK (REX_HAS_FIDELITYFX_SDK).
     enum class Effect {
       kBilinear,
-#if defined(REX_HAS_FIDELITYFX_SDK)
       kCas,
       // AMD FidelityFX Super Resolution upsampling, Contrast Adaptive
       // Sharpening otherwise.
       kFsr,
+      // FSR upsampling when the guest output is smaller than the host output
+      // along either axis, bilinear otherwise (an exact copy at 1:1).
+      kFsrWhenUpscaling,
+#if defined(REX_HAS_FIDELITYFX_SDK)
       // FidelityFX FSR2 selection. Uses the runtime temporal upscaler path
       // where available; currently still experimental due to limited temporal
       // inputs in the presenter path.
@@ -238,6 +244,7 @@ class Presenter {
       kPerformance,
       kUltraPerformance,
     };
+#endif  // defined(REX_HAS_FIDELITYFX_SDK)
 
     // This value is used as a lerp factor.
     static constexpr float kCasAdditionalSharpnessMin = 0.0f;
@@ -260,7 +267,6 @@ class Presenter {
     static constexpr float kFsrSharpnessReductionDefault = 0.2f;
     static_assert(kFsrSharpnessReductionDefault >= kFsrSharpnessReductionMin &&
                   kFsrSharpnessReductionDefault <= kFsrSharpnessReductionMax);
-#endif  // defined(REX_HAS_FIDELITYFX_SDK)
 
     // In the sharpness setters, min / max with a constant as the first argument
     // also drops NaNs.
@@ -273,7 +279,6 @@ class Presenter {
     Effect GetEffect() const { return effect_; }
     void SetEffect(Effect new_effect) { effect_ = new_effect; }
 
-#if defined(REX_HAS_FIDELITYFX_SDK)
     float GetCasAdditionalSharpness() const { return cas_additional_sharpness_; }
     void SetCasAdditionalSharpness(float new_cas_additional_sharpness) {
       cas_additional_sharpness_ =
@@ -295,6 +300,7 @@ class Presenter {
                    std::max(kFsrSharpnessReductionMin, new_fsr_sharpness_reduction));
     }
 
+#if defined(REX_HAS_FIDELITYFX_SDK)
     FsrQualityMode GetFsrQualityMode() const { return fsr_quality_mode_; }
     void SetFsrQualityMode(FsrQualityMode new_fsr_quality_mode) {
       fsr_quality_mode_ = new_fsr_quality_mode;
@@ -314,10 +320,10 @@ class Presenter {
     // original front buffer as possible.
     bool allow_overscan_cutoff_ = false;
     Effect effect_ = Effect::kBilinear;
-#if defined(REX_HAS_FIDELITYFX_SDK)
     float cas_additional_sharpness_ = kCasAdditionalSharpnessDefault;
     uint32_t fsr_max_upsampling_passes_ = kFsrMaxUpscalingPassesMax;
     float fsr_sharpness_reduction_ = kFsrSharpnessReductionDefault;
+#if defined(REX_HAS_FIDELITYFX_SDK)
     FsrQualityMode fsr_quality_mode_ = FsrQualityMode::kAuto;
 #endif
     bool dither_ = false;
@@ -358,6 +364,15 @@ class Presenter {
   bool RefreshGuestOutput(uint32_t frontbuffer_width, uint32_t frontbuffer_height,
                           uint32_t display_aspect_ratio_x, uint32_t display_aspect_ratio_y,
                           std::function<bool(GuestOutputRefreshContext& context)> refresher);
+  // Optional: when set, the steps after the refresher (the backend's
+  // completion such as signaling the refresh fence, the mailbox publication
+  // and painting in the guest output thread) are handed to this executor
+  // instead of running inline, so the refresher needn't wait for its GPU work
+  // to be submitted. The executor must run tasks one at a time, in order, and
+  // each only after all host GPU work the refresher had queued before it. The
+  // next RefreshGuestOutput waits until the previous completion has run.
+  using GuestOutputCompletionExecutor = std::function<void(std::function<void()> task)>;
+  void SetGuestOutputCompletionExecutor(GuestOutputCompletionExecutor executor);
   // The implementation must be callable from any thread, including from
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.
@@ -367,6 +382,10 @@ class Presenter {
   }
   // For simplicity, may be called repeatedly even if no changes have been made.
   void SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConfig& new_config);
+  // The configuration described by the present_* cvars (read at
+  // initialization; pass it to SetGuestOutputPaintConfigFromUIThread after
+  // changing them live).
+  static GuestOutputPaintConfig GuestOutputPaintConfigFromCVars();
 
   void AddUIDrawerFromUIThread(UIDrawer* drawer, size_t z_order);
   void RemoveUIDrawerFromUIThread(UIDrawer* drawer);
@@ -427,7 +446,6 @@ class Presenter {
   enum class GuestOutputPaintEffect {
     kBilinear,
     kBilinearDither,
-#if defined(REX_HAS_FIDELITYFX_SDK)
     kCasSharpen,
     kCasSharpenDither,
     kCasResample,
@@ -435,7 +453,6 @@ class Presenter {
     kFsrEasu,
     kFsrRcas,
     kFsrRcasDither,
-#endif
 
     kCount,
   };
@@ -446,11 +463,9 @@ class Presenter {
       // Dithering is never performed in intermediate passes because it may be
       // interpreted as features by the subsequent passes.
       case GuestOutputPaintEffect::kBilinearDither:
-#if defined(REX_HAS_FIDELITYFX_SDK)
       case GuestOutputPaintEffect::kCasSharpenDither:
       case GuestOutputPaintEffect::kCasResampleDither:
       case GuestOutputPaintEffect::kFsrRcasDither:
-#endif
         return false;
       default:
         // The result of any other effect can be stretched with bilinear
@@ -461,16 +476,13 @@ class Presenter {
 
   static constexpr bool CanGuestOutputPaintEffectBeFinal(GuestOutputPaintEffect effect) {
     switch (effect) {
-#if defined(REX_HAS_FIDELITYFX_SDK)
       case GuestOutputPaintEffect::kFsrEasu:
         return false;
-#endif
       default:
         return true;
     };
   }
 
-#if defined(REX_HAS_FIDELITYFX_SDK)
   // The longest path is kFsrMaxUpscalingPassesMax + optionally RCAS +
   // optionally bilinear, when upscaling by more than
   // 2^kFsrMaxUpscalingPassesMax along any direction.
@@ -478,10 +490,6 @@ class Presenter {
   // more than 2 along any direction) CAS followed by bilinear.
   static constexpr size_t kMaxGuestOutputPaintEffects =
       GuestOutputPaintConfig::kFsrMaxUpscalingPassesMax + 2;
-#else
-  // Bilinear-only path: at most 1 effect.
-  static constexpr size_t kMaxGuestOutputPaintEffects = 1;
-#endif
 
   struct GuestOutputPaintFlow {
     // Letterbox on up to 4 sides.
@@ -548,7 +556,6 @@ class Presenter {
     }
   };
 
-#if defined(REX_HAS_FIDELITYFX_SDK)
   static constexpr float CalculateCasPostSetupSharpness(float sharpness) {
     // CasSetup const1.x.
     return -1.0f / (8.0f - 3.0f * sharpness);
@@ -615,7 +622,6 @@ class Presenter {
       sharpness_post_setup = CalculatePostSetupSharpness(config.GetFsrSharpnessReduction());
     }
   };
-#endif  // defined(REX_HAS_FIDELITYFX_SDK)
 
   explicit Presenter(HostGpuLossCallback host_gpu_loss_callback)
       : host_gpu_loss_callback_(host_gpu_loss_callback) {}
@@ -686,6 +692,10 @@ class Presenter {
   virtual bool RefreshGuestOutputImpl(
       uint32_t mailbox_index, uint32_t frontbuffer_width, uint32_t frontbuffer_height,
       std::function<bool(GuestOutputRefreshContext& context)> refresher, bool& is_8bpc_out_ref) = 0;
+  // Called after RefreshGuestOutputImpl (whether or not it succeeded), inline
+  // or through the completion executor, before the image is published.
+  // Backends that signal the refresh completion on the GPU do it here.
+  virtual void CompleteGuestOutputRefreshImpl([[maybe_unused]] uint32_t mailbox_index) {}
 
   // For guest output capturing (for debugging use thus - shouldn't be adding
   // any noise like dithering that's not present in the original image),
@@ -976,6 +986,17 @@ class Presenter {
   // Accessible only by refreshing, whether the last refresh contained an image
   // rather than being blank.
   bool guest_output_active_last_refresh_ = false;
+
+  // Deferred completion of the last refresh (see
+  // SetGuestOutputCompletionExecutor). guest_output_mailbox_writable_ and the
+  // refresher-side backend state are handed between the refreshing thread and
+  // the executor through this mutex.
+  void PublishGuestOutputAndPaint();
+  void AwaitGuestOutputCompletion();
+  GuestOutputCompletionExecutor guest_output_completion_executor_;
+  std::mutex guest_output_completion_mutex_;
+  std::condition_variable guest_output_completion_cv_;
+  bool guest_output_completion_pending_ = false;
 
   // Ordered by the Z order, and then by the time of addition.
   // Note: All the iteration logic involving this Z ordering must be the same as

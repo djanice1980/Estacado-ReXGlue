@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -35,8 +36,9 @@ REXCVAR_DEFINE_STRING(trace_gpu_prefix, "", "GPU", "GPU trace file prefix");
 
 REXCVAR_DEFINE_BOOL(trace_gpu_stream, false, "GPU", "Enable GPU trace streaming");
 
-REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
-    .allowed({"none", "fxaa", "fxaa_extreme"})
+REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU",
+                      "Swap post effect: none, fxaa, fxaa_extreme, smaa (SMAA 1x, D3D12)")
+    .allowed({"none", "fxaa", "fxaa_extreme", "smaa"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
@@ -57,6 +59,9 @@ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
   }
   if (lowered == "fxaa_extreme" || lowered == "extreme") {
     return rex::graphics::CommandProcessor::SwapPostEffect::kFxaaExtreme;
+  }
+  if (lowered == "smaa") {
+    return rex::graphics::CommandProcessor::SwapPostEffect::kSmaa;
   }
   return rex::graphics::CommandProcessor::SwapPostEffect::kNone;
 }
@@ -186,7 +191,60 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
   return X_STATUS_SUCCESS;
 }
 
+X_STATUS GraphicsSystem::SetupEmbeddedGuestGpu(
+    memory::Memory* memory, double refresh_rate_hz,
+    std::function<void(uint32_t callback, uint32_t source, uint32_t cpu,
+                       uint32_t callback_data)>
+        interrupt_dispatch) {
+  if (!memory || command_processor_) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+  memory_ = memory;
+  function_dispatcher_ = nullptr;
+  kernel_state_ = nullptr;
+  embedded_interrupt_dispatch_ = std::move(interrupt_dispatch);
+
+  if (!provider_) {
+    CreateProvider(false);
+    provider_supports_presentation_ = false;
+  }
+  if (!provider_) {
+    REXGPU_ERROR("Unable to create embedded graphics provider");
+    return X_STATUS_UNSUCCESSFUL;
+  }
+
+  command_processor_ = CreateCommandProcessor();
+  if (!command_processor_ || !command_processor_->Initialize()) {
+    command_processor_.reset();
+    REXGPU_ERROR("Unable to initialize embedded command processor");
+    return X_STATUS_UNSUCCESSFUL;
+  }
+  command_processor_->SetDesiredSwapPostEffect(ParseSwapPostEffect(REXCVAR_GET(swap_post_effect)));
+
+  const auto interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+      std::chrono::duration<double>(1.0 / std::max(1.0, refresh_rate_hz)));
+  vsync_worker_running_ = true;
+  embedded_vsync_worker_thread_ = std::thread([this, interval]() {
+    auto next = std::chrono::steady_clock::now() + interval;
+    while (vsync_worker_running_) {
+      std::this_thread::sleep_until(next);
+      if (!vsync_worker_running_) {
+        break;
+      }
+      MarkVblank();
+      next += interval;
+    }
+  });
+
+  return X_STATUS_SUCCESS;
+}
+
 void GraphicsSystem::Shutdown() {
+  vsync_worker_running_ = false;
+  if (embedded_vsync_worker_thread_.joinable()) {
+    embedded_vsync_worker_thread_.join();
+  }
+
   if (command_processor_) {
     EndTracing();
     command_processor_->Shutdown();
@@ -308,6 +366,11 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
     return;
   }
 
+  if (embedded_interrupt_dispatch_) {
+    embedded_interrupt_dispatch_(interrupt_callback_, source, cpu, interrupt_callback_data_);
+    return;
+  }
+
   auto thread = system::XThread::GetCurrentThread();
   assert_not_null(thread);
 
@@ -323,6 +386,23 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
   uint64_t args[] = {source, interrupt_callback_data_};
   function_dispatcher_->ExecuteInterrupt(thread->thread_state(), interrupt_callback_, args,
                                          rex::countof(args));
+}
+
+void GraphicsSystem::NotifyPhysicalMemoryWrite(uint32_t address, uint32_t length) {
+  if (!command_processor_ || !command_processor_->is_worker_context_ready() || !length ||
+      address >= 0x20000000u ||
+      length > 0x20000000u - address) {
+    return;
+  }
+  command_processor_->TracePlaybackWroteMemory(address, length);
+}
+
+void GraphicsSystem::NotifyHostWrite(uint32_t address, uint32_t length) {
+  if (!command_processor_ || !command_processor_->is_worker_context_ready() || !length ||
+      address >= 0x20000000u || length > 0x20000000u - address) {
+    return;
+  }
+  command_processor_->MarkHostWrite(address, length);
 }
 
 void GraphicsSystem::MarkVblank() {

@@ -16,6 +16,7 @@
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/ui/flags.h>
+#include <rex/ui/window_mode_policy.h>
 #include <rex/kernel/crt/heap.h>
 #include <rex/filesystem.h>
 #include <rex/logging/sink.h>
@@ -346,7 +347,8 @@ bool ReXApp::SetupPresentation() {
   window_->AddListener(this);
   window_->AddInputListener(this, 0);
 
-  if (REXCVAR_GET(fullscreen)) {
+  if (rex::ui::window_mode_policy::ShouldStartBorderless(
+          REXCVAR_GET(window_mode), REXCVAR_GET(fullscreen))) {
     window_->SetFullscreen(true);
   }
   window_->Open();

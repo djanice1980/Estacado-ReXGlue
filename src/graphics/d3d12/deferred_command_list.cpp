@@ -30,11 +30,16 @@ void DeferredCommandList::Reset() {
 
 void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
                                   ID3D12GraphicsCommandList1* command_list_1) {
+  ExecuteStream(command_stream_.data(), command_stream_.size(), command_list, command_list_1);
+}
+
+void DeferredCommandList::ExecuteStream(const uintmax_t* stream, size_t stream_size,
+                                        ID3D12GraphicsCommandList* command_list,
+                                        ID3D12GraphicsCommandList1* command_list_1) const {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
-  const uintmax_t* stream = command_stream_.data();
-  size_t stream_remaining = command_stream_.size();
+  size_t stream_remaining = stream_size;
   ID3D12PipelineState* current_pipeline_state = nullptr;
   while (stream_remaining != 0) {
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
@@ -114,6 +119,12 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
                                        args.num_queries, args.destination_buffer,
                                        args.aligned_destination_buffer_offset);
       } break;
+      case Command::kD3DResolveSubresource: {
+        auto& args = *reinterpret_cast<const D3DResolveSubresourceArguments*>(stream);
+        command_list->ResolveSubresource(
+            args.destination_resource, args.destination_subresource,
+            args.source_resource, args.source_subresource, args.format);
+      } break;
       case Command::kD3DIASetIndexBuffer: {
         auto view = reinterpret_cast<const D3D12_INDEX_BUFFER_VIEW*>(stream);
         command_list->IASetIndexBuffer(view->Format != DXGI_FORMAT_UNKNOWN ? view : nullptr);
@@ -143,6 +154,19 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
       } break;
       case Command::kD3DOMSetStencilRef: {
         command_list->OMSetStencilRef(*reinterpret_cast<const UINT*>(stream));
+      } break;
+      case Command::kD3DSOSetTargets: {
+        static_assert(alignof(D3D12_STREAM_OUTPUT_BUFFER_VIEW) <=
+                      alignof(uintmax_t));
+        auto& args = *reinterpret_cast<const D3DSOSetTargetsHeader*>(stream);
+        command_list->SOSetTargets(
+            args.start_slot, args.num_views,
+            args.num_views
+                ? reinterpret_cast<const D3D12_STREAM_OUTPUT_BUFFER_VIEW*>(
+                      reinterpret_cast<const uint8_t*>(stream) +
+                      rex::align(sizeof(D3DSOSetTargetsHeader),
+                                 alignof(D3D12_STREAM_OUTPUT_BUFFER_VIEW)))
+                : nullptr);
       } break;
       case Command::kD3DResourceBarrier: {
         static_assert(alignof(D3D12_RESOURCE_BARRIER) <= alignof(uintmax_t));
@@ -268,6 +292,13 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
             reinterpret_cast<const uint8_t*>(stream) + sizeof(DebugMarkerHeader));
         command_list->SetMarker(1, label_name, static_cast<UINT>(args.label_length + 1));
       } break;
+      case Command::kExternalCall: {
+        auto& args = *reinterpret_cast<const ExternalCallHeader*>(stream);
+        args.function(reinterpret_cast<const uint8_t*>(stream) + sizeof(ExternalCallHeader),
+                      command_list);
+        // The call may have set its own pipeline.
+        current_pipeline_state = nullptr;
+      } break;
       default:
         assert_unhandled_case(header.command);
         break;
@@ -275,17 +306,6 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
     stream += header.arguments_size_elements;
     stream_remaining -= header.arguments_size_elements;
   }
-}
-
-void* DeferredCommandList::WriteCommand(Command command, size_t arguments_size_bytes) {
-  size_t arguments_size_elements =
-      (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
-  size_t offset = command_stream_.size();
-  command_stream_.resize(offset + kCommandHeaderSizeElements + arguments_size_elements);
-  CommandHeader& header = *reinterpret_cast<CommandHeader*>(command_stream_.data() + offset);
-  header.command = command;
-  header.arguments_size_elements = uint32_t(arguments_size_elements);
-  return command_stream_.data() + (offset + kCommandHeaderSizeElements);
 }
 
 }  // namespace rex::graphics::d3d12

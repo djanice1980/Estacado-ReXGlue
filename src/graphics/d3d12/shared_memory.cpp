@@ -10,6 +10,7 @@
  */
 
 #include <cstring>
+#include <cstdio>
 #include <utility>
 #include <vector>
 
@@ -17,6 +18,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/shared_memory.h>
+#include <rex/graphics/embedded_geometry_readback_policy.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_util.h>
@@ -24,6 +26,11 @@
 REXCVAR_DEFINE_BOOL(d3d12_tiled_shared_memory, true, "GPU/D3D12",
                     "Use tiled shared memory on D3D12")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// Command-processor copy stage: guest-memory copies into upload pages run on
+// a worker thread; submissions and guest-visible writes wait for them
+// (upload_copy_worker.h). Read per upload, so it can be switched live.
+REXCVAR_DEFINE_BOOL(d3d12_async_upload_copies, false, "GPU/D3D12",
+                    "Copy guest memory into upload pages on a worker thread");
 
 namespace rex::graphics::d3d12 {
 
@@ -143,7 +150,14 @@ bool D3D12SharedMemory::Initialize() {
 
 void D3D12SharedMemory::Shutdown(bool from_destructor) {
   ResetTraceDownload();
+  geometry_readbacks_.clear();
+  geometry_readback_count_ = 0;
+  texture_source_readback_count_ = 0;
+  camera_geometry_budget_ = {};
+  scene_resolve_budget_ = {};
 
+  // Finishes its queued copies into upload pages before the pool goes away.
+  upload_copy_worker_.reset();
   upload_buffer_pool_.reset();
 
   ui::d3d12::util::ReleaseAndNull(buffer_descriptor_heap_);
@@ -171,6 +185,101 @@ void D3D12SharedMemory::ClearCache() {
 
 void D3D12SharedMemory::CompletedSubmissionUpdated() {
   upload_buffer_pool_->Reclaim(command_processor_.GetCompletedSubmission());
+  const uint64_t completed = command_processor_.GetCompletedSubmission();
+  for (auto it = geometry_readbacks_.begin(); it != geometry_readbacks_.end();) {
+    if (!embedded_geometry_readback_policy::MayMap(it->submission, completed)) {
+      ++it;
+      continue;
+    }
+    void* data = nullptr;
+    const D3D12_RANGE range{0, it->bytes};
+    size_t written = 0;
+    uint32_t content_hash = 0;
+    if (SUCCEEDED(it->buffer->Map(0, &range, &data))) {
+      content_hash = embedded_geometry_readback_policy::ContentHash(
+          static_cast<const uint8_t*>(data), it->bytes);
+      if (FILE* file = std::fopen(it->path.c_str(), "wb")) {
+        written = std::fwrite(data, 1, it->bytes, file);
+        if (std::fclose(file) != 0) written = 0;
+      }
+      const D3D12_RANGE no_writes{0, 0};
+      it->buffer->Unmap(0, &no_writes);
+    }
+    std::fprintf(stderr,
+        "%s result=%u draw=%llu address=0x%08X "
+        "bytes=%u written=%llu submission=%llu completed=%llu path=%s hash=%08X\n",
+        it->scene_resolve ? "REX_SCENE_RESOLVE_READBACK" :
+          it->camera_geometry ? "REX_EMBEDDED_CAMERA_GEOMETRY_READBACK" :
+            (it->texture_source ? "REX_EMBEDDED_TEXTURE_SOURCE_READBACK" : "REX_EMBEDDED_GEOMETRY_READBACK"),
+        written == it->bytes ? 1u : 0u, static_cast<unsigned long long>(it->draw),
+        it->address, it->bytes, static_cast<unsigned long long>(written),
+        static_cast<unsigned long long>(it->submission),
+        static_cast<unsigned long long>(completed), it->path.c_str(), content_hash);
+    it = geometry_readbacks_.erase(it);
+  }
+}
+
+bool D3D12SharedMemory::QueueGeometryReadback(uint32_t address, uint64_t requested_bytes,
+                                            const char* path, uint64_t draw) {
+  const uint32_t bytes = embedded_geometry_readback_policy::CaptureBytes(
+      address, requested_bytes, geometry_readback_count_);
+  return QueueBoundedReadback(address, bytes, path, draw, false);
+}
+
+bool D3D12SharedMemory::QueueTextureSourceReadback(uint32_t address, uint64_t requested_bytes,
+                                                const char* path, uint64_t draw) {
+  const uint32_t bytes = embedded_geometry_readback_policy::TextureBytes(
+      address, requested_bytes, texture_source_readback_count_);
+  return QueueBoundedReadback(address, bytes, path, draw, true);
+}
+
+bool D3D12SharedMemory::QueueCameraGeometryReadback(uint32_t address, uint64_t requested_bytes,
+                                                 const char* path, uint64_t draw) {
+  const uint32_t bytes = camera_geometry_budget_.Reserve(address, requested_bytes);
+  return QueueBoundedReadback(address, bytes, path, draw, false, true);
+}
+
+bool D3D12SharedMemory::QueueBoundedReadback(uint32_t address, uint32_t bytes,
+                                         const char* path, uint64_t draw, bool texture_source,
+                                         bool camera_geometry, bool scene_resolve) {
+  // The exact-draw caller has an open submission; GetCurrentSubmission must
+  // also be nonzero so an unsubmitted copy can never pass the completion gate.
+  if (!bytes || !path || !*path || !command_processor_.GetCurrentSubmission()) return false;
+  const auto& provider = command_processor_.GetD3D12Provider();
+  GeometryReadback record;
+  D3D12_RESOURCE_DESC desc;
+  ui::d3d12::util::FillBufferResourceDesc(desc, bytes, D3D12_RESOURCE_FLAG_NONE);
+  if (FAILED(provider.GetDevice()->CreateCommittedResource(
+      &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
+      &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&record.buffer)))) return false;
+  record.submission = command_processor_.GetCurrentSubmission();
+  record.draw = draw;
+  record.address = address;
+  record.bytes = bytes;
+  record.path = path;
+  record.texture_source = texture_source;
+  record.camera_geometry = camera_geometry;
+  record.scene_resolve = scene_resolve;
+  const D3D12_RESOURCE_STATES original_state = buffer_state_;
+  UseAsCopySource();
+  command_processor_.SubmitBarriers();
+  command_processor_.GetDeferredCommandList().D3DCopyBufferRegion(
+      record.buffer.Get(), 0, buffer_, address, bytes);
+  CommitUAVWritesAndTransitionBuffer(original_state);
+  command_processor_.SubmitBarriers();
+  // No command-list close/execute/reset: previously bound graphics state survives.
+  if (!scene_resolve) {
+    if (texture_source) ++texture_source_readback_count_;
+    else if (!camera_geometry) ++geometry_readback_count_;
+  }
+  geometry_readbacks_.push_back(std::move(record));
+  return true;
+}
+
+bool D3D12SharedMemory::QueueSceneResolveReadback(uint32_t address, uint64_t requested_bytes,
+                                                const char* path, uint64_t draw) {
+  const uint32_t bytes = scene_resolve_budget_.Reserve(address, requested_bytes);
+  return QueueBoundedReadback(address, bytes, path, draw, false, false, true);
 }
 
 void D3D12SharedMemory::BeginSubmission() {
@@ -370,6 +479,9 @@ bool D3D12SharedMemory::UploadRanges(
   if (upload_page_ranges.empty()) {
     return true;
   }
+  D3D12CommandProcessor::GpuTimingScope upload_timing(command_processor_,
+                                                      GpuTimingCategory::kUpload);
+  command_processor_.GpuTimingCount(GpuTimingCounter::kUploadBatches, 1);
   CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
   command_processor_.SubmitBarriers();
   auto& command_list = command_processor_.GetDeferredCommandList();
@@ -389,13 +501,58 @@ bool D3D12SharedMemory::UploadRanges(
         REXGPU_ERROR("Shared memory: Failed to get an upload buffer");
         return false;
       }
+      const uint32_t upload_physical_start = upload_range_start << page_size_log2();
+      // The texture lifecycle trace is a measurement-build diagnostic.
+      if (kGpuDiagnostics && TextureLifecycleDiagnosticOverlaps(upload_physical_start,
+                                                                uint32_t(upload_buffer_size))) {
+        RecordTextureLifecycleDiagnosticEvent(
+            TextureLifecycleDiagnosticEventType::kSharedUploadCopyBegin,
+            upload_physical_start, uint32_t(upload_buffer_size),
+            uint64_t(reinterpret_cast<uintptr_t>(upload_buffer)), upload_buffer_offset, true);
+      }
+#if REX_GPU_DIAGNOSTICS
+      const uint32_t audit_page_count = uint32_t(upload_buffer_size >> page_size_log2());
+      if (coherency_audit_enabled()) {
+        CoherencyAuditBeforeUpload(upload_range_start, audit_page_count);
+      }
+#endif
       MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
-      std::memcpy(upload_buffer_mapping,
-                  memory().TranslatePhysical(upload_range_start << page_size_log2()),
-                  upload_buffer_size);
+      const bool lifecycle_diagnostic =
+          kGpuDiagnostics &&
+          TextureLifecycleDiagnosticOverlaps(upload_physical_start, uint32_t(upload_buffer_size));
+      const void* upload_source =
+          memory().TranslatePhysical(upload_range_start << page_size_log2());
+      if (REXCVAR_GET(d3d12_async_upload_copies) && !lifecycle_diagnostic) {
+        // Copy stage: the GPU copy below is recorded now; the submission and
+        // any guest-visible write wait for this CPU copy (ticket).
+        if (!upload_copy_worker_) upload_copy_worker_ = std::make_unique<UploadCopyWorker>();
+        upload_copy_worker_->Enqueue(upload_buffer_mapping, upload_source, upload_buffer_size);
+      } else {
+        std::memcpy(upload_buffer_mapping, upload_source, upload_buffer_size);
+      }
+#if REX_GPU_DIAGNOSTICS
+      // Hash the guest source, not the write-combined upload page.
+      if (coherency_audit_enabled()) {
+        CoherencyAuditAfterUpload(upload_range_start, audit_page_count,
+                                  static_cast<const uint8_t*>(upload_source));
+      }
+#endif
+      if (lifecycle_diagnostic) {
+        uint32_t upload_hash = 2166136261u;
+        for (size_t byte_index = 0; byte_index < upload_buffer_size; ++byte_index) {
+          upload_hash = (upload_hash ^ upload_buffer_mapping[byte_index]) * 16777619u;
+        }
+        RecordTextureLifecycleDiagnosticEvent(
+            TextureLifecycleDiagnosticEventType::kSharedUploadCopyEnd,
+            upload_physical_start, uint32_t(upload_buffer_size),
+            uint64_t(reinterpret_cast<uintptr_t>(upload_buffer)), upload_hash, true);
+      }
       command_list.D3DCopyBufferRegion(buffer_, upload_range_start << page_size_log2(),
                                        upload_buffer, UINT64(upload_buffer_offset),
                                        UINT64(upload_buffer_size));
+      command_processor_.NoteSharedMemoryUpload(upload_buffer_size);
+      command_processor_.GpuTimingCount(GpuTimingCounter::kUploadCopies, 1);
+      command_processor_.GpuTimingCount(GpuTimingCounter::kUploadBytes, upload_buffer_size);
       uint32_t upload_buffer_pages = uint32_t(upload_buffer_size >> page_size_log2());
       upload_range_start += upload_buffer_pages;
       upload_range_length -= upload_buffer_pages;

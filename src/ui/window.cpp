@@ -34,10 +34,21 @@ REXCVAR_DEFINE_INT32(window_height, 0, "UI/Window",
 REXCVAR_DEFINE_BOOL(fullscreen, true, "UI/Window", "Start the window in fullscreen mode")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_STRING(window_mode, "auto", "UI/Window",
+                      "Startup mode: auto (legacy fullscreen flag), windowed, or borderless")
+    .allowed({"auto", "windowed", "borderless"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 REXCVAR_DEFINE_INT32(monitor, 0, "UI/Window",
                      "Monitor index to display on (0 = default, 1 = primary, 2 = "
                      "second monitor, etc.)")
     .range(0, 16)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_STRING(
+    output_resolution, "", "UI/Window",
+    "Host output/window resolution preset (native, 720p, 1080p, 1440p, 4k, or WIDTHxHEIGHT); "
+    "does not change the guest video mode")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_INT32(video_mode_width, 1280, "Display", "Guest video mode width in pixels")
@@ -49,8 +60,8 @@ REXCVAR_DEFINE_INT32(video_mode_height, 720, "Display", "Guest video mode height
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_STRING(resolution, "", "Display",
-                      "Common resolution preset for both guest video mode and startup window (for "
-                      "example: 720p, 1080p, 1440p, 4k, 1280x720)")
+                      "Legacy common preset for guest video mode and startup window; prefer "
+                      "output_resolution when only host output should change")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_DOUBLE(video_mode_refresh_rate, 60.0, "Display",

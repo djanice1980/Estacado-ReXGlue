@@ -11,10 +11,9 @@
 // Operates on 32x32 tiled data format used by Xbox 360.
 // Each thread handles one output pixel (one 32x32 tile = 1024 threads).
 //
-// By default, picks the top-left pixel of each scale_x * scale_y block.
-// When xe_downscale_half_pixel_offset is set, samples from (scale/2, scale/2)
-// within each block to compensate for the half-pixel offset becoming a
-// full-pixel offset at higher resolutions.
+// Xenia 0f23f056 stores rectangular host groups in column-major order and their
+// elements in row-major order. Downscaling selects a subpixel of EACH native
+// texel, not a whole repeated group, and restores the guest tiled byte order.
 
 cbuffer XeResolveDownscaleConstants : register(b0) {
   uint xe_downscale_scale_x;         // 1 to kMaxDrawResolutionScaleAlongAxis
@@ -31,6 +30,42 @@ cbuffer XeResolveDownscaleConstants : register(b0) {
 
 ByteAddressBuffer xe_resolve_source : register(t0);
 RWByteAddressBuffer xe_resolve_dest : register(u0);
+
+uint XeGuestTiledByteToHostGroupByte(uint guest_tiled_byte,
+                                     uint bytes_per_element_log2) {
+  [branch] switch (bytes_per_element_log2) {
+    case 0u: {
+      uint x = (guest_tiled_byte & 0x7u) |
+               ((guest_tiled_byte >> 3u) & 0x8u);
+      uint y = ((guest_tiled_byte >> 4u) & 0x1u) |
+               ((guest_tiled_byte >> 2u) & 0x2u) |
+               ((guest_tiled_byte >> 3u) & 0x4u);
+      return (y << 4u) | x;
+    }
+    case 1u: {
+      uint byte_in_element = guest_tiled_byte & 0x1u;
+      uint x = ((guest_tiled_byte >> 1u) & 0x7u) |
+               ((guest_tiled_byte >> 3u) & 0x8u);
+      uint y = ((guest_tiled_byte >> 4u) & 0x1u) |
+               ((guest_tiled_byte >> 4u) & 0x2u);
+      return (((y << 4u) | x) << 1u) | byte_in_element;
+    }
+    case 2u: {
+      uint byte_in_element = guest_tiled_byte & 0x3u;
+      uint x = ((guest_tiled_byte >> 2u) & 0x3u) |
+               ((guest_tiled_byte >> 3u) & 0xCu);
+      uint y = (guest_tiled_byte >> 4u) & 0x1u;
+      return (((y << 4u) | x) << 2u) | byte_in_element;
+    }
+    default: {
+      uint byte_in_element = guest_tiled_byte & 0x7u;
+      uint x = ((guest_tiled_byte >> 3u) & 0x1u) |
+               ((guest_tiled_byte >> 4u) & 0x2u);
+      uint y = (guest_tiled_byte >> 4u) & 0x1u;
+      return (((y << 2u) | x) << 3u) | byte_in_element;
+    }
+  }
+}
 
 // Groupshared memory for coalescing sub-32-bit writes
 // Max tile size at 1x is 32*32*8 bytes = 8KB for 64-bit pixels
@@ -58,26 +93,37 @@ void main(uint3 xe_group_id : SV_GroupID,
   uint scale_xy = xe_downscale_scale_x * xe_downscale_scale_y;
   uint tile_size_scaled = tile_size_1x * scale_xy;
 
-  // Compute offset within each scaled block to sample from.
-  // Without half-pixel correction: sample from (0, 0) = linear offset 0.
-  // With half-pixel correction: sample from (scale/2, scale/2) to compensate
-  // for the D3D9-style half-pixel offset shifting content by (N/2, N/2) pixels
-  // at Nx resolution.
-  uint block_sample_offset = 0u;
+  uint offset_x = 0u;
+  uint offset_y = 0u;
   [branch] if (xe_downscale_half_pixel_offset != 0u && scale_xy > 1u) {
-    uint offset_x = xe_downscale_scale_x >> 1u;
-    uint offset_y = xe_downscale_scale_y >> 1u;
-    block_sample_offset = offset_x + offset_y * xe_downscale_scale_x;
+    offset_x = xe_downscale_scale_x >> 1u;
+    offset_y = xe_downscale_scale_y >> 1u;
   }
-
-  // Source offset: base of the scaled block plus offset within block
-  uint src_offset = tile_index * tile_size_scaled +
-                    pixel_index * pixel_size * scale_xy +
-                    block_sample_offset * pixel_size;
 
   // Destination offset in 1x buffer
   uint dst_offset = tile_index * tile_size_1x +
                     pixel_index * pixel_size;
+  uint group_x_log2 = xe_downscale_pixel_size_log2 >= 3u
+                          ? 5u - xe_downscale_pixel_size_log2
+                          : 4u;
+  uint group_y_log2 =
+      3u - min(xe_downscale_pixel_size_log2, 2u);
+  uint group_size_log2 = group_x_log2 + group_y_log2 +
+                         xe_downscale_pixel_size_log2;
+  uint group_size = 1u << group_size_log2;
+  uint guest_group = dst_offset >> group_size_log2;
+  uint guest_tiled_byte = dst_offset & (group_size - 1u);
+  uint native_group_byte = XeGuestTiledByteToHostGroupByte(
+      guest_tiled_byte, xe_downscale_pixel_size_log2);
+  uint native_element = native_group_byte >> xe_downscale_pixel_size_log2;
+  uint host_x = (native_element & ((1u << group_x_log2) - 1u)) * xe_downscale_scale_x + offset_x;
+  uint host_y = (native_element >> group_x_log2) * xe_downscale_scale_y + offset_y;
+  uint host_group = (host_x >> group_x_log2) * xe_downscale_scale_y + (host_y >> group_y_log2);
+  uint host_group_byte = ((((host_y & ((1u << group_y_log2) - 1u)) << group_x_log2) |
+                           (host_x & ((1u << group_x_log2) - 1u))) << xe_downscale_pixel_size_log2) |
+                         (native_group_byte & ((1u << xe_downscale_pixel_size_log2) - 1u));
+  uint src_offset = guest_group * group_size * scale_xy +
+                    host_group * group_size + host_group_byte;
 
   // Copy pixel based on size
   [branch] switch (xe_downscale_pixel_size_log2) {

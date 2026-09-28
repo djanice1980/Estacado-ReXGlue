@@ -14,6 +14,7 @@
 #include <atomic>
 #include <mutex>
 #include <queue>
+#include <thread>
 
 #include <rex/audio/xma/context.h>
 #include <rex/audio/xma/register_file.h>
@@ -32,12 +33,17 @@ struct XMA_CONTEXT_DATA;
 class XmaDecoder {
  public:
   explicit XmaDecoder(runtime::FunctionDispatcher* function_dispatcher);
+  explicit XmaDecoder(memory::Memory* memory);
   ~XmaDecoder();
 
   memory::Memory* memory() const { return memory_; }
   runtime::FunctionDispatcher* function_dispatcher() const { return function_dispatcher_; }
 
   X_STATUS Setup(system::KernelState* kernel_state);
+  // Static-recompilation hosts already own and account for guest physical
+  // memory. Initialize the decoder over a host-supplied, page-backed context
+  // array and use a native worker without constructing a second kernel.
+  X_STATUS SetupExternal(uint32_t context_data_first_ptr);
   void Shutdown();
 
   uint32_t context_array_ptr() const { return register_file_[XmaRegister::ContextArrayAddress]; }
@@ -73,6 +79,7 @@ class XmaDecoder {
 
   std::atomic<bool> worker_running_ = {false};
   system::object_ref<system::XHostThread> worker_thread_;
+  std::thread external_worker_thread_;
   std::unique_ptr<rex::thread::Event> work_event_ = nullptr;
 
   std::atomic<bool> paused_ = false;
@@ -87,6 +94,7 @@ class XmaDecoder {
 
   uint32_t context_data_first_ptr_ = 0;
   uint32_t context_data_last_ptr_ = 0;
+  bool owns_context_data_ = false;
 };
 
 }  // namespace rex::audio

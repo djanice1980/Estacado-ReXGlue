@@ -13,11 +13,15 @@
 
 #include <algorithm>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include <rex/graphics/shared_memory.h>
+#include <rex/graphics/embedded_camera_geometry_capture_policy.h>
+#include <rex/graphics/embedded_scene_resolve_capture_policy.h>
 #include <rex/graphics/trace_writer.h>
+#include <rex/graphics/d3d12/upload_copy_worker.h>
 #include <rex/memory.h>
 #include <rex/ui/d3d12/d3d12_api.h>
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
@@ -41,6 +45,31 @@ class D3D12SharedMemory : public SharedMemory {
 
   void CompletedSubmissionUpdated();
   void BeginSubmission();
+
+  // Copy stage (d3d12_async_upload_copies, upload_copy_worker.h). Command
+  // processor thread only: the ticket of the last queued guest-memory copy
+  // (0 when none was ever queued).
+  uint64_t QueuedUploadCopies() const {
+    return upload_copy_worker_ ? upload_copy_worker_->queued() : 0;
+  }
+  uint64_t CompletedUploadCopies() const {
+    return upload_copy_worker_ ? upload_copy_worker_->completed() : 0;
+  }
+  // Any thread: returns once every copy up to ticket has been written.
+  void WaitForUploadCopies(uint64_t ticket) const {
+    if (ticket && upload_copy_worker_) upload_copy_worker_->Wait(ticket);
+  }
+
+  // Bounded exact-draw observer. No CPU substitute, submission split or wait.
+  // Source is the already-resident shared GPU buffer used by this draw.
+  bool QueueGeometryReadback(uint32_t address, uint64_t requested_bytes,
+                             const char* path, uint64_t draw);
+  bool QueueTextureSourceReadback(uint32_t address, uint64_t requested_bytes,
+                                  const char* path, uint64_t draw);
+  bool QueueCameraGeometryReadback(uint32_t address, uint64_t requested_bytes,
+                                   const char* path, uint64_t draw);
+  bool QueueSceneResolveReadback(uint32_t address, uint64_t requested_bytes,
+                                 const char* path, uint64_t draw);
 
   // RequestRange may transition the buffer to copy destination - call it before
   // UseForReading or UseForWriting.
@@ -88,6 +117,9 @@ class D3D12SharedMemory : public SharedMemory {
   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
 
  private:
+  bool QueueBoundedReadback(uint32_t address, uint32_t bytes, const char* path,
+                           uint64_t draw, bool texture_source, bool camera_geometry = false,
+                           bool scene_resolve = false);
   D3D12CommandProcessor& command_processor_;
   TraceWriter& trace_writer_;
 
@@ -117,10 +149,29 @@ class D3D12SharedMemory : public SharedMemory {
   D3D12_CPU_DESCRIPTOR_HANDLE buffer_descriptor_heap_start_;
 
   std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> upload_buffer_pool_;
+  // Created on first use; destroyed (after its last copy) before the pool.
+  std::unique_ptr<UploadCopyWorker> upload_copy_worker_;
 
   // Created temporarily, only for downloading.
   ID3D12Resource* trace_download_buffer_ = nullptr;
   void ResetTraceDownload();
+
+  struct GeometryReadback {
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    uint64_t submission = 0;
+    uint64_t draw = 0;
+    uint32_t address = 0;
+    uint32_t bytes = 0;
+    std::string path;
+    bool texture_source = false;
+    bool camera_geometry = false;
+    bool scene_resolve = false;
+  };
+  uint32_t geometry_readback_count_ = 0;
+  uint32_t texture_source_readback_count_ = 0;
+  embedded_camera_geometry_capture_policy::RangeBudget camera_geometry_budget_;
+  embedded_scene_resolve_capture_policy::RangeBudget scene_resolve_budget_;
+  std::vector<GeometryReadback> geometry_readbacks_;
 };
 
 }  // namespace rex::graphics::d3d12

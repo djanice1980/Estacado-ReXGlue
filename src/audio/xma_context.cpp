@@ -133,10 +133,41 @@ bool XmaContext::Work() {
   }
 
   while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
+    const int32_t remaining_blocks_before =
+        remaining_subframe_blocks_in_output_buffer_;
+    const uint32_t input_offset_before = data.input_buffer_read_offset;
+    const uint8_t current_buffer_before = data.current_buffer;
+    const uint8_t input_0_valid_before = data.input_buffer_0_valid;
+    const uint8_t input_1_valid_before = data.input_buffer_1_valid;
+    const uint8_t remaining_subframes_before =
+        current_frame_remaining_subframes_;
     Decode(&data);
     Consume(&output_rb, &data);
 
     if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
+      break;
+    }
+
+    // Every successful hardware work iteration must either advance the input
+    // stream or consume output capacity. If neither happens, retrying here can
+    // never change the result and prevents the decoder from observing a host
+    // shutdown request. Return the unchanged context to the guest so it may
+    // provide more data or explicitly re-kick the context.
+    if (remaining_subframe_blocks_in_output_buffer_ ==
+            remaining_blocks_before &&
+        data.input_buffer_read_offset == input_offset_before &&
+        data.current_buffer == current_buffer_before &&
+        data.input_buffer_0_valid == input_0_valid_before &&
+        data.input_buffer_1_valid == input_1_valid_before &&
+        current_frame_remaining_subframes_ == remaining_subframes_before) {
+      REXAPU_WARN(
+          "XmaContext {}: decode made no progress (buffer {} offset {} "
+          "remaining_blocks {} output_valid {} error {}), yielding",
+          id(), static_cast<uint32_t>(data.current_buffer),
+          static_cast<uint32_t>(data.input_buffer_read_offset),
+          remaining_subframe_blocks_in_output_buffer_,
+          static_cast<uint32_t>(data.output_buffer_valid),
+          static_cast<uint32_t>(data.error_status));
       break;
     }
   }
@@ -174,7 +205,10 @@ void XmaContext::Clear() {
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
   XMA_CONTEXT_DATA data(context_ptr);
   ClearLocked(&data);
-  data.Store(context_ptr);
+  {
+    auto host_write = memory()->GuardVirtualWrite(guest_ptr(), sizeof(XMA_CONTEXT_DATA));
+    data.Store(context_ptr);
+  }
 }
 
 void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
@@ -214,6 +248,7 @@ void XmaContext::Release() {
   set_is_allocated(false);
   ResetDecoderState();
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
+  auto host_write = memory()->GuardVirtualWrite(guest_ptr(), sizeof(XMA_CONTEXT_DATA));
   std::memset(context_ptr, 0, sizeof(XMA_CONTEXT_DATA));
 }
 
@@ -390,6 +425,7 @@ kPacketInfo XmaContext::GetPacketInfo(uint8_t* packet, uint32_t frame_offset) {
 
 void XmaContext::StoreContextMerged(const XMA_CONTEXT_DATA& data,
                                     const XMA_CONTEXT_DATA& initial_data, uint8_t* context_ptr) {
+  auto host_write = memory()->GuardVirtualWrite(guest_ptr(), sizeof(XMA_CONTEXT_DATA));
   XMA_CONTEXT_DATA fresh(context_ptr);
 
   fresh.loop_count = data.loop_count;
@@ -448,8 +484,13 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* 
       ((kBytesPerFrameChannel / kOutputBytesPerBlock) << data->is_stereo) -
       current_frame_remaining_subframes_;
 
-  output_rb->Write(raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
-                   subframes_to_write * kOutputBytesPerBlock);
+  {
+    // The ring may wrap; conservatively invalidate its complete backing span.
+    auto host_write = memory()->GuardPhysicalWrite(data->output_buffer_ptr,
+        data->output_buffer_block_count * kOutputBytesPerBlock);
+    output_rb->Write(raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
+                     subframes_to_write * kOutputBytesPerBlock);
+  }
 
   const int8_t headroom = (current_frame_remaining_subframes_ - subframes_to_write == 0)
                               ? data->output_buffer_padding

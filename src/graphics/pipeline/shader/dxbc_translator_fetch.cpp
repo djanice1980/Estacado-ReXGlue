@@ -20,6 +20,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
+#include <rex/graphics/pipeline/render_target/native_shader_scale_policy.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
 #include <rex/math.h>
 #include <rex/string.h>
@@ -140,13 +141,38 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
     address_src = address_temp_src;
   }
 
+  // Words at or past the end of the fetch buffer must read as 0. The shared
+  // memory binding covers all physical memory, so an out-of-bounds word would
+  // otherwise load unrelated guest data where the Xenos hardware clamps and
+  // returns zero. Games may overallocate a draw and rely on unwritten vertices
+  // collapsing into degenerate primitives. Compute the exclusive buffer end
+  // in bytes and a per-word in-bounds mask before issuing the loads.
+  uint32_t bounds_temp = PushSystemTemp(0, 2);
+  uint32_t word_mask_temp = bounds_temp + 1;
+  // bounds_temp.x = buffer size in words (bits 2:25 of fetch constant dword 1).
+  a_.OpUBFE(dxbc::Dest::R(bounds_temp, 0b0001), dxbc::Src::LU(24),
+            dxbc::Src::LU(2), fetch_constant_src.SelectFromSwizzled(1));
+  // bounds_temp.y = buffer base address in bytes.
+  a_.OpAnd(dxbc::Dest::R(bounds_temp, 0b0010),
+           fetch_constant_src.SelectFromSwizzled(0),
+           dxbc::Src::LU(~uint32_t(3)));
+  // bounds_temp.x = exclusive buffer end address in bytes.
+  a_.OpUMAd(dxbc::Dest::R(bounds_temp, 0b0001),
+            dxbc::Src::R(bounds_temp, dxbc::Src::kXXXX), dxbc::Src::LU(4),
+            dxbc::Src::R(bounds_temp, dxbc::Src::kYYYY));
+  // word_mask_temp = byte addresses of the words in this fetched element.
+  a_.OpIAdd(dxbc::Dest::R(word_mask_temp), address_src,
+            dxbc::Src::LI((0 - int32_t(first_word_index)) * 4,
+                          (1 - int32_t(first_word_index)) * 4,
+                          (2 - int32_t(first_word_index)) * 4,
+                          (3 - int32_t(first_word_index)) * 4));
+  // word_mask_temp = all bits set for each in-bounds word, zero otherwise.
+  a_.OpULT(dxbc::Dest::R(word_mask_temp, needed_words),
+           dxbc::Src::R(word_mask_temp),
+           dxbc::Src::R(bounds_temp, dxbc::Src::kXXXX));
+
   // - Load needed words to system_temp_result_, words 0, 1, 2, 3 to X, Y, Z, W
   //   respectively.
-
-  // FIXME(Triang3l): Bound checking is not done here, but haven't encountered
-  // any games relying on out-of-bounds access. On Adreno 200 on Android (LG
-  // P705), however, words (not full elements) out of glBufferData bounds
-  // contain 0.
 
   // Loading the FXC way, Load4.xyw becomes Load2 and Load - would be a
   // compromise between AMD, where there are load_dwordx2/3/4, and Nvidia, where
@@ -208,6 +234,10 @@ void DxbcShaderTranslator::ProcessVertexFetchInstruction(
     }
   }
   a_.OpEndIf();
+
+  a_.OpAnd(dxbc::Dest::R(system_temp_result_, needed_words),
+           dxbc::Src::R(system_temp_result_), dxbc::Src::R(word_mask_temp));
+  PopSystemTemp(2);
 
   dxbc::Src result_src(dxbc::Src::R(system_temp_result_));
 
@@ -771,6 +801,29 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
   //           for simplicity).
   // 3D: X - width, Y - height, Z - depth, W - 0 if stacked 2D, 1 if 3D.
   uint32_t size_needed_components = 0b0000;
+  const bool native_filter_sampling =
+      is_pixel_shader() && instr.opcode == FetchOpcode::kTextureFetch &&
+      GetDxbcShaderModification().pixel.native_filter_fetch == tfetch_index + 1 &&
+      instr.dimension == xenos::FetchOpDimension::k2D &&
+      render_target::native_shader_scale_policy::FilterInstructionSupported(
+          !instr.attributes.unnormalized_coordinates, instr.attributes.offset_x,
+          instr.attributes.offset_y, instr.attributes.use_register_lod,
+          instr.attributes.use_register_gradients);
+  const bool native_region_sampling = !native_filter_sampling &&
+      is_pixel_shader() && instr.opcode == FetchOpcode::kTextureFetch &&
+      GetDxbcShaderModification().pixel.native_region_sampling &&
+      instr.dimension == xenos::FetchOpDimension::k2D &&
+      render_target::native_shader_scale_policy::FilterInstructionSupported(
+          !instr.attributes.unnormalized_coordinates, instr.attributes.offset_x,
+          instr.attributes.offset_y, instr.attributes.use_register_lod,
+          instr.attributes.use_register_gradients) &&
+      (instr.attributes.min_filter == xenos::TextureFilter::kUseFetchConst ||
+       instr.attributes.min_filter == xenos::TextureFilter::kLinear) &&
+      (instr.attributes.mag_filter == xenos::TextureFilter::kUseFetchConst ||
+       instr.attributes.mag_filter == xenos::TextureFilter::kLinear) &&
+      (instr.attributes.aniso_filter == xenos::AnisoFilter::kUseFetchConst ||
+       instr.attributes.aniso_filter == xenos::AnisoFilter::kDisabled);
+  if (native_filter_sampling || native_region_sampling) size_needed_components |= 0b0011;
   if (instr.opcode == FetchOpcode::kGetTextureWeights) {
     // Size needed for denormalization for coordinate lerp factor.
     // FIXME(Triang3l): Currently disregarding the LOD completely in getWeights.
@@ -900,56 +953,19 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
     // but for simplicity, not doing that - from a high level point of view,
     // would be useless to get weights that will always be zero.
 
-    // Need unnormalized coordinates.
+    // Need unnormalized coordinates. Keep these in guest texel space even
+    // when the sampled resource came from a resolution-scaled resolve. The
+    // hardware weights are fractional guest-texel positions; scaling the
+    // coordinate and size changes the weight pattern and breaks custom
+    // filtering kernels.
     bool coord_operand_temp_pushed = false;
     dxbc::Src coord_operand =
         LoadOperand(instr.operands[0], used_result_nonzero_components, coord_operand_temp_pushed);
     dxbc::Src coord_src(coord_operand);
-    // If needed, apply the resolution scale to the width / height and the
-    // unnormalized coordinates.
-    uint32_t resolution_scaled_result_components =
-        used_result_nonzero_components & revert_resolution_scale_axes;
-    uint32_t resolution_scaled_coord_components =
-        instr.attributes.unnormalized_coordinates ? resolution_scaled_result_components : 0b0000;
-    uint32_t resolution_scaled_size_components =
-        size_needed_components & resolution_scaled_result_components;
-    if (resolution_scaled_coord_components || resolution_scaled_size_components) {
-      if (resolution_scaled_coord_components &&
-          (coord_src.type_ != dxbc::OperandType::kTemp ||
-           coord_src.index_1d_.index_ != system_temp_result_)) {
-        // Use system_temp_result_ as a temporary for conditionally
-        // resolution-scaled coordinates.
-        a_.OpMov(dxbc::Dest::R(system_temp_result_, used_result_nonzero_components), coord_src);
-        coord_src = dxbc::Src::R(system_temp_result_);
-      }
-      // Using system_temp_result_.w as a temporary for the flag indicating
-      // whether the texture is resolution-scaled - not involved in coordinate
-      // calculations.
-      assert_zero(used_result_nonzero_components & 0b1000);
-      a_.OpAnd(dxbc::Dest::R(system_temp_result_, 0b1000),
-               LoadSystemConstant(SystemConstants::Index::kTexturesResolutionScaled,
-                                  offsetof(SystemConstants, textures_resolution_scaled),
-                                  dxbc::Src::kXXXX),
-               dxbc::Src::LU(uint32_t(1) << tfetch_index));
-      a_.OpIf(true, dxbc::Src::R(system_temp_result_, dxbc::Src::kWWWW));
-      // The texture is resolution-scaled - scale the coordinates and the size.
-      dxbc::Src resolution_scale_src(dxbc::Src::LF(float(draw_resolution_scale_x_),
-                                                   float(draw_resolution_scale_y_), 1.0f, 1.0f));
-      if (resolution_scaled_coord_components) {
-        a_.OpMul(dxbc::Dest::R(system_temp_result_, resolution_scaled_coord_components), coord_src,
-                 resolution_scale_src);
-      }
-      if (resolution_scaled_size_components) {
-        a_.OpMul(dxbc::Dest::R(size_and_is_3d_temp, resolution_scaled_size_components),
-                 dxbc::Src::R(size_and_is_3d_temp), resolution_scale_src);
-      }
-      a_.OpEndIf();
-    }
     uint32_t offsets_needed = offsets_not_zero & used_result_nonzero_components;
     if (!instr.attributes.unnormalized_coordinates || offsets_needed) {
       // Using system_temp_result_ as a temporary for coordinate denormalization
-      // and offsetting. May already contain the coordinates loaded if
-      // resolution scaling was applied to the coordinates.
+      // and offsetting.
       coord_src = dxbc::Src::R(system_temp_result_);
       dxbc::Dest coord_dest(dxbc::Dest::R(system_temp_result_, used_result_nonzero_components));
       if (instr.attributes.unnormalized_coordinates) {
@@ -1831,7 +1847,111 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
                                      texture_bindless_descriptor_index >> 2)
                            .Select(texture_bindless_descriptor_index & 3));
             }
-            if (grad_v_temp != UINT32_MAX) {
+            if (native_filter_sampling || native_region_sampling) {
+              // Native-lattice image filters may read an earlier 2x scene
+              // resolve. Bilinear filtering directly on the 2x grid shrinks
+              // the paired-tap footprint and leaves gaps in the convolution.
+              // Four host bilinear reads at native texel centers implement
+              // an exact 2x2 box reduction followed by native bilinear weights.
+              // No source resource or guest bytes are modified. Native inputs
+              // take the original path and the shader variant is cache-keyed.
+              const uint32_t native_temp = PushSystemTemp(0, 8);
+              const uint32_t base = native_temp;
+              const uint32_t fraction = native_temp + 1;
+              const uint32_t sample_coord = native_temp + 2;
+              const uint32_t samples = native_temp + 3;
+              const uint32_t upper_center = native_temp + 7;
+              a_.OpAnd(dxbc::Dest::R(base, 0b1000),
+                  LoadSystemConstant(SystemConstants::Index::kTexturesResolutionScaled,
+                      offsetof(SystemConstants, textures_resolution_scaled), dxbc::Src::kXXXX),
+                  dxbc::Src::LU(uint32_t(1) << tfetch_index));
+              if (native_region_sampling) {
+                // A shared SRV may contain both native results and genuinely
+                // scaled neighbors. Only reconstruct a complete native footprint.
+                // Bounds use guest cells, not page extents or a title address.
+                const size_t region_offset = offsetof(SystemConstants, native_texture_regions) +
+                                             sizeof(float) * 4 * tfetch_index;
+                a_.OpMAd(dxbc::Dest::R(base, 0b0011),
+                    dxbc::Src::R(coord_and_sampler_temp), dxbc::Src::R(size_and_is_3d_temp),
+                    dxbc::Src::LF(-0.5f));
+                a_.OpRoundNI(dxbc::Dest::R(base, 0b0011), dxbc::Src::R(base));
+                a_.OpAdd(dxbc::Dest::R(samples + 1, 0b0011),
+                    dxbc::Src::R(size_and_is_3d_temp), dxbc::Src::LF(-1.0f));
+                a_.OpMax(dxbc::Dest::R(sample_coord, 0b0011),
+                    dxbc::Src::R(base), dxbc::Src::LF(0.0f));
+                a_.OpMin(dxbc::Dest::R(sample_coord, 0b0011),
+                    dxbc::Src::R(sample_coord), dxbc::Src::R(samples + 1));
+                a_.OpAdd(dxbc::Dest::R(upper_center, 0b0011),
+                    dxbc::Src::R(base), dxbc::Src::LF(1.0f));
+                a_.OpMax(dxbc::Dest::R(upper_center, 0b0011),
+                    dxbc::Src::R(upper_center), dxbc::Src::LF(0.0f));
+                a_.OpMin(dxbc::Dest::R(upper_center, 0b0011),
+                    dxbc::Src::R(upper_center), dxbc::Src::R(samples + 1));
+                a_.OpGE(dxbc::Dest::R(samples, 0b0011), dxbc::Src::R(sample_coord),
+                    LoadSystemConstant(SystemConstants::Index::kNativeTextureRegions,
+                        region_offset, dxbc::Src::kXYZW));
+                a_.OpLT(dxbc::Dest::R(upper_center, 0b0011), dxbc::Src::R(upper_center),
+                    LoadSystemConstant(SystemConstants::Index::kNativeTextureRegions,
+                        region_offset, 0b11101110 /* ZWZW */));
+                a_.OpAnd(dxbc::Dest::R(base, 0b0100), dxbc::Src::R(samples, dxbc::Src::kXXXX),
+                    dxbc::Src::R(samples, dxbc::Src::kYYYY));
+                a_.OpAnd(dxbc::Dest::R(fraction, 0b0100), dxbc::Src::R(upper_center, dxbc::Src::kXXXX),
+                    dxbc::Src::R(upper_center, dxbc::Src::kYYYY));
+                a_.OpAnd(dxbc::Dest::R(base, 0b0100), dxbc::Src::R(base, dxbc::Src::kZZZZ),
+                    dxbc::Src::R(fraction, dxbc::Src::kZZZZ));
+                a_.OpAnd(dxbc::Dest::R(base, 0b1000), dxbc::Src::R(base, dxbc::Src::kWWWW),
+                    dxbc::Src::R(base, dxbc::Src::kZZZZ));
+              }
+              a_.OpIf(true, dxbc::Src::R(base, dxbc::Src::kWWWW));
+              a_.OpMAd(dxbc::Dest::R(base, 0b0011),
+                  dxbc::Src::R(coord_and_sampler_temp), dxbc::Src::R(size_and_is_3d_temp),
+                  dxbc::Src::LF(-0.5f));
+              a_.OpFrc(dxbc::Dest::R(fraction, 0b0011), dxbc::Src::R(base));
+              a_.OpRoundNI(dxbc::Dest::R(base, 0b0011), dxbc::Src::R(base));
+              a_.OpAdd(dxbc::Dest::R(base, 0b0011), dxbc::Src::R(base), dxbc::Src::LF(0.5f));
+              a_.OpMov(dxbc::Dest::R(sample_coord), dxbc::Src::R(coord_and_sampler_temp));
+              a_.OpAdd(dxbc::Dest::R(upper_center, 0b0011),
+                  dxbc::Src::R(size_and_is_3d_temp), dxbc::Src::LF(-0.5f));
+              for (uint32_t corner = 0; corner < 4; ++corner) {
+                a_.OpAdd(dxbc::Dest::R(sample_coord, 0b0011), dxbc::Src::R(base),
+                    dxbc::Src::LF(float(corner & 1), float(corner >> 1), 0.0f, 0.0f));
+                // Clamp the logical cell, not a single host edge subpixel.
+                a_.OpMax(dxbc::Dest::R(sample_coord, 0b0011),
+                    dxbc::Src::R(sample_coord), dxbc::Src::LF(0.5f));
+                a_.OpMin(dxbc::Dest::R(sample_coord, 0b0011),
+                    dxbc::Src::R(sample_coord), dxbc::Src::R(upper_center));
+                a_.OpDiv(dxbc::Dest::R(sample_coord, 0b0011),
+                    dxbc::Src::R(sample_coord), dxbc::Src::R(size_and_is_3d_temp));
+                a_.OpSampleL(dxbc::Dest::R(samples + corner, used_result_nonzero_components),
+                    dxbc::Src::R(sample_coord), 3, srv_unsigned, sampler, dxbc::Src::LF(0.0f));
+              }
+              // Lerp both rows, then between rows; keep the original swizzle,
+              // sign interpretation and exponent adjustment below this block.
+              for (uint32_t row = 0; row < 2; ++row) {
+                const uint32_t left = samples + row * 2;
+                a_.OpAdd(dxbc::Dest::R(left + 1, used_result_nonzero_components),
+                    dxbc::Src::R(left + 1), -dxbc::Src::R(left));
+                a_.OpMAd(dxbc::Dest::R(left, used_result_nonzero_components),
+                    dxbc::Src::R(left + 1), dxbc::Src::R(fraction, dxbc::Src::kXXXX),
+                    dxbc::Src::R(left));
+              }
+              a_.OpAdd(dxbc::Dest::R(samples + 2, used_result_nonzero_components),
+                  dxbc::Src::R(samples + 2), -dxbc::Src::R(samples));
+              a_.OpMAd(dxbc::Dest::R(layer_value_temp, used_result_nonzero_components),
+                  dxbc::Src::R(samples + 2), dxbc::Src::R(fraction, dxbc::Src::kYYYY),
+                  dxbc::Src::R(samples));
+              a_.OpElse();
+              if (grad_v_temp != UINT32_MAX) {
+                a_.OpSampleD(dxbc::Dest::R(layer_value_temp, used_result_nonzero_components),
+                    dxbc::Src::R(coord_and_sampler_temp), 3, srv_unsigned, sampler,
+                    dxbc::Src::R(grad_h_lod_temp), dxbc::Src::R(grad_v_temp), srv_grad_component_count);
+              } else {
+                a_.OpSampleL(dxbc::Dest::R(layer_value_temp, used_result_nonzero_components),
+                    dxbc::Src::R(coord_and_sampler_temp), 3, srv_unsigned, sampler, lod_src);
+              }
+              a_.OpEndIf();
+              PopSystemTemp(8);
+            } else if (grad_v_temp != UINT32_MAX) {
               assert_not_zero(grad_component_count);
               a_.OpSampleD(dxbc::Dest::R(layer_value_temp, used_result_nonzero_components),
                            dxbc::Src::R(coord_and_sampler_temp), 3, srv_unsigned, sampler,
@@ -1970,6 +2090,31 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
     a_.OpMov(dxbc::Dest::R(system_temp_result_, used_result_zero_components), dxbc::Src::LF(0.0f));
   }
   StoreResult(instr.result, dxbc::Src::R(system_temp_result_));
+
+  // Feed one real, post-format/sign/bias texture-fetch result into the existing
+  // bounded render-target readback. The exact shader performs tf4, tf1, tf0 and
+  // tf2 in that order; the launch-time mode maps 1..4 to those fetch constants.
+  // Ordinary translations have mode zero and emit none of this code.
+  const uint32_t texture_sample_diagnostic =
+      GetDxbcShaderModification().pixel.texture_sample_diagnostic;
+  if (current_shader().ucode_data_hash() == UINT64_C(0xBE763931E2AB7D56) &&
+      texture_sample_diagnostic >= 1 && texture_sample_diagnostic <= 4) {
+    constexpr uint32_t kDiagnosticFetchConstants[] = {4, 1, 0, 2};
+    if (tfetch_index ==
+        kDiagnosticFetchConstants[texture_sample_diagnostic - 1]) {
+      if (texture_sample_diagnostic == 4) {
+        // tf2 only contributes Y (and W, which is not used by the final RGB
+        // calculation); replicate Y so its spatial content is visible.
+        a_.OpMov(dxbc::Dest::R(system_temps_color_[0], 0b0111),
+                 dxbc::Src::R(system_temp_result_, dxbc::Src::kYYYY));
+      } else {
+        a_.OpMov(dxbc::Dest::R(system_temps_color_[0], 0b0111),
+                 dxbc::Src::R(system_temp_result_));
+      }
+      a_.OpMov(dxbc::Dest::R(system_temps_color_[0], 0b1000),
+               dxbc::Src::LF(1.0f));
+    }
+  }
 }
 
 }  // namespace rex::graphics

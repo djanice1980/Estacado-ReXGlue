@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -32,11 +33,15 @@
 #include <rex/filesystem.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/pipeline_cache.h>
+#include <rex/graphics/d3d12/pipeline_preload_policy.h>
+#include <rex/graphics/d3d12/pipeline_storage_seed.h>
 #include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/format/dxbc.h>
 #include <rex/graphics/pipeline_util.h>
+#include <rex/graphics/pipeline_storage_policy.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
+#include <rex/graphics/pipeline/shader/replacement_pack.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
@@ -61,6 +66,25 @@ REXCVAR_DEFINE_INT32(d3d12_pipeline_creation_threads, -1, "GPU/D3D12",
 
 REXCVAR_DEFINE_BOOL(d3d12_tessellation_wireframe, false, "GPU/D3D12",
                     "Render tessellation as wireframe");
+
+REXCVAR_DEFINE_BOOL(d3d12_pipeline_storage_seed, true, "GPU/D3D12",
+                    "Merge the packaged shader/pipeline seed (runtime_data/pipeline_seed) into "
+                    "the persistent storage before preloading it")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(
+    d3d12_embedded_scene_sample_diagnostic, 0, "GPU/D3D12",
+    "Expose one bounded embedded scene shader value (0=off, 1..4=fetches, 5..7=final RGB multiply)")
+    .range(0, 7)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(
+    d3d12_embedded_scene_shaded_depth_compare_diagnostic, 0, "GPU/D3D12",
+    "Diagnose the scaled embedded scene shaded depth mismatch (0=off, 1=less-equal, 2=greater-equal)")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DECLARE(bool, d3d12_embedded_scene_host_vertex_output_diagnostic);
 
 namespace rex::graphics::d3d12 {
 
@@ -251,6 +275,35 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
   auto pipeline_storage_file_path =
       shader_storage_shareable_root /
       fmt::format("{:08X}.{}.d3d12.xpso", title_id, edram_rov_used ? "rov" : "rtv");
+  const uint32_t pipeline_storage_version =
+      std::max(PipelineDescription::kVersion, DxbcShaderTranslator::Modification::kVersion);
+
+  // Merge the packaged seed (records from earlier sessions) into the store so
+  // the blocking preload below also covers content this machine hasn't
+  // rendered yet. The seed goes through the same validation as the store.
+  static_assert(sizeof(ShaderStoredHeader) == pipeline_storage_seed::kShaderRecordHeaderSize);
+  static_assert(sizeof(PipelineStoredDescription) == pipeline_storage_seed::kPipelineRecordSize);
+  pipeline_storage_seed::FileResult seed_shaders;
+  pipeline_storage_seed::FileResult seed_pipelines;
+  const bool seed_enabled = REXCVAR_GET(d3d12_pipeline_storage_seed);
+  if (seed_enabled) {
+    const std::filesystem::path seed_root =
+        rex::filesystem::GetExecutableFolder() / "runtime_data" / "pipeline_seed";
+    seed_shaders = pipeline_storage_seed::MergeShaders(
+        seed_root / fmt::format("{:08X}.xsh", title_id),
+        shader_storage_shareable_root / fmt::format("{:08X}.xsh", title_id),
+        ShaderStoredHeader::kVersion);
+    seed_pipelines = pipeline_storage_seed::MergePipelines(
+        seed_root / pipeline_storage_file_path.filename(), pipeline_storage_file_path,
+        edram_rov_used ? pipeline_storage_seed::kPipelineApiRov
+                       : pipeline_storage_seed::kPipelineApiRtv,
+        pipeline_storage_version);
+  }
+  size_t preload_shaders = 0;
+  uint64_t preload_shader_ms = 0;
+  size_t preload_pipelines = 0;
+  uint64_t preload_pipeline_ms = 0;
+
   pipeline_storage_file_ = rex::filesystem::OpenFile(pipeline_storage_file_path, "a+b");
   if (!pipeline_storage_file_) {
     REXGPU_ERROR(
@@ -261,11 +314,12 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
   }
   pipeline_storage_file_flush_needed_ = false;
   // 'XEPS'.
-  const uint32_t pipeline_storage_magic = 0x53504558;
+  const uint32_t pipeline_storage_magic = pipeline_storage_seed::kPipelineMagic;
   // 'DXRO' or 'DXRT'.
-  const uint32_t pipeline_storage_magic_api = edram_rov_used ? 0x4F525844 : 0x54525844;
-  const uint32_t pipeline_storage_version_swapped = rex::byte_swap(
-      std::max(PipelineDescription::kVersion, DxbcShaderTranslator::Modification::kVersion));
+  const uint32_t pipeline_storage_magic_api = edram_rov_used
+                                                  ? pipeline_storage_seed::kPipelineApiRov
+                                                  : pipeline_storage_seed::kPipelineApiRtv;
+  const uint32_t pipeline_storage_version_swapped = rex::byte_swap(pipeline_storage_version);
   struct {
     uint32_t magic;
     uint32_t magic_api;
@@ -345,7 +399,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
     uint32_t version_swapped;
   } shader_storage_file_header;
   // 'XESH'.
-  const uint32_t shader_storage_magic = 0x48534558;
+  const uint32_t shader_storage_magic = pipeline_storage_seed::kShaderMagic;
   if (fread(&shader_storage_file_header, sizeof(shader_storage_file_header), 1,
             shader_storage_file_) &&
       shader_storage_file_header.magic == shader_storage_magic &&
@@ -510,9 +564,12 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
         }
       }
     }
+    preload_shaders = shaders_translated;
+    preload_shader_ms =
+        (rex::chrono::Clock::QueryHostTickCount() - shader_storage_initialization_start) * 1000 /
+        rex::chrono::Clock::QueryHostTickFrequency();
     REXGPU_INFO("Translated {} shaders from the storage in {} milliseconds", shaders_translated,
-                (rex::chrono::Clock::QueryHostTickCount() - shader_storage_initialization_start) *
-                    1000 / rex::chrono::Clock::QueryHostTickFrequency());
+                preload_shader_ms);
     rex::filesystem::TruncateStdioFile(shader_storage_file_, shader_storage_valid_bytes);
   } else {
     rex::filesystem::TruncateStdioFile(shader_storage_file_, 0);
@@ -529,10 +586,11 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
     // Launch additional creation threads to use all cores to create
     // pipelines faster. Will also be using the main thread, so minus 1.
     size_t creation_thread_original_count = creation_threads_.size();
-    size_t creation_thread_needed_count =
-        std::max(std::min(pipeline_stored_descriptions.size(), logical_processor_count) - size_t(1),
-                 creation_thread_original_count);
-    while (creation_threads_.size() < creation_thread_original_count) {
+    const size_t creation_thread_needed_count =
+        pipeline_preload_policy::ResolveWorkerTarget(
+            creation_thread_original_count, pipeline_stored_descriptions.size(),
+            logical_processor_count);
+    while (creation_threads_.size() < creation_thread_needed_count) {
       size_t creation_thread_index = creation_threads_.size();
       std::unique_ptr<rex::thread::Thread> creation_thread = rex::thread::Thread::Create(
           {}, [this, creation_thread_index]() { CreationThread(creation_thread_index); });
@@ -652,45 +710,48 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
 
     if (!creation_threads_.empty()) {
       CreateQueuedPipelinesOnProcessorThread();
-      if (creation_threads_.size() > creation_thread_original_count) {
-        {
-          std::lock_guard<std::mutex> lock(creation_request_lock_);
+      const bool has_temporary_creation_threads =
+          creation_threads_.size() > creation_thread_original_count;
+      bool await_creation_completion = false;
+      {
+        std::lock_guard<std::mutex> lock(creation_request_lock_);
+        if (has_temporary_creation_threads) {
           creation_threads_shutdown_from_ = creation_thread_original_count;
-          // Assuming the queue is empty because of
-          // CreateQueuedPipelinesOnProcessorThread.
         }
+        // CreateQueuedPipelinesOnProcessorThread empties the queue, but worker
+        // threads may still own pipeline creations. A blocking preload must
+        // wait for them regardless of whether temporary workers were needed.
+        await_creation_completion =
+            pipeline_preload_policy::MustAwaitCompletion(
+                blocking, creation_threads_busy_);
+        if (await_creation_completion) {
+          creation_completion_event_->Reset();
+          creation_completion_set_event_ = true;
+        }
+      }
+      if (has_temporary_creation_threads || await_creation_completion) {
         creation_request_cond_.notify_all();
+      }
+      if (await_creation_completion) {
+        rex::thread::Wait(creation_completion_event_.get(), false);
+      }
+      if (has_temporary_creation_threads) {
         while (creation_threads_.size() > creation_thread_original_count) {
           rex::thread::Wait(creation_threads_.back().get(), false);
           creation_threads_.pop_back();
         }
-        bool await_creation_completion_event;
-        {
-          // Cleanup so additional threads can be created later again.
-          std::lock_guard<std::mutex> lock(creation_request_lock_);
-          creation_threads_shutdown_from_ = SIZE_MAX;
-          // If the invocation is blocking, all the shader storage
-          // initialization is expected to be done before proceeding, to avoid
-          // latency in the command processor after the invocation.
-          await_creation_completion_event = blocking && creation_threads_busy_ != 0;
-          if (await_creation_completion_event) {
-            creation_completion_event_->Reset();
-            creation_completion_set_event_ = true;
-          }
-        }
-        if (await_creation_completion_event) {
-          creation_request_cond_.notify_one();
-          rex::thread::Wait(creation_completion_event_.get(), false);
-        }
+        std::lock_guard<std::mutex> lock(creation_request_lock_);
+        creation_threads_shutdown_from_ = SIZE_MAX;
       }
     }
 
+    preload_pipelines = pipelines_created;
+    preload_pipeline_ms = (rex::chrono::Clock::QueryHostTickCount() - pipeline_creation_start_) *
+                          1000 / rex::chrono::Clock::QueryHostTickFrequency();
     REXGPU_INFO(
         "Created {} graphics pipelines (not including reading the "
         "descriptions) from the storage in {} milliseconds",
-        pipelines_created,
-        (rex::chrono::Clock::QueryHostTickCount() - pipeline_creation_start_) * 1000 /
-            rex::chrono::Clock::QueryHostTickFrequency());
+        pipelines_created, preload_pipeline_ms);
     // If any pipeline descriptions were corrupted (or the whole file has excess
     // bytes in the end), truncate to the last valid pipeline description.
     rex::filesystem::TruncateStdioFile(
@@ -708,6 +769,19 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
 
   shader_storage_cache_root_ = cache_root;
   shader_storage_title_id_ = title_id;
+
+  // One line per start: how much the seed added and what the preload cost.
+  std::fprintf(stderr,
+               "REX_PIPELINE_STORAGE_PRELOAD seed=%d seed_shaders=%zu seed_shaders_added=%zu "
+               "seed_pipelines=%zu seed_pipelines_added=%zu seed_write_failed=%d shaders=%zu "
+               "shader_ms=%llu pipelines=%zu pipeline_ms=%llu blocking=%d\n",
+               seed_enabled ? 1 : 0, seed_shaders.seed_records, seed_shaders.added,
+               seed_pipelines.seed_records, seed_pipelines.added,
+               (seed_shaders.write_failed || seed_pipelines.write_failed) ? 1 : 0,
+               preload_shaders, static_cast<unsigned long long>(preload_shader_ms),
+               preload_pipelines, static_cast<unsigned long long>(preload_pipeline_ms),
+               blocking ? 1 : 0);
+  std::fflush(stderr);
 
   // Start the storage writing thread.
   storage_write_flush_shaders_ = false;
@@ -801,6 +875,12 @@ D3D12Shader* PipelineCache::LoadShader(xenos::ShaderType shader_type, const uint
 
 D3D12Shader* PipelineCache::LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
                                        uint32_t dword_count, uint64_t data_hash) {
+  if (const ShaderReplacement* replacement =
+          FindConfiguredShaderReplacement(shader_type, data_hash, host_address, dword_count)) {
+    host_address = replacement->ucode.data();
+    dword_count = uint32_t(replacement->ucode.size());
+    data_hash = replacement->replacement_hash;
+  }
   auto it = shaders_.find(data_hash);
   if (it != shaders_.end()) {
     // Shader has been previously loaded.
@@ -827,7 +907,6 @@ DxbcShaderTranslator::Modification PipelineCache::GetCurrentVertexShaderModifica
           host_vertex_shader_type));
 
   modification.vertex.interpolator_mask = interpolator_mask;
-
   auto pa_cl_clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
   uint32_t user_clip_planes = pa_cl_clip_cntl.clip_disable ? 0 : pa_cl_clip_cntl.ucp_ena;
   modification.vertex.user_clip_plane_count = rex::bit_count(user_clip_planes);
@@ -874,8 +953,11 @@ DxbcShaderTranslator::Modification PipelineCache::GetCurrentPixelShaderModificat
   }
 
   if (render_target_cache_.GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
+    modification.pixel.resolution_scale_native =
+        uint32_t(render_target_cache_.IsDrawScaleNative());
+
     using DepthStencilMode = DxbcShaderTranslator::Modification::DepthStencilMode;
-    if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
+    if (render_target_cache_.current_draw_depth_float24_convert_in_pixel_shader() &&
         normalized_depth_control.z_enable &&
         regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
       modification.pixel.depth_stencil_mode = render_target_cache_.depth_float24_round()
@@ -890,6 +972,17 @@ DxbcShaderTranslator::Modification PipelineCache::GetCurrentPixelShaderModificat
         modification.pixel.depth_stencil_mode = DepthStencilMode::kNoModifiers;
       }
     }
+  }
+
+  // This is an observational, launch-time-only diagnostic for a single shader
+  // whose inputs are captured independently by the command processor. Keeping
+  // the selector in the modification value gives every diagnostic mode its own
+  // translated-shader and persistent-cache identity.
+  constexpr uint64_t kEmbeddedSceneShadedPixelShaderHash =
+      UINT64_C(0xBE763931E2AB7D56);
+  if (shader.ucode_data_hash() == kEmbeddedSceneShadedPixelShaderHash) {
+    modification.pixel.texture_sample_diagnostic =
+        uint32_t(REXCVAR_GET(d3d12_embedded_scene_sample_diagnostic));
   }
 
   return modification;
@@ -989,6 +1082,8 @@ bool PipelineCache::ConfigurePipeline(
 
   if (current_pipeline_ != nullptr && !std::memcmp(&current_pipeline_->description.description,
                                                    &description, sizeof(description))) {
+    // Telemetry feeds only the hitch report (measurement builds).
+    if (kGpuDiagnostics) ++telemetry_current_reuses_;
     *pipeline_handle_out = current_pipeline_;
     *root_signature_out = current_pipeline_->root_signature.load(std::memory_order_acquire);
     return true;
@@ -1001,6 +1096,7 @@ bool PipelineCache::ConfigurePipeline(
     Pipeline* found_pipeline = it->second;
     if (!std::memcmp(&found_pipeline->description.description, &description, sizeof(description))) {
       PROFILE_PIPELINE_CACHE_HIT();
+      if (kGpuDiagnostics) ++telemetry_cache_hits_;
       current_pipeline_ = found_pipeline;
       *pipeline_handle_out = found_pipeline;
       *root_signature_out = found_pipeline->root_signature.load(std::memory_order_acquire);
@@ -1008,6 +1104,7 @@ bool PipelineCache::ConfigurePipeline(
     }
   }
   PROFILE_PIPELINE_CACHE_MISS();
+  if (kGpuDiagnostics) ++telemetry_cache_misses_;
 
   Pipeline* new_pipeline = new Pipeline;
   std::memcpy(&new_pipeline->description, &runtime_description, sizeof(runtime_description));
@@ -1015,7 +1112,10 @@ bool PipelineCache::ConfigurePipeline(
   pipelines_.emplace(hash, new_pipeline);
   COUNT_profile_set("gpu/pipeline_cache/pipelines", pipelines_.size());
 
-  if (use_async) {
+  // A creation thread creates the pipeline while the rest of the submission is
+  // recorded: the draw refers to the pipeline by its handle, and EndSubmission
+  // waits for the creation before the command list is executed.
+  const auto queue_creation = [&]() {
     uint32_t bound_rts =
         pipeline_util::GetBoundRTMaskFromNormalizedColorMask(normalized_color_mask);
     uint32_t shader_writes_color_targets =
@@ -1024,16 +1124,25 @@ bool PipelineCache::ConfigurePipeline(
                                             : normalized_depth_control.z_write_enable != 0;
     new_pipeline->priority = pipeline_util::CalculatePipelinePriority(
         bound_rts, shader_writes_color_targets, shader_writes_depth);
-    new_pipeline->pending_vertex_shader = vertex_shader;
-    new_pipeline->pending_pixel_shader = pixel_shader;
     // Submit the pipeline for creation to any available thread.
     {
       std::lock_guard<std::mutex> lock(creation_request_lock_);
       creation_queue_.push(new_pipeline);
     }
+    if (kGpuDiagnostics) ++telemetry_async_queued_;
     creation_request_cond_.notify_one();
+  };
+  if (use_async) {
+    // The creation thread translates the shaders too, and IssueDraw skips the
+    // draws until the pipeline exists.
+    new_pipeline->pending_vertex_shader = vertex_shader;
+    new_pipeline->pending_pixel_shader = pixel_shader;
+    queue_creation();
+  } else if (!creation_threads_.empty() && !REXCVAR_GET(async_shader_compilation)) {
+    queue_creation();
   } else {
     new_pipeline->state.store(CreateD3D12Pipeline(runtime_description), std::memory_order_release);
+    if (kGpuDiagnostics) ++telemetry_sync_created_;
   }
 
   if (pipeline_storage_file_) {
@@ -1213,11 +1322,16 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator& translator,
 
   // Disassemble the shader for dumping.
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+  // Keep host disassembly for the bounded PRESS START texture-sampling probe.
+  // This is observational and does not change the translated shader binary.
+  constexpr uint64_t kPromptPixelShaderHash = UINT64_C(0x207D40E674A7C916);
+  const bool disassemble_dxbc =
+      REXCVAR_GET(d3d12_dxbc_disasm) || shader.ucode_data_hash() == kPromptPixelShaderHash;
   if (REXCVAR_GET(d3d12_dxbc_disasm_dxilconv)) {
-    translation.DisassembleDxbcAndDxil(provider, REXCVAR_GET(d3d12_dxbc_disasm), dxbc_converter,
+    translation.DisassembleDxbcAndDxil(provider, disassemble_dxbc, dxbc_converter,
                                        dxc_utils, dxc_compiler);
   } else {
-    translation.DisassembleDxbcAndDxil(provider, REXCVAR_GET(d3d12_dxbc_disasm));
+    translation.DisassembleDxbcAndDxil(provider, disassemble_dxbc);
   }
 
   // Dump shader files if desired.
@@ -1424,6 +1538,8 @@ bool PipelineCache::GetCurrentStateDescription(
         regs.Get<reg::RB_DEPTH_INFO>().depth_format, polygon_offset);
     description_out.depth_bias_slope_scaled =
         polygon_offset_scale * xenos::kPolygonOffsetScaleSubpixelUnit;
+    description_out.resolution_scale_native =
+        uint32_t(render_target_cache_.IsDrawScaleNative());
   }
   if (tessellated && REXCVAR_GET(d3d12_tessellation_wireframe)) {
     description_out.fill_mode_wireframe = 1;
@@ -1476,6 +1592,9 @@ bool PipelineCache::GetCurrentStateDescription(
           description_out.depth_write || description_out.stencil_enable) {
         description_out.depth_format =
             xenos::DepthRenderTargetFormat(bound_depth_and_color_render_target_formats[0]);
+        description_out.depth_float24_convert_in_pixel_shader = uint32_t(
+            description_out.depth_format == xenos::DepthRenderTargetFormat::kD24FS8 &&
+            render_target_cache_.current_draw_depth_float24_convert_in_pixel_shader());
         depth_stencil_bound_and_used = true;
       }
     } else {
@@ -2679,6 +2798,47 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     const PipelineRuntimeDescription& runtime_description) {
   const PipelineDescription& description = runtime_description.description;
 
+  // Probe231 proved that keeping the title's stencil test while changing the
+  // affected shaded draw's depth comparison from equal to always restores its
+  // rasterized coverage. Probe232 then proved that every referenced guest
+  // vertex has bit-identical clip, screen and depth output in the prepass and
+  // shaded passes. This launch-time-only diagnostic determines whether the
+  // remaining host post-vertex depth difference is consistently below, above,
+  // or straddles the stored prepass value. It is deliberately exact-targeted,
+  // scale-only and disabled by default; it is not a rendering workaround.
+  xenos::CompareFunction effective_depth_func = description.depth_func;
+  const int32_t shaded_depth_compare_diagnostic =
+      REXCVAR_GET(d3d12_embedded_scene_shaded_depth_compare_diagnostic);
+  const bool is_scaled_embedded_scene_shaded_pipeline =
+      shaded_depth_compare_diagnostic != 0 &&
+      (render_target_cache_.draw_resolution_scale_x() > 1 ||
+       render_target_cache_.draw_resolution_scale_y() > 1) &&
+      runtime_description.vertex_shader != nullptr &&
+      runtime_description.pixel_shader != nullptr &&
+      runtime_description.vertex_shader->shader().ucode_data_hash() ==
+          UINT64_C(0x818A2B33A7AB4ECE) &&
+      runtime_description.pixel_shader->shader().ucode_data_hash() ==
+          UINT64_C(0xBE763931E2AB7D56) &&
+      description.depth_func == xenos::CompareFunction::kEqual;
+  if (is_scaled_embedded_scene_shaded_pipeline) {
+    effective_depth_func =
+        shaded_depth_compare_diagnostic == 1
+            ? xenos::CompareFunction::kLessEqual
+            : xenos::CompareFunction::kGreaterEqual;
+    static std::atomic<uint32_t> diagnostic_pipeline_count{0};
+    const uint32_t diagnostic_ordinal =
+        diagnostic_pipeline_count.fetch_add(1, std::memory_order_relaxed);
+    if (diagnostic_ordinal < 4) {
+      std::fprintf(
+          stderr,
+          "REX_EMBEDDED_SCENE_SHADED_DEPTH_DIRECTION ordinal=%u mode=%d original=%u effective=%u scale=%ux%u\n",
+          diagnostic_ordinal, shaded_depth_compare_diagnostic,
+          uint32_t(description.depth_func), uint32_t(effective_depth_func),
+          render_target_cache_.draw_resolution_scale_x(),
+          render_target_cache_.draw_resolution_scale_y());
+    }
+  }
+
   if (runtime_description.pixel_shader != nullptr) {
     REXGPU_DEBUG("Creating graphics pipeline with VS {:016X}, PS {:016X}",
                  runtime_description.vertex_shader->shader().ucode_data_hash(),
@@ -2690,6 +2850,8 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
 
   D3D12_GRAPHICS_PIPELINE_STATE_DESC state_desc;
   std::memset(&state_desc, 0, sizeof(state_desc));
+  D3D12_SO_DECLARATION_ENTRY embedded_scene_position_stream_output = {};
+  UINT embedded_scene_position_stream_output_stride = sizeof(float) * 4;
 
   bool edram_rov_used =
       render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
@@ -2825,6 +2987,48 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     }
   }
 
+  // Stream out only the three exact scaled scene pipelines used to localize
+  // the depth-EQUAL mismatch. SV_Position is captured after the translated
+  // guest shader and ReXGlue's clip-space conversion, but before host clipping
+  // and raster setup. Stream 0 continues to rasterize normally.
+  if (REXCVAR_GET(d3d12_embedded_scene_host_vertex_output_diagnostic) &&
+      (render_target_cache_.draw_resolution_scale_x() > 1 ||
+       render_target_cache_.draw_resolution_scale_y() > 1)) {
+    const uint64_t vertex_shader_hash =
+        runtime_description.vertex_shader->shader().ucode_data_hash();
+    const uint64_t pixel_shader_hash =
+        runtime_description.pixel_shader
+            ? runtime_description.pixel_shader->shader().ucode_data_hash()
+            : 0;
+    const bool is_prepass =
+        vertex_shader_hash == UINT64_C(0x52472DD3CF459B83) &&
+        pixel_shader_hash == 0 &&
+        description.depth_func == xenos::CompareFunction::kGreaterEqual;
+    const bool is_control =
+        vertex_shader_hash == UINT64_C(0x539FB8DE2DD7715A) &&
+        pixel_shader_hash == UINT64_C(0x7EF6E3B55D32AEB4) &&
+        description.depth_func == xenos::CompareFunction::kEqual;
+    const bool is_shaded =
+        vertex_shader_hash == UINT64_C(0x818A2B33A7AB4ECE) &&
+        pixel_shader_hash == UINT64_C(0xBE763931E2AB7D56) &&
+        description.depth_func == xenos::CompareFunction::kEqual;
+    if (is_prepass || is_control || is_shaded) {
+      embedded_scene_position_stream_output.Stream = 0;
+      embedded_scene_position_stream_output.SemanticName = "SV_Position";
+      embedded_scene_position_stream_output.SemanticIndex = 0;
+      embedded_scene_position_stream_output.StartComponent = 0;
+      embedded_scene_position_stream_output.ComponentCount = 4;
+      embedded_scene_position_stream_output.OutputSlot = 0;
+      state_desc.StreamOutput.pSODeclaration =
+          &embedded_scene_position_stream_output;
+      state_desc.StreamOutput.NumEntries = 1;
+      state_desc.StreamOutput.pBufferStrides =
+          &embedded_scene_position_stream_output_stride;
+      state_desc.StreamOutput.NumStrides = 1;
+      state_desc.StreamOutput.RasterizedStream = 0;
+    }
+  }
+
   // Pixel shader.
   if (runtime_description.pixel_shader != nullptr) {
     if (!runtime_description.pixel_shader->is_translated()) {
@@ -2839,7 +3043,7 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     state_desc.PS.pShaderBytecode = depth_only_pixel_shader_.data();
     state_desc.PS.BytecodeLength = depth_only_pixel_shader_.size();
   } else {
-    if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
+    if (description.depth_float24_convert_in_pixel_shader &&
         (description.depth_func != xenos::CompareFunction::kAlways || description.depth_write) &&
         description.depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
       if (render_target_cache_.depth_float24_round()) {
@@ -2885,8 +3089,10 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
   // more likely.
   state_desc.RasterizerState.SlopeScaledDepthBias =
       description.depth_bias_slope_scaled *
-      float(std::max(render_target_cache_.draw_resolution_scale_x(),
-                     render_target_cache_.draw_resolution_scale_y()));
+      (description.resolution_scale_native
+           ? 1.0f
+           : float(std::max(render_target_cache_.draw_resolution_scale_x(),
+                            render_target_cache_.draw_resolution_scale_y())));
   state_desc.RasterizerState.DepthClipEnable = description.depth_clip ? TRUE : FALSE;
   uint32_t msaa_sample_count = uint32_t(1) << uint32_t(description.host_msaa_samples);
   if (edram_rov_used) {
@@ -2925,14 +3131,14 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
 
   if (!edram_rov_used) {
     // Depth/stencil.
-    if (description.depth_func != xenos::CompareFunction::kAlways || description.depth_write) {
+    if (effective_depth_func != xenos::CompareFunction::kAlways || description.depth_write) {
       state_desc.DepthStencilState.DepthEnable = TRUE;
       state_desc.DepthStencilState.DepthWriteMask =
           description.depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
       // Comparison functions are the same in Direct3D 12 but plus one (minus
       // one, bit 0 for less, bit 1 for equal, bit 2 for greater).
       state_desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC(
-          uint32_t(D3D12_COMPARISON_FUNC_NEVER) + uint32_t(description.depth_func));
+          uint32_t(D3D12_COMPARISON_FUNC_NEVER) + uint32_t(effective_depth_func));
     }
     if (description.stencil_enable) {
       state_desc.DepthStencilState.StencilEnable = TRUE;
@@ -3081,9 +3287,6 @@ void PipelineCache::StorageWriteThread() {
     bool write_pipeline = false;
     {
       std::unique_lock<std::mutex> lock(storage_write_request_lock_);
-      if (storage_write_thread_shutdown_) {
-        return;
-      }
       if (!storage_write_shader_queue_.empty()) {
         shader = storage_write_shader_queue_.front();
         storage_write_shader_queue_.pop_front();
@@ -3100,7 +3303,20 @@ void PipelineCache::StorageWriteThread() {
         storage_write_flush_pipelines_ = false;
         flush_pipelines = true;
       }
-      if (!shader && !write_pipeline) {
+      const bool writer_has_selected_work =
+          rex::graphics::pipeline_storage_policy::HasSelectedWork(
+              shader != nullptr, write_pipeline, flush_shaders,
+              flush_pipelines);
+      // A clean shutdown must drain records already accepted by the writer.
+      // Otherwise a title can successfully create a shader or pipeline, exit,
+      // and then repeat the same cold creation on the next run. Flush-only
+      // requests are work too and must reach the fflush calls above rather than
+      // going back to sleep until an unrelated later notification.
+      if (rex::graphics::pipeline_storage_policy::MayExitAfterDrain(
+              storage_write_thread_shutdown_, writer_has_selected_work)) {
+        return;
+      }
+      if (!writer_has_selected_work) {
         storage_write_request_cond_.wait(lock);
         continue;
       }
@@ -3226,11 +3442,19 @@ void PipelineCache::CreationThread(size_t thread_index) {
     }
 
     PipelineRuntimeDescription runtime_description;
+    bool creation_failed = false;
     if (!PrepareRuntimeDescriptionForQueuedCreation(pipeline_to_create, runtime_description)) {
       pipeline_to_create->state.store(nullptr, std::memory_order_release);
+      creation_failed = true;
     } else {
-      pipeline_to_create->state.store(CreateD3D12Pipeline(runtime_description),
-                                      std::memory_order_release);
+      ID3D12PipelineState* pipeline_state =
+          CreateD3D12Pipeline(runtime_description);
+      pipeline_to_create->state.store(pipeline_state, std::memory_order_release);
+      creation_failed = pipeline_state == nullptr;
+    }
+    telemetry_async_completed_.fetch_add(1, std::memory_order_relaxed);
+    if (creation_failed) {
+      telemetry_async_failed_.fetch_add(1, std::memory_order_relaxed);
     }
 
     // Pipeline created - the thread is not busy anymore, safe to set the
@@ -3256,13 +3480,39 @@ void PipelineCache::CreateQueuedPipelinesOnProcessorThread() {
       creation_queue_.pop();
     }
     PipelineRuntimeDescription runtime_description;
+    bool creation_failed = false;
     if (!PrepareRuntimeDescriptionForQueuedCreation(pipeline_to_create, runtime_description)) {
       pipeline_to_create->state.store(nullptr, std::memory_order_release);
-      continue;
+      creation_failed = true;
+    } else {
+      ID3D12PipelineState* pipeline_state =
+          CreateD3D12Pipeline(runtime_description);
+      pipeline_to_create->state.store(pipeline_state, std::memory_order_release);
+      creation_failed = pipeline_state == nullptr;
     }
-    pipeline_to_create->state.store(CreateD3D12Pipeline(runtime_description),
-                                    std::memory_order_release);
+    telemetry_async_completed_.fetch_add(1, std::memory_order_relaxed);
+    if (creation_failed) {
+      telemetry_async_failed_.fetch_add(1, std::memory_order_relaxed);
+    }
   }
+}
+
+PipelineCache::TelemetrySnapshot PipelineCache::GetTelemetrySnapshot() {
+  TelemetrySnapshot snapshot;
+  snapshot.current_reuses = telemetry_current_reuses_;
+  snapshot.cache_hits = telemetry_cache_hits_;
+  snapshot.cache_misses = telemetry_cache_misses_;
+  snapshot.async_queued = telemetry_async_queued_;
+  snapshot.sync_created = telemetry_sync_created_;
+  snapshot.async_completed =
+      telemetry_async_completed_.load(std::memory_order_relaxed);
+  snapshot.async_failed = telemetry_async_failed_.load(std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(creation_request_lock_);
+    snapshot.queue_depth = creation_queue_.size();
+    snapshot.threads_busy = creation_threads_busy_;
+  }
+  return snapshot;
 }
 
 }  // namespace rex::graphics::d3d12

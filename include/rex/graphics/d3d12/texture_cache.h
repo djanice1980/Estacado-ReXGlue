@@ -15,6 +15,7 @@
 #include <functional>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -22,7 +23,12 @@
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/graphics/pipeline/texture/cache.h>
+#include <rex/graphics/pipeline/texture/texture_pack.h>
 #include <rex/graphics/pipeline/texture/util.h>
+#include <rex/graphics/embedded_texture_readback_policy.h>
+#include <rex/graphics/offset_allocator.h>
+#include <rex/graphics/pc_scene_color_history.h>
+#include <rex/graphics/pc_draw_transform_history.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/xenos.h>
 #include <rex/ui/d3d12/d3d12_api.h>
@@ -90,6 +96,12 @@ class D3D12TextureCache final : public TextureCache {
   void BeginFrame() override;
   void EndFrame();
 
+  // Arms the same bounded one-shot loader/resource readback for the actual
+  // output interval selected by a semantic resolve diagnostic. This avoids
+  // relying on a title allocation address observed in an earlier process.
+  void ArmTextureReadbackDiagnostic(uint32_t guest_address,
+                                    uint32_t guest_length);
+
   // Must be called within a submission - creates and untiles textures needed by
   // shaders and puts them in the SRV state. This may bind compute pipelines
   // (notifying the command processor about that), so this must be called before
@@ -122,6 +134,13 @@ class D3D12TextureCache final : public TextureCache {
   // Ensures the tiles backing the range in the buffers are allocated.
   bool EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled, uint32_t length_unscaled,
                                           uint32_t length_scaled_alignment_log2 = 0) override;
+  // Materializes pages that don't currently have a resolution-scaled
+  // representation from authoritative 1x shared memory, using the scaled tiled
+  // group layout. Used both before a partial resolve and when loading a texture
+  // that contains a mixture of scaled and unscaled pages.
+  bool InitializeUnscaledResolvePagesFromSharedMemory(
+      uint32_t start_unscaled, uint32_t length_unscaled,
+      uint32_t bytes_per_block_log2);
   // Makes the specified range of up to 1-2 GB currently accessible on the GPU.
   // One draw call can access only at most one range - the same memory is
   // accessible through different buffers based on the range needed, so aliasing
@@ -134,7 +153,9 @@ class D3D12TextureCache final : public TextureCache {
   void CreateCurrentScaledResolveRangeUintPow2SRV(D3D12_CPU_DESCRIPTOR_HANDLE handle,
                                                   uint32_t element_size_bytes_pow2);
   void CreateCurrentScaledResolveRangeUintPow2UAV(D3D12_CPU_DESCRIPTOR_HANDLE handle,
-                                                  uint32_t element_size_bytes_pow2);
+                                                   uint32_t element_size_bytes_pow2);
+  void CreateCurrentScaledResolveRangeRawUAV(
+      D3D12_CPU_DESCRIPTOR_HANDLE handle);
   void TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATES new_state);
   uint64_t GetCurrentScaledResolveRangeStartScaled() const {
     return scaled_resolve_current_range_start_scaled_;
@@ -152,6 +173,13 @@ class D3D12TextureCache final : public TextureCache {
     assert_true(IsDrawResolutionScaled());
     GetCurrentScaledResolveBuffer().SetUAVBarrierPending();
   }
+  // Reads back exactly one scaled resolve output interval after its compute
+  // dispatch. This is an opt-in, synchronous diagnostic boundary used to
+  // distinguish resolve conversion from the later texture loader.
+  bool CaptureCurrentScaledResolveRange(uint32_t start_unscaled,
+                                        uint32_t length_unscaled,
+                                        const char* diagnostic_label,
+                                        const char* dump_path);
 
   // Returns the ID3D12Resource of the front buffer texture (in
   // NON_PIXEL_SHADER_RESOURCE state), or nullptr in case of failure, and writes
@@ -161,6 +189,83 @@ class D3D12TextureCache final : public TextureCache {
                                      xenos::TextureFormat& format_out,
                                      uint32_t* width_unscaled_out = nullptr,
                                      uint32_t* height_unscaled_out = nullptr);
+
+  // Bounded diagnostics for proving the exact resource selected by a texture
+  // fetch without exposing the cache's binding implementation to the command
+  // processor. This is observational only and does not retain the resource.
+  struct ActiveTextureDiagnostic {
+    uint32_t guest_base = 0;
+    uint32_t guest_size = 0;
+    uint32_t guest_width = 0;
+    uint32_t guest_height = 0;
+    uint32_t guest_depth_or_array_size = 0;
+    uint32_t guest_format = 0;
+    uint32_t guest_dimension = 0;
+    uint32_t guest_tiled = 0;
+    uint32_t scaled_resolve = 0;
+    uint32_t outdated_mask = 0;
+    uint32_t descriptor_index = UINT32_MAX;
+    uint32_t descriptor_index_signed = UINT32_MAX;
+    uint64_t resource_identity = 0;
+    uint64_t resource_width = 0;
+    uint32_t resource_height = 0;
+    uint32_t resource_depth_or_array_size = 0;
+    uint32_t resource_mip_levels = 0;
+    uint32_t resource_format = 0;
+  };
+  bool GetActiveTextureDiagnostic(uint32_t fetch_constant_index,
+                                  ActiveTextureDiagnostic& diagnostic_out) const;
+  void CaptureActiveTextureReadbackDiagnostics(
+      const uint32_t* fetch_constant_indices, size_t fetch_constant_count,
+      bool scaled_resolve_only = false, uint64_t context_draw_ordinal = 0,
+      bool distinguish_draw_epoch = false);
+  void CaptureFirstTemporalDepthBinding(uint32_t used_texture_mask,
+                                       uint64_t context_draw_ordinal);
+
+  // Actual final-composite scene input, preserved before mutable cache reuse.
+  // Color storage only: these resources do not assert reprojection validity.
+  bool OwnsSceneHistory() const;
+  void RecordOwnedDrawTransform(const pc_draw_transform_history::Draw& draw, bool valid);
+  void CopyOwnedSceneColor(uint64_t pixel_shader, bool verify_copy);
+  struct OwnedSceneColorPair {
+    ID3D12Resource* current = nullptr;
+    ID3D12Resource* previous = nullptr;
+    uint64_t current_frame = 0, previous_frame = 0, epoch = 0;
+    uint32_t width = 0, height = 0, host_swizzle = 0;
+    uint8_t swizzled_signs = 0;
+    int32_t sample_exponent = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    // Optional exact per-draw inputs from these same color frames. Neither
+    // array order nor matching bytes supplies cross-frame instance identity.
+    const pc_draw_transform_history::Frame* current_draws = nullptr;
+    const pc_draw_transform_history::Frame* previous_draws = nullptr;
+    // Projection/viewport equality only, never camera-cut/history acceptance.
+    bool projection_unchanged = false;
+  };
+  // Borrowed until the next frame boundary, same CP thread/queue only. Commands
+  // must be recorded in the current submission; this call extends reuse fences.
+  OwnedSceneColorPair UseOwnedSceneColor();
+
+  // Temporal AA (V397, command_processor_temporal_aa.cpp): the host texture
+  // bound to a fetch constant for the current draw, and the resolved scene
+  // depth requested by key (the title writes it but samples it nowhere in the
+  // frame). Borrowed for the current submission; `handle` moves the texture
+  // between states through the cache's own state tracking.
+  struct TemporalAaTexture {
+    void* handle = nullptr;
+    ID3D12Resource* resource = nullptr;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t guest_base = 0;
+    uint32_t guest_format = 0;
+  };
+  bool GetTemporalAaBoundTexture(uint32_t fetch_constant_index,
+                                 TemporalAaTexture& out) const;
+  bool RequestTemporalAaDepth(uint32_t guest_base, uint32_t width, uint32_t height,
+                              xenos::Endian endian, TemporalAaTexture& out);
+  void TransitionTemporalAaTexture(void* handle, D3D12_RESOURCE_STATES state);
+  void InvalidateOwnedSceneColor();
 
  protected:
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
@@ -268,9 +373,52 @@ class D3D12TextureCache final : public TextureCache {
       srv_descriptors_.emplace(descriptor_key, descriptor_index);
     }
 
+    // HD texture packs (gpu_texture_replace): while a pack replacement is
+    // shown, resource() is the replacement (always in the shader-resource
+    // state, possibly shared with other textures of the same content) and the
+    // texture's own guest-sized resource waits here.
+    bool replaced() const { return replaced_original_ != nullptr; }
+    uint64_t replacement_id() const { return replacement_id_; }
+    void ShowReplacement(uint64_t id, Microsoft::WRL::ComPtr<ID3D12Resource> replacement,
+                         D3D12_RESOURCE_STATES replacement_state) {
+      replaced_original_ = std::move(resource_);
+      replaced_original_state_ = resource_state_;
+      resource_ = std::move(replacement);
+      resource_state_ = replacement_state;
+      replacement_id_ = id;
+    }
+    // Back to the texture's own resource; returns the replacement reference.
+    Microsoft::WRL::ComPtr<ID3D12Resource> RestoreOriginal() {
+      Microsoft::WRL::ComPtr<ID3D12Resource> replacement = std::move(resource_);
+      resource_ = std::move(replaced_original_);
+      resource_state_ = replaced_original_state_;
+      replacement_id_ = 0;
+      return replacement;
+    }
+    // Moves the cached view descriptors out (the caller releases them once the
+    // GPU no longer uses them).
+    void TakeSRVDescriptors(std::vector<uint32_t>& descriptors_out) {
+      for (const auto& descriptor_pair : srv_descriptors_) {
+        descriptors_out.push_back(descriptor_pair.second);
+      }
+      srv_descriptors_.clear();
+    }
+
+    // Placement in the texture heap pool; the range is returned to the pool
+    // after the resource is released (textures are destroyed only once the
+    // GPU has completed their last use).
+    void SetHeapPlacement(int32_t heap_index, uint64_t offset, uint64_t size) {
+      heap_index_ = heap_index;
+      heap_offset_ = offset;
+      heap_size_ = size;
+    }
+
    private:
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
     D3D12_RESOURCE_STATES resource_state_;
+    int32_t heap_index_ = -1;
+    uint64_t heap_offset_ = 0;
+    uint64_t heap_size_ = 0;
     std::unique_ptr<D3D12Texture> texture_3d_as_2d_;
 
     // For bindful - indices in the non-shader-visible descriptor cache for
@@ -278,6 +426,10 @@ class D3D12TextureCache final : public TextureCache {
     // according to profiling, was often a bottleneck in many games).
     // For bindless - indices in the global shader-visible descriptor heap.
     std::unordered_map<SRVDescriptorKey, uint32_t, SRVDescriptorKey::Hasher> srv_descriptors_;
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> replaced_original_;
+    D3D12_RESOURCE_STATES replaced_original_state_ = D3D12_RESOURCE_STATE_COMMON;
+    uint64_t replacement_id_ = 0;
   };
 
   static constexpr uint32_t kSRVDescriptorCachePageSize = 65536;
@@ -402,6 +554,104 @@ class D3D12TextureCache final : public TextureCache {
   // or UINT32_MAX if failed to create.
   uint32_t FindOrCreateTextureDescriptor(D3D12Texture& texture, xenos::DataDimension dimension,
                                          bool is_signed, uint32_t host_swizzle);
+  void TryCompletePromptTextureReadbackDiagnostic();
+  void TryCompleteTextureReadbackDiagnostic();
+  void TryCompleteActiveTextureReadbackDiagnostics();
+
+  // HD texture packs, phase 1 (gpu_texture_dump, off by default; see
+  // rex/graphics/pipeline/texture/texture_pack.h): after a texture's full load
+  // its host resource is copied to a readback buffer; EndFrame writes the
+  // completed ones as DDS files through a background thread.
+  struct PendingTextureDump {
+    uint64_t submission = 0;
+    uint64_t id = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints;
+    std::vector<UINT> rows;
+    std::vector<UINT64> row_bytes;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t mip_levels = 0;
+    TextureKey key;
+  };
+  static constexpr size_t kMaxPendingTextureDumps = 1024;
+  // Content id of a texture's current guest data (0 if unreadable).
+  uint64_t ComputeTextureContentId(const D3D12Texture& texture) const;
+  void QueueTextureDump(D3D12Texture& texture, uint64_t id);
+  // Records a copy of the texture's resource into a new readback buffer.
+  bool RecordTextureReadback(D3D12Texture& texture, uint64_t id, PendingTextureDump& readback);
+  // Language-pack overlays: the loaded texture is read back once, the pack's
+  // blocks are laid over it and the result goes to the loader like a file.
+  bool QueueOverlayReadback(D3D12Texture& texture, uint64_t id);
+  void ProcessOverlayReadbacks();
+  std::vector<PendingTextureDump> pending_overlays_;
+
+  // HD texture packs, phase 2 (gpu_texture_replace, off by default): textures
+  // whose content id has a pack file get the replacement at the next frame
+  // start (the command processor rebuilds every texture view then); the file
+  // is read and parsed on a background thread and uploaded within a per-frame
+  // budget. A replaced texture whose guest data changes goes back to its own
+  // resource and reloads.
+  // Created on the loader thread: the texture (copy destination state) and
+  // a filled upload buffer.
+  struct PreparedPackUpload {
+    Microsoft::WRL::ComPtr<ID3D12Resource> texture;
+    Microsoft::WRL::ComPtr<ID3D12Resource> upload;
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints;
+    uint64_t bytes = 0;
+  };
+  struct PackReplacement {
+    enum class State : uint8_t { kIndexed, kLoading, kFailed };
+    State state = State::kIndexed;
+    std::shared_ptr<PreparedPackUpload> prepared;     // not yet copied
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;  // shader-resource state
+  };
+  static std::shared_ptr<void> PreparePackUpload(ID3D12Device* device,
+                                                 D3D12_HEAP_FLAGS heap_flags,
+                                                 const texture_pack::DdsImage& image);
+  struct DeferredTextureRelease {
+    uint64_t submission = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    std::vector<uint32_t> descriptors;
+  };
+  void EnsurePackIndex();
+  void OfferTextureForReplacement(D3D12Texture& texture, uint64_t id);
+  void RevertTextureReplacement(D3D12Texture& texture);
+  void UpdatePackReplacements();
+  void RecordPackUpload(PackReplacement& replacement);
+  uint64_t replacement_last_logged_ = 0;
+  // Preload: every pack file is loaded and uploaded from startup (at most
+  // kMaxPackLoadsInFlight files at a time), so gameplay only swaps views.
+  static constexpr uint32_t kMaxPackLoadsInFlight = 16;
+  static constexpr uint32_t kPackSwapIntervalFrames = 8;
+  std::vector<uint64_t> pack_preload_order_;
+  size_t pack_preload_next_ = 0;
+  uint32_t pack_loads_in_flight_ = 0;
+  uint32_t pack_frames_since_swap_ = 0;
+  bool pack_preload_logged_ = false;
+  // Loaded and prepared on the loader thread, copy not recorded yet.
+  uint32_t pack_uploads_waiting_ = 0;
+  int64_t pack_index_qpc_ = 0;
+  // Content-id hashing on the command processor this frame (texture packs).
+  uint32_t pack_hash_textures_frame_ = 0;
+  uint64_t pack_hash_bytes_frame_ = 0;
+  uint64_t pack_hash_ticks_frame_ = 0;
+  void OnD3D12TextureDestroyed(D3D12Texture& texture);
+  bool pack_index_built_ = false;
+  texture_pack::PackIndex pack_index_;
+  std::unordered_map<uint64_t, PackReplacement> pack_replacements_;
+  std::vector<std::pair<D3D12Texture*, uint64_t>> textures_awaiting_replacement_;
+  std::vector<DeferredTextureRelease> deferred_texture_releases_;
+  bool replacement_bindings_dirty_ = false;
+  uint64_t textures_replaced_ = 0;
+  uint64_t textures_reverted_ = 0;
+  uint64_t replacement_bytes_uploaded_ = 0;
+  void ProcessTextureDumps();
+  std::vector<PendingTextureDump> pending_texture_dumps_;
+  std::unordered_set<uint64_t> dumped_texture_ids_;
+  uint64_t texture_dumps_written_ = 0;
+  uint64_t texture_dumps_skipped_ = 0;
   void ReleaseTextureDescriptor(uint32_t descriptor_index);
   D3D12_CPU_DESCRIPTOR_HANDLE GetTextureDescriptorCPUHandle(uint32_t descriptor_index) const;
 
@@ -452,15 +702,51 @@ class D3D12TextureCache final : public TextureCache {
 
   xenos::ClampMode NormalizeClampMode(xenos::ClampMode clamp_mode) const;
 
+  // GetSamplerParameters is a pure function of the six fetch constant words,
+  // the binding's filter overrides and the anisotropic override. Keep the last
+  // result per fetch constant and return it for an exact repeat.
+  struct SamplerParametersMemo {
+    uint32_t fetch[6];
+    uint32_t binding_filters;  // 0 = empty entry.
+    int32_t anisotropic_override;
+    SamplerParameters parameters;
+  };
+  mutable std::array<SamplerParametersMemo, 32> sampler_parameters_memo_{};
+
   static const HostFormat host_formats_[64];
 
   D3D12CommandProcessor& command_processor_;
   bool bindless_resources_used_;
 
+  // Texture heap pool (V300, d3d12_texture_heap_pool): textures are placed in
+  // pre-created heaps instead of each getting its own committed allocation,
+  // which cost a driver allocation plus a residency wait on the command
+  // processor thread for every new texture (first-encounter hitches).
+  struct TextureHeap {
+    explicit TextureHeap(uint64_t capacity) : allocator(capacity) {}
+    Microsoft::WRL::ComPtr<ID3D12Heap> heap;
+    OffsetAllocator allocator;
+  };
+  static constexpr uint64_t kTextureHeapSize = UINT64_C(64) << 20;
+  static constexpr uint32_t kTextureHeapInitialCount = 4;
+  static constexpr uint32_t kTextureHeapMaxCount = 16;
+  bool CreateTextureHeap();
+  // Returns a placed resource (and its placement) or nullptr to fall back to a
+  // committed resource.
+  Microsoft::WRL::ComPtr<ID3D12Resource> CreatePlacedTexture(
+      const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state, int32_t& heap_index,
+      uint64_t& heap_offset, uint64_t& heap_size);
+  void FreeTextureHeapRange(int32_t heap_index, uint64_t offset, uint64_t size);
+  std::vector<std::unique_ptr<TextureHeap>> texture_heaps_;
+  uint64_t texture_heap_placed_ = 0;
+  uint64_t texture_heap_fallbacks_ = 0;
+
   Microsoft::WRL::ComPtr<ID3D12RootSignature> load_root_signature_;
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kLoadShaderCount> load_pipelines_;
   // Load pipelines for resolution-scaled resolve targets.
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kLoadShaderCount> load_pipelines_scaled_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState>
+      scaled_resolve_initialize_pipeline_;
 
   std::vector<SRVDescriptorCachePage> srv_descriptor_cache_;
   uint32_t srv_descriptor_cache_allocated_;
@@ -480,6 +766,94 @@ class D3D12TextureCache final : public TextureCache {
   D3D12_CPU_DESCRIPTOR_HANDLE null_srv_descriptor_heap_start_;
 
   std::array<D3D12TextureBinding, xenos::kTextureFetchConstantCount> d3d12_texture_bindings_;
+
+  // One-shot verification of the dynamically identified PRESS START texture.
+  // The first half receives the loader scratch buffer, and the second receives
+  // the resulting BC1 texture resource. Completion is checked on a later GPU
+  // submission, so the normal draw path is never synchronously stalled.
+  Microsoft::WRL::ComPtr<ID3D12Resource> prompt_texture_readback_;
+  uint64_t prompt_texture_readback_submission_ = 0;
+  uint32_t prompt_texture_readback_guest_base_ = 0;
+  uint32_t prompt_texture_readback_copy_size_ = 0;
+  uint32_t prompt_texture_readback_resource_offset_ = 0;
+  uint32_t prompt_texture_cpu_expected_hash_ = 0;
+
+  // One-shot, explicitly address-gated comparison of the loader scratch
+  // output and the actual shader-visible host texture. Disabled by default;
+  // completion is asynchronous on a later GPU submission.
+  Microsoft::WRL::ComPtr<ID3D12Resource> texture_readback_;
+  uint64_t texture_readback_submission_ = 0;
+  uint32_t texture_readback_guest_base_ = 0;
+  uint32_t texture_readback_guest_size_ = 0;
+  uint32_t texture_readback_payload_size_ = 0;
+  uint32_t texture_readback_resource_offset_ = 0;
+  uint32_t texture_readback_row_pitch_ = 0;
+  uint32_t texture_readback_row_bytes_ = 0;
+  uint32_t texture_readback_row_count_ = 0;
+  uint32_t texture_readback_width_ = 0;
+  uint32_t texture_readback_height_ = 0;
+  uint32_t texture_readback_depth_ = 0;
+  uint32_t texture_readback_format_ = 0;
+  uint32_t texture_readback_scale_x_ = 1;
+  uint32_t texture_readback_scale_y_ = 1;
+  bool texture_readback_scaled_resolve_ = false;
+  bool texture_readback_diagnostic_started_ = false;
+  uint64_t texture_readback_armed_address_min_ = 0;
+  uint64_t texture_readback_armed_address_max_ = 0;
+
+  struct ActiveTextureReadbackDiagnostic {
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+    Microsoft::WRL::ComPtr<ID3D12Resource> depth_snapshot;
+    uint64_t snapshot_frame = 0;
+    uint64_t submission = 0;
+    uint64_t resource_identity = 0;
+    uint64_t context_draw_ordinal = 0;
+    uint32_t fetch_constant_index = 0;
+    uint32_t array_slice = 0;
+    uint32_t array_size = 1;
+    uint32_t guest_base = 0;
+    uint32_t guest_size = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t depth = 0;
+    uint32_t format = 0;
+    uint32_t row_pitch = 0;
+    uint32_t row_bytes = 0;
+    uint32_t row_count = 0;
+    uint32_t scale_x = 1;
+    uint32_t scale_y = 1;
+    bool scaled_resolve = false;
+  };
+  std::vector<ActiveTextureReadbackDiagnostic>
+      active_texture_readback_diagnostics_;
+  embedded_texture_readback_policy::State
+      active_texture_readback_diagnostic_policy_;
+  bool active_texture_readback_limit_reported_ = false;
+  bool temporal_first_binding_attempted_ = false;
+
+  void FinishOwnedSceneColor();
+  void CompleteOwnedSceneColorVerification();
+  pc_scene_color_history::State owned_scene_color_state_;
+  pc_draw_transform_history::Frame pending_owned_draws_;
+  std::array<pc_draw_transform_history::Frame,
+             pc_scene_color_history::State::kSlots> owned_draws_;
+  std::array<Microsoft::WRL::ComPtr<ID3D12Resource>,
+             pc_scene_color_history::State::kSlots> owned_scene_color_;
+  uint32_t owned_scene_color_swizzle_ = 0;
+  uint8_t owned_scene_color_signs_ = 0;
+  int32_t owned_scene_color_exponent_ = 0;
+  uint32_t owned_scene_color_reported_ = 0;
+  uint32_t owned_camera_frames_reported_ = 0;
+  pc_draw_transform_history::FollowupSamples owned_camera_followups_;
+  struct OwnedColorVerification {
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2> readback;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    uint64_t frame = 0, submission = 0, bytes = 0;
+    uint32_t row_bytes = 0, rows = 0;
+    bool finished = false;
+  };
+  std::array<OwnedColorVerification, 2> owned_color_verifications_;
+  uint32_t owned_color_verification_count_ = 0;
 
   // Unsupported texture formats used during this frame (for research and
   // testing).

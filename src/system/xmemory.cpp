@@ -231,6 +231,44 @@ bool Memory::Initialize() {
   return true;
 }
 
+bool Memory::InitializeExternal(uint8_t* virtual_membase, uint8_t* physical_membase,
+                                HostWriteCallbacks host_writes,
+                                HostWriteCallbacks gpu_mirror_writes) {
+  if (!host_writes.Valid() || !gpu_mirror_writes.Valid()) return false;
+  if (!virtual_membase || !physical_membase || virtual_membase_ || physical_membase_) {
+    return false;
+  }
+
+  virtual_membase_ = virtual_membase;
+  physical_membase_ = physical_membase;
+  external_backing_ = true;
+  host_writes_ = host_writes;
+  host_mirror_writes_ = gpu_mirror_writes;
+
+  // Retain ReXGlue's address classification and alias offsets without
+  // reserving, committing, protecting, or owning any host pages.
+  heaps_.v00000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestVirtual, 0x00000000,
+                              0x40000000, 4096);
+  heaps_.v40000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestVirtual, 0x40000000,
+                              0x40000000 - 0x01000000, 64 * 1024);
+  heaps_.v80000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestXex, 0x80000000,
+                              0x10000000, 64 * 1024);
+  heaps_.v90000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestXex, 0x90000000,
+                              0x10000000, 4096);
+  heaps_.physical.Initialize(this, physical_membase_, memory::HeapType::kGuestPhysical, 0x00000000,
+                             0x20000000, 4096);
+  heaps_.vA0000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestPhysical, 0xA0000000,
+                              0x20000000, 64 * 1024, &heaps_.physical);
+  heaps_.vC0000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestPhysical, 0xC0000000,
+                              0x20000000, 16 * 1024 * 1024, &heaps_.physical);
+  heaps_.vE0000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestPhysical, 0xE0000000,
+                              0x1FD00000, 4096, &heaps_.physical);
+
+  REXSYS_INFO("Adopted external guest memory: virtual={} physical={}",
+              fmt::ptr(virtual_membase_), fmt::ptr(physical_membase_));
+  return true;
+}
+
 static const struct {
   uint64_t virtual_address_start;
   uint64_t virtual_address_end;
@@ -396,14 +434,17 @@ uint32_t Memory::GetPhysicalAddress(uint32_t address) const {
 }
 
 void Memory::Zero(uint32_t address, uint32_t size) {
+  auto host_write = GuardVirtualWrite(address, size);
   std::memset(TranslateVirtual(address), 0, size);
 }
 
 void Memory::Fill(uint32_t address, uint32_t size, uint8_t value) {
+  auto host_write = GuardVirtualWrite(address, size);
   std::memset(TranslateVirtual(address), value, size);
 }
 
 void Memory::Copy(uint32_t dest, uint32_t src, uint32_t size) {
+  auto host_write = GuardVirtualWrite(dest, size);
   uint8_t* pdest = TranslateVirtual(dest);
   const uint8_t* psrc = TranslateVirtual(src);
   std::memcpy(pdest, psrc, size);
@@ -598,8 +639,14 @@ void Memory::UnregisterPhysicalMemoryInvalidationCallback(void* callback_handle)
 }
 
 void Memory::EnablePhysicalMemoryAccessCallbacks(uint32_t physical_address, uint32_t length,
-                                                 bool enable_invalidation_notifications,
-                                                 bool enable_data_providers) {
+                                                  bool enable_invalidation_notifications,
+                                                  bool enable_data_providers) {
+  // An embedded host owns page protections and delivers exact modified ranges
+  // explicitly. Protecting its aliases here would install no matching ReXGlue
+  // exception handler and could fault unrelated guest CPU execution.
+  if (external_backing_) {
+    return;
+  }
   heaps_.vA0000000.EnableAccessCallbacks(physical_address, length,
                                          enable_invalidation_notifications, enable_data_providers);
   heaps_.vC0000000.EnableAccessCallbacks(physical_address, length,

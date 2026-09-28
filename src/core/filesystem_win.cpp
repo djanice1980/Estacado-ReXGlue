@@ -43,9 +43,21 @@ std::filesystem::path to_path(const std::u16string_view source) {
 namespace filesystem {
 
 std::filesystem::path GetExecutablePath() {
-  wchar_t* path;
-  auto error = _get_wpgmptr(&path);
-  return !error ? std::filesystem::path(path) : std::filesystem::path();
+  // Not _get_wpgmptr: the CRT fills it only for wide-entry programs, and a
+  // narrow-main host (the embedded title) would hit the CRT invalid-parameter
+  // handler, which terminates the process.
+  std::wstring buffer(MAX_PATH, L'\0');
+  while (buffer.size() <= 32768) {
+    const DWORD length =
+        GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (!length) break;
+    if (length < buffer.size()) {
+      buffer.resize(length);
+      return std::filesystem::path(buffer);
+    }
+    buffer.resize(buffer.size() * 2);
+  }
+  return std::filesystem::path();
 }
 
 std::filesystem::path GetExecutableFolder() {

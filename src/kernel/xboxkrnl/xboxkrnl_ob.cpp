@@ -177,7 +177,9 @@ u32 ObCreateSymbolicLink_entry(ppc_ptr_t<X_ANSI_STRING> path_ptr,
   auto target = rex::string::utf8_canonicalize_guest_path(
       util::TranslateAnsiPath(REX_KERNEL_MEMORY(), target_ptr));
 
-  if (rex::string::utf8_starts_with(path, u8"\\??\\")) {
+  // This qualifier is ASCII, and utf8_starts_with consumes a char string
+  // view. C++20 makes u8 literals char8_t, which is not implicitly compatible.
+  if (rex::string::utf8_starts_with(path, "\\??\\")) {
     path = path.substr(4);  // Strip the full qualifier
   }
 

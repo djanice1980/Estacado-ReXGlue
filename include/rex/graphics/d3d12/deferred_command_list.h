@@ -34,6 +34,14 @@ class DeferredCommandList {
 
   void Reset();
   void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1);
+  // Replays a recorded stream taken with SwapStream. Reads only the stream and
+  // pipeline handles (atomic), so a submission thread may call it while the
+  // command processor records into this object's own stream.
+  void ExecuteStream(const uintmax_t* stream, size_t stream_size,
+                     ID3D12GraphicsCommandList* command_list,
+                     ID3D12GraphicsCommandList1* command_list_1) const;
+  // Exchanges the recorded commands with another (normally empty) buffer.
+  void SwapStream(std::vector<uintmax_t>& other) { command_stream_.swap(other); }
 
   D3D12_RECT* ClearDepthStencilViewAllocatedRects(D3D12_CPU_DESCRIPTOR_HANDLE depth_stencil_view,
                                                   D3D12_CLEAR_FLAGS clear_flags, FLOAT depth,
@@ -196,6 +204,20 @@ class DeferredCommandList {
     args.aligned_destination_buffer_offset = aligned_destination_buffer_offset;
   }
 
+  void D3DResolveSubresource(ID3D12Resource* destination_resource,
+                             UINT destination_subresource,
+                             ID3D12Resource* source_resource,
+                             UINT source_subresource, DXGI_FORMAT format) {
+    auto& args = *reinterpret_cast<D3DResolveSubresourceArguments*>(
+        WriteCommand(Command::kD3DResolveSubresource,
+                     sizeof(D3DResolveSubresourceArguments)));
+    args.destination_resource = destination_resource;
+    args.destination_subresource = destination_subresource;
+    args.source_resource = source_resource;
+    args.source_subresource = source_subresource;
+    args.format = format;
+  }
+
   void D3DIASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* view) {
     auto& args = *reinterpret_cast<D3D12_INDEX_BUFFER_VIEW*>(
         WriteCommand(Command::kD3DIASetIndexBuffer, sizeof(D3D12_INDEX_BUFFER_VIEW)));
@@ -266,6 +288,25 @@ class DeferredCommandList {
   void D3DOMSetStencilRef(UINT stencil_ref) {
     auto& arg = *reinterpret_cast<UINT*>(WriteCommand(Command::kD3DOMSetStencilRef, sizeof(UINT)));
     arg = stencil_ref;
+  }
+
+  void D3DSOSetTargets(UINT start_slot, UINT num_views,
+                       const D3D12_STREAM_OUTPUT_BUFFER_VIEW* views) {
+    num_views = std::min(num_views, UINT(D3D12_SO_BUFFER_SLOT_COUNT));
+    static_assert(alignof(D3D12_STREAM_OUTPUT_BUFFER_VIEW) <=
+                  alignof(uintmax_t));
+    const size_t header_size = ::rex::align(
+        sizeof(D3DSOSetTargetsHeader),
+        alignof(D3D12_STREAM_OUTPUT_BUFFER_VIEW));
+    auto* args = reinterpret_cast<D3DSOSetTargetsHeader*>(WriteCommand(
+        Command::kD3DSOSetTargets,
+        header_size + num_views * sizeof(D3D12_STREAM_OUTPUT_BUFFER_VIEW)));
+    args->start_slot = start_slot;
+    args->num_views = num_views;
+    if (num_views != 0) {
+      std::memcpy(reinterpret_cast<uint8_t*>(args) + header_size, views,
+                  num_views * sizeof(D3D12_STREAM_OUTPUT_BUFFER_VIEW));
+    }
   }
 
   void D3DResourceBarrier(UINT num_barriers, const D3D12_RESOURCE_BARRIER* barriers) {
@@ -442,6 +483,21 @@ class DeferredCommandList {
 
   void EndDebugMarker() { WriteCommand(Command::kEndDebugMarker, 0); }
 
+  // Calls a function with the real command list when the stream is executed,
+  // for external SDKs that record their own work (NVIDIA NGX). The payload is
+  // copied into the stream. The function may change any command list state:
+  // the recorder must re-bind everything it relies on afterwards.
+  using ExternalCallFunction = void (*)(const void* payload,
+                                        ID3D12GraphicsCommandList* command_list);
+  void ExternalCall(ExternalCallFunction function, const void* payload, size_t payload_size) {
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
+        WriteCommand(Command::kExternalCall, sizeof(ExternalCallHeader) + payload_size));
+    auto& args = *reinterpret_cast<ExternalCallHeader*>(args_ptr);
+    args.function = function;
+    args.payload_size = payload_size;
+    std::memcpy(args_ptr + sizeof(ExternalCallHeader), payload, payload_size);
+  }
+
   void InsertDebugMarker(const char* label_name) {
     size_t label_len = std::strlen(label_name);
     uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
@@ -466,12 +522,14 @@ class DeferredCommandList {
     kD3DBeginQuery,
     kD3DEndQuery,
     kD3DResolveQueryData,
+    kD3DResolveSubresource,
     kD3DIASetIndexBuffer,
     kD3DIASetPrimitiveTopology,
     kD3DIASetVertexBuffers,
     kD3DOMSetBlendFactor,
     kD3DOMSetRenderTargets,
     kD3DOMSetStencilRef,
+    kD3DSOSetTargets,
     kD3DResourceBarrier,
     kRSSetScissorRect,
     kRSSetViewport,
@@ -494,6 +552,7 @@ class DeferredCommandList {
     kBeginDebugMarker,
     kEndDebugMarker,
     kInsertDebugMarker,
+    kExternalCall,
   };
 
   struct CommandHeader {
@@ -592,6 +651,14 @@ class DeferredCommandList {
     UINT64 aligned_destination_buffer_offset;
   };
 
+  struct D3DResolveSubresourceArguments {
+    ID3D12Resource* destination_resource;
+    UINT destination_subresource;
+    ID3D12Resource* source_resource;
+    UINT source_subresource;
+    DXGI_FORMAT format;
+  };
+
   struct D3DIASetVertexBuffersHeader {
     UINT start_slot;
     UINT num_views;
@@ -604,6 +671,11 @@ class DeferredCommandList {
     D3D12_CPU_DESCRIPTOR_HANDLE
     render_target_descriptors[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
     D3D12_CPU_DESCRIPTOR_HANDLE depth_stencil_descriptor;
+  };
+
+  struct D3DSOSetTargetsHeader {
+    UINT start_slot;
+    UINT num_views;
   };
 
   struct SetRoot32BitConstantsHeader {
@@ -638,7 +710,26 @@ class DeferredCommandList {
     // Followed by null-terminated label string.
   };
 
-  void* WriteCommand(Command command, size_t arguments_size_bytes);
+  struct ExternalCallHeader {
+    ExternalCallFunction function;
+    size_t payload_size;
+    // Followed by the payload.
+  };
+
+  // The recording wrappers have fixed argument sizes in the ordinary draw
+  // path. Keep allocation and header construction visible to their compiler:
+  // it can fold the word count and combine zero-initialization with the payload
+  // stores. Storage, padding, growth and replay semantics remain unchanged.
+  void* WriteCommand(Command command, size_t arguments_size_bytes) {
+    size_t arguments_size_elements =
+        (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
+    size_t offset = command_stream_.size();
+    command_stream_.resize(offset + kCommandHeaderSizeElements + arguments_size_elements);
+    CommandHeader& header = *reinterpret_cast<CommandHeader*>(command_stream_.data() + offset);
+    header.command = command;
+    header.arguments_size_elements = uint32_t(arguments_size_elements);
+    return command_stream_.data() + (offset + kCommandHeaderSizeElements);
+  }
 
   const D3D12CommandProcessor& command_processor_;
 

@@ -11,11 +11,21 @@
 
 #pragma once
 
+// REXGLUE_GPU_DIAGNOSTICS (CMake) -> REX_GPU_DIAGNOSTICS: diagnostics and work
+// counters exist only in measurement builds.
+#ifndef REX_GPU_DIAGNOSTICS
+#define REX_GPU_DIAGNOSTICS 0
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <deque>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -25,17 +35,23 @@
 #include <rex/assert.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/d3d12/deferred_command_list.h>
+#include <rex/graphics/d3d12/gpu_timing.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/pipeline_cache.h>
 #include <rex/graphics/d3d12/primitive_processor.h>
 #include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/graphics/d3d12/texture_cache.h>
+#include <rex/graphics/embedded_target_writer_capture_policy.h>
+#include <rex/graphics/embedded_depth_resolve_capture_policy.h>
 #include <rex/graphics/pipeline/shader/dxbc.h>
+#include <rex/graphics/pipeline/render_target/native_shader_scale_policy.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/temporal_aa_policy.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
+#include <rex/graphics/xenos_zpd_report.h>
 #include <rex/system/kernel_state.h>
 #include <rex/ui/d3d12/d3d12_descriptor_heap_pool.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
@@ -59,6 +75,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   void RequestFrameTrace(const std::filesystem::path& root_path) override;
 
   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
+  void MarkHostWrite(uint32_t base_ptr, uint32_t length) override;
 
   void RestoreEdramSnapshot(const void* snapshot) override;
 
@@ -75,6 +92,83 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   uint64_t GetCurrentSubmission() const { return submission_current_; }
   uint64_t GetCompletedSubmission() const { return submission_completed_; }
+
+#if REX_GPU_DIAGNOSTICS
+  // Swap-interval diagnostic only (no effect unless that observer is active).
+  void NoteSharedMemoryUpload(uint64_t bytes) { swap_intervals_.AddUpload(bytes); }
+  // Swap-interval diagnostics only (texture creations per frame).
+  bool SwapIntervalObserverActive() const { return swap_intervals_.active; }
+  void NoteTextureCreation(uint64_t ticks, bool /*placed*/) {
+    swap_intervals_.AddTextureCreation(ticks);
+  }
+
+  // GPU timing diagnostic (d3d12_gpu_timing, off by default): GPU work
+  // recorded while a scope is alive is attributed to its category; the
+  // previous category resumes when it ends. Only a null check when off.
+  class GpuTimingScope {
+   public:
+    GpuTimingScope(D3D12CommandProcessor& command_processor, GpuTimingCategory category)
+        : command_processor_(command_processor) {
+      if (command_processor_.gpu_timing_) {
+        previous_ = command_processor_.GpuTimingSwitch(category);
+      }
+    }
+    ~GpuTimingScope() {
+      if (command_processor_.gpu_timing_) {
+        command_processor_.GpuTimingSwitch(previous_);
+      }
+    }
+    GpuTimingScope(const GpuTimingScope&) = delete;
+    GpuTimingScope& operator=(const GpuTimingScope&) = delete;
+
+   private:
+    D3D12CommandProcessor& command_processor_;
+    GpuTimingCategory previous_ = GpuTimingCategory::kOther;
+  };
+  // Work recorded from now on belongs to the category (until the next switch).
+  void GpuTimingMark(GpuTimingCategory category) {
+    if (gpu_timing_) {
+      GpuTimingSwitch(category);
+    }
+  }
+  void GpuTimingCount(GpuTimingCounter counter, uint64_t value) {
+    if (gpu_timing_) {
+      GpuTimingAddCount(counter, value);
+    }
+  }
+  bool GpuTimingEnabled() const { return gpu_timing_ != nullptr; }
+  // d3d12_gpu_timing_passes: draw time is attributed to the render-target set
+  // bound from now on (keys: depth, then colors; 0 for none).
+  void GpuTimingNotePass(const uint32_t* render_target_keys);
+  // Splits draw time by render-target set and shader pair (once per draw).
+  void GpuTimingDrawPass();
+  // True in the sampled frames whose transfers are logged
+  // (d3d12_gpu_timing_transfer_log_interval).
+  bool GpuTimingTransferLogFrame() const { return gpu_timing_ && GpuTimingLogFrame(); }
+#else
+  // Player builds (REXGLUE_GPU_DIAGNOSTICS off): the swap-interval observer
+  // hooks and the GPU timing diagnostic are compiled out - no checks remain.
+  void NoteSharedMemoryUpload(uint64_t) {}
+  static constexpr bool SwapIntervalObserverActive() { return false; }
+  void NoteTextureCreation(uint64_t, bool) {}
+  class GpuTimingScope {
+   public:
+    GpuTimingScope(D3D12CommandProcessor&, GpuTimingCategory) {}
+    GpuTimingScope(const GpuTimingScope&) = delete;
+    GpuTimingScope& operator=(const GpuTimingScope&) = delete;
+  };
+  void GpuTimingMark(GpuTimingCategory) {}
+  void GpuTimingCount(GpuTimingCounter, uint64_t) {}
+  static constexpr bool GpuTimingEnabled() { return false; }
+  void GpuTimingNotePass(const uint32_t*) {}
+  void GpuTimingDrawPass() {}
+  static constexpr bool GpuTimingTransferLogFrame() { return false; }
+#endif
+
+  // d3d12_gpu_frame_meter (on by default, two timestamps per submission): the
+  // GPU busy time of each guest frame, for automatic settings.
+  size_t GetRecentGpuFrameBusyUs(uint32_t* out, size_t capacity,
+                                 uint64_t* total_frames_out = nullptr) const override;
 
   // Must be called when a subsystem does something like UpdateTileMappings so
   // it can be awaited in CheckSubmissionFence(submission_current_) if it was
@@ -202,13 +296,29 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::string GetWindowTitleText() const;
 
  protected:
+  bool QueryCadenceSubmission(uint64_t& submitted, uint64_t& completed) override;
   bool SetupContext() override;
   void ShutdownContext() override;
 
   void WriteRegister(uint32_t index, uint32_t value) override;
+  void WriteRegisterFromPacket(uint32_t index, uint32_t value,
+                               uint32_t packet, uint32_t data,
+                               const pc_owned_camera_packet::Source* source = nullptr) override;
+  void InvalidateRegisterProvenance() override;
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
   bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
                                           uint32_t count) override;
+  void PrepareForWait() override;
+  void PrepareForPacketMemoryWrite(uint32_t address, uint32_t bytes) override;
+  // Copy stage: every queued guest-memory copy into an upload page is done
+  // before anything tells the title the GPU consumed its data.
+  void SettleGuestVisibleWork() override { SettleUploadCopies(); }
+  void SettleUploadCopies();
+  std::string SwapIntervalBackendStats() override;
+  // Copy-stage counters (reported with the swap-interval diagnostic).
+  uint64_t upload_settle_calls_ = 0;
+  uint64_t upload_settle_blocked_ = 0;
+  uint64_t upload_settle_blocked_ticks_ = 0;
 
   void OnGammaRamp256EntryTableValueWritten() override;
   void OnGammaRampPWLValueWritten() override;
@@ -228,6 +338,12 @@ class D3D12CommandProcessor : public CommandProcessor {
   void InitializeTrace() override;
 
  private:
+  friend class D3D12RenderTargetCache;
+  // The texture cache owns the scaled-resolve resource state. Its bounded
+  // diagnostic readback must submit and await the exact copy without exposing
+  // the command processor's general submission controls publicly.
+  friend class D3D12TextureCache;
+
   static constexpr uint32_t kQueueFrames = 3;
 
   enum RootParameter : UINT {
@@ -324,6 +440,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   // opposed to simply resuming after mid-frame synchronization). Returns
   // whether a submission is open currently and the device is not removed.
   bool BeginSubmission(bool is_guest_command);
+  bool IsSubmissionOpen() const { return submission_open_; }
   // If is_swap is true, a full frame is closed - with, if needed, cache
   // clearing and stopping capturing. Returns whether the submission was done
   // successfully, if it has failed, leaves it open.
@@ -412,14 +529,28 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   bool InitializeOcclusionQueryResources();
   void ShutdownOcclusionQueryResources();
+  bool InitializeEmbeddedSceneHostVertexOutputResources();
+  void ShutdownEmbeddedSceneHostVertexOutputResources();
   bool BeginGuestOcclusionQuery(uint32_t sample_count_address);
   bool EndGuestOcclusionQuery(uint32_t sample_count_address,
                               xenos::xe_gpu_depth_sample_counts* sample_counts);
+  bool BeginGuestOcclusionQuerySegment();
+  bool CloseGuestOcclusionQuerySegment();
+  bool UpdateGuestOcclusionQueryScale(uint32_t scale_area);
+  // Retires completed host segments and publishes finished guest reports.
+  // await_submission 0 never waits; UINT64_MAX awaits every segment in flight.
+  bool RetireGuestOcclusionQuerySegments(uint64_t await_submission);
+  void PublishGuestOcclusionReport(const XenosZPDReportAccumulator& report);
+  // Publishes every deferred report overlapping the guest range first.
+  // kind (diagnostic counters only): 0 same-slot BEGIN, 1 packet write.
+  bool AwaitGuestOcclusionReportsInRange(uint32_t address, uint32_t bytes,
+                                         uint32_t kind);
+  // At a guest swap: publishes (waiting for their host submissions if needed)
+  // the reports that ended at least d3d12_zpd_max_publish_lag_frames swaps ago.
+  void BoundGuestOcclusionReportLag();
   bool AcquireOcclusionQueryIndex(uint32_t& host_index_out);
   void DisableHostOcclusionQueries();
-  uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
-  void WriteGuestOcclusionResult(xenos::xe_gpu_depth_sample_counts* sample_counts,
-                                 uint64_t samples);
+  uint64_t NormalizeOcclusionSamples(uint64_t samples, uint32_t scale_area) const;
   void InvalidateAllVertexBufferResidency();
   void InvalidateVertexBufferResidency(uint32_t vfetch_index);
   void InvalidateVertexBufferResidencyRange(uint32_t first_vfetch, uint32_t last_vfetch);
@@ -437,6 +568,44 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t submission_current_ = 1;
   uint64_t submission_completed_ = 0;
   ID3D12Fence* submission_fence_ = nullptr;
+
+  // Asynchronous submission (init-only d3d12_async_submission). EndSubmission
+  // hands the recorded deferred stream to one worker thread, which replays it
+  // into command_list_, executes it and signals submission_fence_ with the
+  // submission's value, strictly in order. The command processor drains the
+  // worker only where later queue work from another component must follow
+  // (shutdown, and the presenter refresh when its completion can't be
+  // deferred). A job without an allocator is an ordered task: it runs on the
+  // worker after every earlier job has been executed and signaled.
+  struct SubmissionJob {
+    std::vector<uintmax_t> stream;
+    ID3D12CommandAllocator* allocator = nullptr;
+    uint64_t fence_value = 0;
+    std::function<void()> task;
+    // Copy stage: the job's upload pages are written once this copy is done.
+    uint64_t upload_copy_ticket = 0;
+  };
+  void StartSubmissionThread();
+  void StopSubmissionThread();
+  void SubmissionThreadMain();
+  void DrainSubmissions();
+  // Runs task on the submission worker after all currently queued jobs (inline
+  // when there is no worker).
+  void EnqueueSubmissionTask(std::function<void()> task);
+  // V292: the presenter's post-refresh steps (fence signal, mailbox
+  // publication, immediate paint) run as an ordered worker task after the
+  // frame's command lists instead of the command processor draining the
+  // worker at every swap.
+  bool presenter_completion_deferred_ = false;
+  bool async_submission_ = false;
+  std::thread submission_thread_;
+  std::mutex submission_mutex_;
+  std::condition_variable submission_work_cv_;
+  std::condition_variable submission_idle_cv_;
+  std::deque<SubmissionJob> submission_jobs_;
+  std::vector<std::vector<uintmax_t>> submission_free_streams_;
+  bool submission_worker_busy_ = false;
+  bool submission_thread_stop_ = false;
 
   // For awaiting non-submission queue operations such as UpdateTileMappings in
   // AwaitAllQueueOperationsCompletion when they're queued after the latest
@@ -495,6 +664,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::unique_ptr<D3D12SharedMemory> shared_memory_;
 
   std::unique_ptr<D3D12RenderTargetCache> render_target_cache_;
+  render_target::native_shader_scale_policy::Rules native_shader_grid_rules_;
+  uint32_t native_shader_grid_logged_mask_ = 0;
+  embedded_target_writer_capture_policy::Config embedded_target_writer_config_;
+  embedded_target_writer_capture_policy::State embedded_target_writer_state_;
+  embedded_depth_resolve_capture_policy::State embedded_depth_resolve_capture_state_;
 
   std::unique_ptr<ui::d3d12::D3D12UploadBufferPool> constant_buffer_pool_;
 
@@ -639,8 +813,117 @@ class D3D12CommandProcessor : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12Resource> fxaa_source_texture_;
   uint64_t fxaa_source_texture_submission_ = 0;
 
+  // SMAA 1x (swap_post_effect smaa): three compute passes over the gamma-
+  // corrected guest output (shaders/smaa.cs.hlsl). Sources are single-
+  // descriptor tables t0-t2, the destination u0; static samplers s0 linear
+  // and s1 point, both clamped.
+  enum class SmaaRootParameter : UINT {
+    kConstants,
+    kSource0,
+    kSource1,
+    kSource2,
+    kDestination,
+
+    kCount,
+  };
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> smaa_root_signature_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> smaa_edge_detection_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> smaa_blending_weight_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> smaa_neighborhood_blending_pipeline_;
+  // The reference's precomputed area (160x560 R8G8) and search (64x16 R8)
+  // tables, uploaded at the first SMAA frame; NON_PIXEL_SHADER_RESOURCE.
+  Microsoft::WRL::ComPtr<ID3D12Resource> smaa_area_texture_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> smaa_search_texture_;
+  bool smaa_lookup_textures_uploaded_ = false;
+  // Guest-output-sized intermediates (color after gamma, edges, blending
+  // weights), kept in NON_PIXEL_SHADER_RESOURCE state.
+  Microsoft::WRL::ComPtr<ID3D12Resource> smaa_color_texture_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> smaa_edges_texture_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> smaa_blend_texture_;
+  uint64_t smaa_textures_submission_ = 0;
+  bool EnsureSmaaResources(uint32_t width, uint32_t height);
+
+  // Temporal anti-aliasing (V397, gpu_temporal_aa, default off;
+  // command_processor_temporal_aa.cpp, temporal_aa_policy.h): the camera of
+  // each rendered frame is voted from its depth-writing scene draws, the
+  // scene draws are rasterized with a sub-pixel viewport jitter, and right
+  // before the title's final composite samples its scene colour a compute
+  // resolve blends it with the reprojected history.
+  enum class TemporalAaRootParameter : UINT {
+    kConstants,
+    kColor,
+    kDepth,
+    kHistory,
+    kOutHistory,
+    kOutColor,
+    kOutUpscalerColor,
+    kCount,
+  };
+  struct TemporalAaFrame {
+    temporal_aa::CameraVote vote;
+    temporal_aa::Camera previous_camera;
+    uint64_t frame = 0;
+    // Jitter the scene draws of this frame (the previous one was resolved).
+    bool armed = false;
+    bool resolved = false;
+    bool history_valid = false;
+    uint32_t history_index = 0;
+    uint32_t depth_base = 0;
+    uint32_t depth_pitch = 0;
+    uint32_t depth_info = 0;
+    // The scene target: the render target (surface info, EDRAM colour base)
+    // the colour resolves into the composite's scene colour read from. Only
+    // depth-tested geometry drawn to it is jittered; learned in one frame,
+    // used in the next.
+    uint32_t scene_color_base = 0;
+    uint32_t scene_color_bytes = 0;
+    uint32_t scene_surface_info = 0;
+    uint32_t scene_color_edram_base = 0;
+    bool scene_target_valid = false;
+    uint32_t next_surface_info = 0;
+    uint32_t next_color_edram_base = 0;
+    bool next_target_valid = false;
+    uint64_t resolves = 0;
+    uint64_t reports = 0;
+  };
+  bool temporal_aa_enabled_ = false;
+  bool temporal_aa_jitter_draw_ = false;
+  float temporal_aa_jitter_[2] = {};
+  std::unique_ptr<TemporalAaFrame> temporal_aa_frame_;
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> temporal_aa_root_signature_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> temporal_aa_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> temporal_aa_history_[2];
+  Microsoft::WRL::ComPtr<ID3D12Resource> temporal_aa_output_;
+  uint64_t temporal_aa_textures_submission_ = 0;
+  // Upscalers on the same inputs (native AA modes: NVIDIA DLSS/DLAA, AMD FSR
+  // 3.1, Intel XeSS), with camera motion vectors computed from the resolved
+  // depth; the built-in resolve takes over when one is unavailable.
+  struct TemporalAaUpscaler;
+  TemporalAaUpscaler* temporal_aa_upscaler_ = nullptr;
+  void TemporalAaInitialize();
+  void TemporalAaShutdown();
+  void TemporalAaDraw(uint64_t vertex_shader_hash, uint64_t pixel_shader_hash,
+                      reg::RB_DEPTHCONTROL normalized_depth_control);
+  void TemporalAaCopy();
+  void TemporalAaEndFrame();
+  bool TemporalAaResolve();
+  bool TemporalAaEnsureResources(uint32_t width, uint32_t height);
+  bool TemporalAaUpscalerInitialize(uint32_t kind);
+  bool TemporalAaUpscalerEnsure(uint32_t width, uint32_t height);
+  // Runs on the thread that executes the deferred command stream.
+  static void TemporalAaUpscalerEvaluate(const void* payload,
+                                         ID3D12GraphicsCommandList* command_list);
+  // After a deferred ExternalCall: nothing bound on the command list is known.
+  void InvalidateCommandListStateAfterExternalCall();
+
   // Unsubmitted barrier batch.
   std::vector<D3D12_RESOURCE_BARRIER> barriers_;
+
+  // Init-only, default-off draw batching experiment. Reset only after an
+  // actual submission; a rejected/failed early submission retains its budget.
+  uint32_t guest_draw_submit_limit_ = 0;
+  uint32_t submission_guest_draws_ = 0;
+  uint64_t guest_draw_submit_count_ = 0;
 
   // <Submission where requested, resource>, sorted by the submission number.
   std::deque<std::pair<uint64_t, ID3D12Resource*>> resources_for_deletion_;
@@ -662,17 +945,83 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t* occlusion_query_readback_mapping_ = nullptr;
   uint32_t occlusion_query_cursor_ = 0;
   bool occlusion_query_resources_available_ = false;
+  XenosZPDReportAccumulator logical_occlusion_query_;
   struct ActiveOcclusionQuery {
-    uint32_t sample_count_address = 0;
     uint32_t host_index = UINT32_MAX;
+    uint32_t scale_area = 1;
+    uint32_t draws = 0;
     bool valid = false;
   } active_occlusion_query_;
+  uint32_t zpd_submit_after_draws_ = 0;
+  bool zpd_early_submission_logged_ = false;
+  uint32_t zpd_early_end_count_ = 0;
+  uint32_t zpd_early_max_segment_draws_ = 0;
+  bool zpd_fence_check_active_ = false;
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> zpd_gpu_timestamp_heap_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> zpd_gpu_timestamp_readback_;
+  uint64_t* zpd_gpu_timestamp_mapping_ = nullptr;
+  uint64_t zpd_gpu_timestamp_frequency_ = 0;
+  bool zpd_gpu_timestamp_active_ = false;
+  bool zpd_gpu_timestamp_pending_ = false;
+  uint64_t zpd_gpu_timestamp_submission_ = 0;
+  uint64_t zpd_gpu_calibration_window_ = 0;
+  uint64_t zpd_gpu_calibration_gpu_tick_ = 0;
+  uint64_t zpd_gpu_calibration_cpu_tick_ = 0;
+  uint64_t zpd_gpu_submit_return_qpc_ = 0;
+  uint64_t zpd_gpu_qpc_frequency_ = 0;
+  bool zpd_gpu_calibration_valid_ = false;
+  // Host segments in flight and guest reports awaiting their exact result.
+  XenosZPDDeferredReports occlusion_reports_;
+  std::unordered_map<uint32_t, uint32_t> occlusion_query_slot_values_;
+
+  // Diagnostic-only stream-output capture of the actual host VS SV_Position
+  // bytes for the eight matching internal-scale scene draws. The output and
+  // filled-size counter share one default buffer; each bounded record is
+  // copied to its own persistently mapped readback segment.
+  static constexpr uint32_t kEmbeddedSceneHostVertexOutputRecordCount = 8;
+  static constexpr uint32_t kEmbeddedSceneHostVertexOutputMaximumVertices =
+      16384;
+  static constexpr uint32_t kEmbeddedSceneHostVertexOutputDataSize =
+      kEmbeddedSceneHostVertexOutputMaximumVertices * sizeof(float) * 4;
+  static constexpr uint32_t kEmbeddedSceneHostVertexOutputRecordStride =
+      kEmbeddedSceneHostVertexOutputDataSize + sizeof(uint64_t);
+  struct EmbeddedSceneHostVertexOutputRecord {
+    const char* kind = nullptr;
+    uint64_t vertex_shader_hash = 0;
+    uint32_t expected_vertex_count = 0;
+  };
+  Microsoft::WRL::ComPtr<ID3D12Resource>
+      embedded_scene_host_vertex_output_buffer_;
+  Microsoft::WRL::ComPtr<ID3D12Resource>
+      embedded_scene_host_vertex_output_zero_upload_;
+  Microsoft::WRL::ComPtr<ID3D12Resource>
+      embedded_scene_host_vertex_output_readback_;
+  uint8_t* embedded_scene_host_vertex_output_readback_mapping_ = nullptr;
+  D3D12_RESOURCE_STATES embedded_scene_host_vertex_output_buffer_state_ =
+      D3D12_RESOURCE_STATE_COPY_DEST;
+  bool embedded_scene_host_vertex_output_resources_available_ = false;
+  uint32_t embedded_scene_host_vertex_output_record_count_ = 0;
+  std::array<EmbeddedSceneHostVertexOutputRecord,
+             kEmbeddedSceneHostVertexOutputRecordCount>
+      embedded_scene_host_vertex_output_records_{};
   struct VertexBufferState {
     uint32_t address = UINT32_MAX;
     uint32_t size = UINT32_MAX;
   };
   std::array<VertexBufferState, 96> vertex_buffer_states_{};
   uint64_t vertex_buffers_in_sync_[2] = {};
+  // SharedMemory::invalidation_epoch() when the in-sync bits were last set:
+  // any invalidation since then re-checks the residency of unchanged slots.
+  uint64_t vertex_buffers_residency_epoch_ = UINT64_MAX;
+#if REX_GPU_DIAGNOSTICS
+  // Measurement builds (REX_VERTEX_SLOT_RESIDENCY): unchanged slots found
+  // resident (skipped) or not (requested again; the pre-V351 cache skipped
+  // these and drew from invalid pages), and changed slots.
+  uint64_t vertex_slot_skipped_ = 0;
+  uint64_t vertex_slot_revalidated_ = 0;
+  uint64_t vertex_slot_changed_ = 0;
+  uint64_t vertex_slot_frames_ = 0;
+#endif
 
   std::atomic<bool> pix_capture_requested_ = false;
   bool pix_capturing_;
@@ -720,6 +1069,30 @@ class D3D12CommandProcessor : public CommandProcessor {
   ConstantBufferBinding cbuffer_binding_fetch_;
   ConstantBufferBinding cbuffer_binding_descriptor_indices_vertex_;
   ConstantBufferBinding cbuffer_binding_descriptor_indices_pixel_;
+
+  // Bounded PRESS START diagnostics. The CPU pointer is the allocation backing
+  // the currently bound tightly-packed vertex float constants, so the embedded
+  // host can verify the data actually made visible to the host shader rather
+  // than only inspecting the Xenos register file. Constant write provenance is
+  // retained only for c0-c10, the range used by the verified prompt shaders.
+  const uint8_t* embedded_float_vertex_cpu_address_ = nullptr;
+  uint32_t embedded_float_vertex_cpu_size_ = 0;
+  const uint8_t* embedded_float_pixel_cpu_address_ = nullptr;
+  uint32_t embedded_float_pixel_cpu_size_ = 0;
+  using EmbeddedFloatConstantWrite = pc_constant_writer::Record;
+  static constexpr uint32_t kEmbeddedTrackedFloatConstantDwords = 20 * 4;
+#if REX_GPU_DIAGNOSTICS
+  std::array<EmbeddedFloatConstantWrite, kEmbeddedTrackedFloatConstantDwords>
+      embedded_float_constant_writes_{};
+  uint64_t embedded_float_constant_write_sequence_ = 0;
+#else
+  // Player builds: write provenance is recorded only with ring publication
+  // tracking (measurement builds). Static storage that is never touched, so
+  // the 14 KB record table no longer splits the binding state.
+  static inline std::array<EmbeddedFloatConstantWrite, kEmbeddedTrackedFloatConstantDwords>
+      embedded_float_constant_writes_{};
+  static inline uint64_t embedded_float_constant_write_sequence_ = 0;
+#endif
 
   // Whether the latest shared memory and EDRAM buffer binding contains the
   // shared memory UAV rather than the SRV.
@@ -771,6 +1144,26 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   // Temporary storage for memexport stream constants used in the draw.
   std::vector<draw_util::MemExportRange> memexport_ranges_;
+
+  // GPU timing diagnostic state (allocated only when d3d12_gpu_timing is on;
+  // kept last so the object layout before it is unchanged).
+  struct GpuTimingState;
+  GpuTimingCategory GpuTimingSwitch(GpuTimingCategory category);
+  // Boundary writes (frame and submission starts / ends) may use the reserve.
+  void GpuTimingWrite(bool boundary = false);
+  void GpuTimingAddCount(GpuTimingCounter counter, uint64_t value);
+  bool GpuTimingLogFrame() const;
+  void InitializeGpuTiming();
+  void GpuTimingBeginSubmission(bool submission_opened, bool is_opening_frame);
+  void GpuTimingEndSubmission();
+  void GpuTimingCloseFrame();
+  std::unique_ptr<GpuTimingState> gpu_timing_;
+  struct GpuFrameMeter;
+  void InitializeGpuFrameMeter();
+  void GpuFrameMeterBeginSubmission(bool submission_opened, bool is_opening_frame);
+  void GpuFrameMeterEndSubmission();
+  void GpuFrameMeterCloseFrame();
+  std::unique_ptr<GpuFrameMeter> gpu_frame_meter_;
 };
 
 }  // namespace rex::graphics::d3d12

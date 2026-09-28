@@ -53,6 +53,13 @@ add_library(rex::runtime ALIAS rexruntime)
 add_library(rex::system ALIAS rexruntime)
 add_library(rex::kernel ALIAS rexruntime)
 
+if(WIN32)
+    # Keep the packaged PE identity stable across clean Release relinks. This
+    # changes only the COFF timestamp, which lld derives from output content.
+    target_link_options(rexruntime PRIVATE
+        $<$<CONFIG:Release>:LINKER:/Brepro>)
+endif()
+
 set_target_properties(rexruntime PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS TRUE)
 
 target_include_directories(rexruntime PUBLIC

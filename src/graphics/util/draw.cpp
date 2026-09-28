@@ -19,6 +19,7 @@
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/registers.h>
+#include <rex/graphics/resolve_rectangle.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
@@ -804,30 +805,11 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
     vertices_fixed[i] = ui::FloatToD3D11Fixed16p8(xenos::GpuSwap(vertices_guest[i], fetch.endian) +
                                                   half_pixel_offset);
   }
-  // Inclusive.
-  int32_t x0 = std::min(std::min(vertices_fixed[0], vertices_fixed[2]), vertices_fixed[4]);
-  int32_t y0 = std::min(std::min(vertices_fixed[1], vertices_fixed[3]), vertices_fixed[5]);
-  // Exclusive.
-  int32_t x1 = std::max(std::max(vertices_fixed[0], vertices_fixed[2]), vertices_fixed[4]);
-  int32_t y1 = std::max(std::max(vertices_fixed[1], vertices_fixed[3]), vertices_fixed[5]);
-  // Top-left - include .5 (0.128 treated as 0 covered, 0.129 as 0 not covered).
-  x0 = (x0 + 127) >> 8;
-  y0 = (y0 + 127) >> 8;
-  // Bottom-right - exclude .5.
-  x1 = (x1 + 127) >> 8;
-  y1 = (y1 + 127) >> 8;
-
-  auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
-
-  // Apply the window offset to the vertices.
-  if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
-    x0 += pa_sc_window_offset.window_x_offset;
-    y0 += pa_sc_window_offset.window_y_offset;
-    x1 += pa_sc_window_offset.window_x_offset;
-    y1 += pa_sc_window_offset.window_y_offset;
-  }
-
-  // Apply the scissor and prevent negative origin (behind the EDRAM base).
+  // Apply the Xenos vertex window offset, then the scissor, and prevent a
+  // negative origin (behind the EDRAM base). GetScissor independently applies
+  // the window offset to PA_SC_WINDOW_SCISSOR when its disable bit is clear.
+  // Both transformations are required to preserve the triangle's placement
+  // relative to the scissor.
   Scissor scissor;
   // False because clamping to the surface pitch will be done later (it will be
   // aligned to the resolve alignment here, for resolving from render targets
@@ -835,10 +817,17 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   GetScissor(regs, scissor, false);
   int32_t scissor_right = int32_t(scissor.offset[0] + scissor.extent[0]);
   int32_t scissor_bottom = int32_t(scissor.offset[1] + scissor.extent[1]);
-  x0 = std::clamp(x0, int32_t(scissor.offset[0]), scissor_right);
-  y0 = std::clamp(y0, int32_t(scissor.offset[1]), scissor_bottom);
-  x1 = std::clamp(x1, int32_t(scissor.offset[0]), scissor_right);
-  y1 = std::clamp(y1, int32_t(scissor.offset[1]), scissor_bottom);
+  auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+  ResolveRectangle rectangle = GetResolveRectangleFromVertices(
+      vertices_fixed,
+      regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable,
+      pa_sc_window_offset.window_x_offset,
+      pa_sc_window_offset.window_y_offset, int32_t(scissor.offset[0]),
+      int32_t(scissor.offset[1]), scissor_right, scissor_bottom);
+  int32_t x0 = rectangle.x0;
+  int32_t y0 = rectangle.y0;
+  int32_t x1 = rectangle.x1;
+  int32_t y1 = rectangle.y1;
 
   assert_true(x0 <= x1 && y0 <= y1);
 
@@ -945,6 +934,11 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
 
   // Calculate the destination memory extent.
   uint32_t rb_copy_dest_base = regs[XE_GPU_REG_RB_COPY_DEST_BASE];
+  info_out.copy_dest_original_base = rb_copy_dest_base;
+  info_out.copy_dest_rect[0] = uint32_t(x0);
+  info_out.copy_dest_rect[1] = uint32_t(y0);
+  info_out.copy_dest_rect[2] = uint32_t(x1);
+  info_out.copy_dest_rect[3] = uint32_t(y1);
   uint32_t copy_dest_base_adjusted = rb_copy_dest_base;
   uint32_t copy_dest_extent_start, copy_dest_extent_end;
   auto rb_copy_dest_pitch = regs.Get<reg::RB_COPY_DEST_PITCH>();

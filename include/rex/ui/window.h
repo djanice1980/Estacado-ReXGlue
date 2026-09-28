@@ -290,6 +290,14 @@ class Window {
   /// Valid after Open() returns successfully.
   virtual void* GetNativeWindowHandle() const { return nullptr; }
 
+  // Enables native relative mouse motion when the platform supports it.
+  // This is separate from CaptureMouse because UI dragging must not implicitly
+  // hide or recenter the pointer.
+  virtual bool SetRelativeMouseMode(bool enabled) {
+    (void)enabled;
+    return false;
+  }
+
   // Desired state stored by the common Window, externally modifiable, read-only
   // in the implementation.
   void SetMainMenu(std::unique_ptr<MenuItem> new_main_menu);

@@ -26,6 +26,7 @@
 #include <rex/platform.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/sdl_virtual_key.h>
+#include <rex/ui/window_input_policy.h>
 
 #if REX_PLATFORM_WIN32
 #include <rex/ui/surface_win.h>
@@ -38,11 +39,45 @@ namespace rex::ui {
 
 namespace {
 
+bool TryResolveNativeOutputSize(uint32_t& width_out, uint32_t& height_out) {
+  if (!rex::graphics::video_mode_util::IsNativeOutputResolutionFromCVar()) {
+    return false;
+  }
+  SDL_DisplayID display = SDL_GetPrimaryDisplay();
+  if (int32_t monitor_index = REXCVAR_GET(monitor); monitor_index > 0) {
+    int display_count = 0;
+    SDL_DisplayID* displays = SDL_GetDisplays(&display_count);
+    if (displays) {
+      if (monitor_index <= display_count) display = displays[monitor_index - 1];
+      SDL_free(displays);
+    }
+  }
+  const SDL_DisplayMode* mode = display ? SDL_GetDesktopDisplayMode(display) : nullptr;
+  if (!mode || mode->w <= 0 || mode->h <= 0) {
+    REXLOG_WARN("Unable to resolve native output size; using the application default");
+    return false;
+  }
+  width_out = uint32_t(mode->w);
+  height_out = uint32_t(mode->h);
+  return true;
+}
+
 uint32_t ResolveWindowWidth(uint32_t requested_width) {
   if (REXCVAR_GET(window_width) > 0) {
     return uint32_t(REXCVAR_GET(window_width));
   }
   if (!rex::cvar::HasNonDefaultValue("window_width")) {
+    uint32_t native_width = 0;
+    uint32_t native_height = 0;
+    if (TryResolveNativeOutputSize(native_width, native_height)) {
+      return std::min(native_width, uint32_t(8192));
+    }
+    int32_t output_width = 0;
+    int32_t output_height = 0;
+    if (rex::graphics::video_mode_util::TryGetOutputResolutionPresetFromCVar(
+            output_width, output_height)) {
+      return uint32_t(std::clamp(output_width, 1, 8192));
+    }
     if (rex::cvar::HasNonDefaultValue("video_mode_width") && REXCVAR_GET(video_mode_width) > 0) {
       return uint32_t(std::clamp(REXCVAR_GET(video_mode_width), 1, 8192));
     }
@@ -61,6 +96,17 @@ uint32_t ResolveWindowHeight(uint32_t requested_height) {
     return uint32_t(REXCVAR_GET(window_height));
   }
   if (!rex::cvar::HasNonDefaultValue("window_height")) {
+    uint32_t native_width = 0;
+    uint32_t native_height = 0;
+    if (TryResolveNativeOutputSize(native_width, native_height)) {
+      return std::min(native_height, uint32_t(8192));
+    }
+    int32_t output_width = 0;
+    int32_t output_height = 0;
+    if (rex::graphics::video_mode_util::TryGetOutputResolutionPresetFromCVar(
+            output_width, output_height)) {
+      return uint32_t(std::clamp(output_height, 1, 8192));
+    }
     if (rex::cvar::HasNonDefaultValue("video_mode_height") && REXCVAR_GET(video_mode_height) > 0) {
       return uint32_t(std::clamp(REXCVAR_GET(video_mode_height), 1, 8192));
     }
@@ -130,8 +176,23 @@ WindowSDL::~WindowSDL() {
 bool WindowSDL::OpenImpl() {
   // SDL window coordinates are physical pixels on Windows and X11.
   SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN;
-  sdl_window_ = SDL_CreateWindow(GetTitle().c_str(), int(SizeToPhysical(GetDesiredLogicalWidth())),
-                                 int(SizeToPhysical(GetDesiredLogicalHeight())), flags);
+  // output_resolution is an explicit host-surface size in physical pixels.
+  // Unlike window_width/window_height (which are documented as logical), it
+  // must not be multiplied by the desktop content scale a second time. This
+  // matters for the windowed 3840x2160 validation path on a scaled 2560x1440
+  // desktop. Borderless mode may still replace this with the desktop mode.
+  const bool output_resolution_is_physical =
+      rex::cvar::HasNonDefaultValue("output_resolution") &&
+      !REXCVAR_GET(output_resolution).empty() &&
+      !rex::cvar::HasNonDefaultValue("window_width") &&
+      !rex::cvar::HasNonDefaultValue("window_height");
+  const uint32_t create_width = output_resolution_is_physical
+                                    ? GetDesiredLogicalWidth()
+                                    : SizeToPhysical(GetDesiredLogicalWidth());
+  const uint32_t create_height = output_resolution_is_physical
+                                     ? GetDesiredLogicalHeight()
+                                     : SizeToPhysical(GetDesiredLogicalHeight());
+  sdl_window_ = SDL_CreateWindow(GetTitle().c_str(), int(create_width), int(create_height), flags);
   if (!sdl_window_) {
     REXLOG_ERROR("SDL_CreateWindow failed: {}", SDL_GetError());
     return false;
@@ -219,6 +280,10 @@ void* WindowSDL::GetNativeWindowHandle() const {
 #else
   return nullptr;
 #endif
+}
+
+bool WindowSDL::SetRelativeMouseMode(bool enabled) {
+  return sdl_window_ && SDL_SetWindowRelativeMouseMode(sdl_window_, enabled);
 }
 
 uint32_t WindowSDL::GetLatestDpiImpl() const {
@@ -410,6 +475,12 @@ void WindowSDL::HandleKeyEvent(SDL_Event& event) {
     return;
   }
   SDL_Keymod mod = event.key.mod;
+  if (window_input_policy::ShouldToggleFullscreen(
+          virtual_key, event.type == SDL_EVENT_KEY_DOWN, event.key.repeat,
+          (mod & SDL_KMOD_ALT) != 0)) {
+    SetFullscreen(!IsFullscreen());
+    return;
+  }
   KeyEvent e(this, virtual_key, /*repeat_count=*/1,
              /*prev_state=*/event.key.repeat,
              /*modifier_shift_pressed=*/(mod & SDL_KMOD_SHIFT) != 0,
@@ -444,6 +515,11 @@ void WindowSDL::HandleTextInputEvent(SDL_Event& event) {
   }
 }
 
+float WindowSDL::PixelDensity() const {
+  const float density = sdl_window_ ? SDL_GetWindowPixelDensity(sdl_window_) : 1.0f;
+  return density > 0.0f ? density : 1.0f;
+}
+
 void WindowSDL::HandleMouseEvent(SDL_Event& event) {
   // SDL3 reports float window coordinates; listeners expect physical pixels.
   float density = sdl_window_ ? SDL_GetWindowPixelDensity(sdl_window_) : 1.0f;
@@ -457,8 +533,11 @@ void WindowSDL::HandleMouseEvent(SDL_Event& event) {
         SDL_ShowCursor();
         RearmCursorAutoHideTimer();
       }
-      MouseEvent e(this, MouseEvent::Button::kNone, int32_t(event.motion.x * density),
-                   int32_t(event.motion.y * density));
+      MouseEvent e(this, MouseEvent::Button::kNone,
+                   int32_t(event.motion.x * density),
+                   int32_t(event.motion.y * density), 0, 0,
+                   int32_t(event.motion.xrel * density),
+                   int32_t(event.motion.yrel * density));
       OnMouseMove(e, destruction_receiver);
       break;
     }

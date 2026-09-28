@@ -1366,6 +1366,20 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
     if (copy_shader != draw_util::ResolveCopyShaderIndex::kUnknown) {
       const draw_util::ResolveCopyShaderInfo& copy_shader_info =
           draw_util::resolve_copy_shader_info[size_t(copy_shader)];
+      const FormatInfo* copy_dest_format_info = FormatInfo::Get(
+          uint32_t(resolve_info.copy_dest_info.copy_dest_format));
+      uint32_t copy_dest_pixel_size_log2 = 0;
+      const bool copy_dest_pixel_size_supported =
+          copy_dest_format_info && copy_dest_format_info->bits_per_pixel >= 8 &&
+          copy_dest_format_info->bits_per_pixel <= 128 &&
+          rex::bit_scan_forward(copy_dest_format_info->bits_per_pixel >> 3,
+                                &copy_dest_pixel_size_log2) &&
+          copy_dest_format_info->bits_per_pixel ==
+              (UINT32_C(8) << copy_dest_pixel_size_log2);
+      assert_true(copy_dest_pixel_size_supported);
+      if (!copy_dest_pixel_size_supported) {
+        return false;
+      }
       bool direct_resolved = false;
       if (GetPath() == Path::kHostRenderTargets) {
         if (REXCVAR_GET(direct_host_resolve)) {
@@ -1491,7 +1505,8 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
 
           // Invalidate textures and mark the range as scaled if needed.
           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
-                                            resolve_info.copy_dest_extent_length);
+                                            resolve_info.copy_dest_extent_length,
+                                            copy_dest_pixel_size_log2);
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
           copied = true;
@@ -1583,9 +1598,10 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
 
 bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
                                      reg::RB_DEPTHCONTROL normalized_depth_control,
-                                     uint32_t normalized_color_mask, const Shader& vertex_shader) {
+                                     uint32_t normalized_color_mask, const Shader& vertex_shader,
+                                     bool native_shader_grid) {
   if (!RenderTargetCache::Update(is_rasterization_done, normalized_depth_control,
-                                 normalized_color_mask, vertex_shader)) {
+                                 normalized_color_mask, vertex_shader, native_shader_grid)) {
     return false;
   }
 

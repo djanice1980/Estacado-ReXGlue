@@ -20,6 +20,7 @@
 #include <CLI/CLI.hpp>
 
 #include <rex/cvar.h>
+#include <rex/config_contents.h>
 #include <rex/logging.h>
 #include <rex/platform/env.h>
 
@@ -582,6 +583,19 @@ std::vector<std::string> Init(int argc, char** argv) {
   }
   g_init_done = true;
   return positional;
+}
+
+bool LoadConfigContents(std::string_view contents,
+                        const std::filesystem::path& origin) {
+  try {
+    auto config = toml::parse(contents, origin.string());
+    ApplyTomlTable(config, "");
+    REXLOG_INFO("Loaded config snapshot from {}", origin.string());
+    return true;
+  } catch (const toml::parse_error& err) {
+    REXLOG_ERROR("Failed to parse config {}: {}", origin.string(), err.what());
+    return false;
+  }
 }
 
 void LoadConfig(const std::filesystem::path& config_path) {

@@ -36,6 +36,13 @@ class DrawExtentEstimator {
   uint32_t EstimateVertexMaxY(const Shader& vertex_shader);
   uint32_t EstimateMaxY(bool try_to_estimate_vertex_max_y, const Shader& vertex_shader);
 
+  // Bounds of a draw that is exactly one screen-space rectangle (a 3-vertex
+  // kRectangleList with clipping disabled), in guest pixels with pixel
+  // centers at +0.5 and the window offset applied. False for anything else or
+  // when the vertices can't be evaluated on the CPU.
+  bool EstimateRectangleBounds(const Shader& vertex_shader, float& min_x, float& min_y,
+                               float& max_x, float& max_y);
+
  private:
   class PositionYExportSink : public ShaderInterpreter::ExportSink {
    public:
@@ -43,18 +50,21 @@ class DrawExtentEstimator {
                 uint32_t value_mask) override;
 
     void Reset() {
+      position_x_.reset();
       position_y_.reset();
       position_w_.reset();
       point_size_.reset();
       vertex_kill_.reset();
     }
 
+    const std::optional<float>& position_x() const { return position_x_; }
     const std::optional<float>& position_y() const { return position_y_; }
     const std::optional<float>& position_w() const { return position_w_; }
     const std::optional<float>& point_size() const { return point_size_; }
     const std::optional<uint32_t>& vertex_kill() const { return vertex_kill_; }
 
    private:
+    std::optional<float> position_x_;
     std::optional<float> position_y_;
     std::optional<float> position_w_;
     std::optional<float> point_size_;

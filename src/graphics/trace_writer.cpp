@@ -126,7 +126,7 @@ void TraceWriter::WriteIndirectBufferEnd() {
   fwrite(&cmd, 1, sizeof(cmd), file_);
 }
 
-void TraceWriter::WritePacketStart(uint32_t base_ptr, uint32_t count) {
+void TraceWriter::WritePacketStartOpen(uint32_t base_ptr, uint32_t count) {
   if (!file_) {
     return;
   }
@@ -139,7 +139,7 @@ void TraceWriter::WritePacketStart(uint32_t base_ptr, uint32_t count) {
   fwrite(membase_ + base_ptr, 4, count, file_);
 }
 
-void TraceWriter::WritePacketEnd() {
+void TraceWriter::WritePacketEndOpen() {
   if (!file_) {
     return;
   }

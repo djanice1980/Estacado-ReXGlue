@@ -4,7 +4,8 @@
 #     FLOOR_MINOR <int>
 #     GIT_DESCRIBE_LONG  <string>   # output of git describe --tags --long ...
 #     GIT_DESCRIBE_EXACT <string>   # output of git describe --tags --exact-match
-#     BRANCH_NAME        <string>)  # output of git symbolic-ref --short HEAD
+#     BRANCH_NAME        <string>   # output of git symbolic-ref --short HEAD
+#     GIT_REV_PARSE      <string>)  # output of git rev-parse --short=8 HEAD
 #
 # Emits a CMake-style version string: MAJOR.MINOR[.PATCH[.TWEAK]][-id].
 # See https://cmake.org/cmake/help/latest/variable/CMAKE_VERSION.html
@@ -18,7 +19,8 @@
 #   id is "dev.gSHA" on any branch and "rc.gSHA" on a release/* branch.
 #==========================================================
 function(rex_compute_version out_var)
-    set(one_value FLOOR_MAJOR FLOOR_MINOR GIT_DESCRIBE_LONG GIT_DESCRIBE_EXACT BRANCH_NAME)
+    set(one_value FLOOR_MAJOR FLOOR_MINOR GIT_DESCRIBE_LONG GIT_DESCRIBE_EXACT
+                  BRANCH_NAME GIT_REV_PARSE)
     cmake_parse_arguments(ARG "" "${one_value}" "" ${ARGN})
 
     if(NOT "${ARG_GIT_DESCRIBE_EXACT}" STREQUAL "")
@@ -30,6 +32,15 @@ function(rex_compute_version out_var)
     endif()
 
     if("${ARG_GIT_DESCRIBE_LONG}" STREQUAL "")
+        if(ARG_GIT_REV_PARSE MATCHES "^[0-9a-f]+$")
+            message(STATUS
+                "rex_compute_version: no v* tag reachable from HEAD; "
+                "using exact commit fallback dev.g${ARG_GIT_REV_PARSE}")
+            set(${out_var}
+                "${ARG_FLOOR_MAJOR}.${ARG_FLOOR_MINOR}.0.0-dev.g${ARG_GIT_REV_PARSE}"
+                PARENT_SCOPE)
+            return()
+        endif()
         message(WARNING
             "rex_compute_version: no v* tag reachable from HEAD. "
             "Falling back to ${ARG_FLOOR_MAJOR}.${ARG_FLOOR_MINOR}.0.0-dev.unknown. "
@@ -101,7 +112,8 @@ function(rex_resolve_version out_var)
             FLOOR_MINOR ${ARG_FLOOR_MINOR}
             GIT_DESCRIBE_LONG ""
             GIT_DESCRIBE_EXACT ""
-            BRANCH_NAME "")
+            BRANCH_NAME ""
+            GIT_REV_PARSE "")
         set(${out_var} "${result}" PARENT_SCOPE)
         return()
     endif()
@@ -143,11 +155,23 @@ function(rex_resolve_version out_var)
         set(branch_name "")
     endif()
 
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse --short=8 HEAD
+        WORKING_DIRECTORY "${ARG_SOURCE_DIR}"
+        OUTPUT_VARIABLE rev_parse
+        ERROR_QUIET
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE rev_parse_rc)
+    if(NOT rev_parse_rc EQUAL 0)
+        set(rev_parse "")
+    endif()
+
     rex_compute_version(result
         FLOOR_MAJOR ${ARG_FLOOR_MAJOR}
         FLOOR_MINOR ${ARG_FLOOR_MINOR}
         GIT_DESCRIBE_LONG "${describe_long}"
         GIT_DESCRIBE_EXACT "${describe_exact}"
-        BRANCH_NAME "${branch_name}")
+        BRANCH_NAME "${branch_name}"
+        GIT_REV_PARSE "${rev_parse}")
     set(${out_var} "${result}" PARENT_SCOPE)
 endfunction()

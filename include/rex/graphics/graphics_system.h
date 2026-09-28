@@ -59,8 +59,22 @@ class GraphicsSystem : public system::IGraphicsSystem {
   ::rex::ui::Presenter* presenter() const override { return presenter_.get(); }
 
   X_STATUS SetupPresentation(::rex::ui::WindowedAppContext* app_context) override;
+  // The presentation thread ends before Shutdown (the embedded title path
+  // joins it first) and its app context is a local of that thread: forget it
+  // there, so Shutdown releases the presenter on its own thread instead of
+  // calling into the destroyed context (V380: rexruntime.dll+0x100674 access
+  // violation after every graceful stop).
+  void ReleaseAppContext() { app_context_ = nullptr; }
   X_STATUS SetupGuestGpu(runtime::FunctionDispatcher* function_dispatcher,
                          system::KernelState* kernel_state) override;
+  // Initializes only the GPU subsystem for a static-recompilation host. The
+  // supplied Memory adopts host-owned mappings and no ReXGlue kernel,
+  // dispatcher, filesystem, or object system is constructed.
+  X_STATUS SetupEmbeddedGuestGpu(
+      memory::Memory* memory, double refresh_rate_hz,
+      std::function<void(uint32_t callback, uint32_t source, uint32_t cpu,
+                         uint32_t callback_data)>
+          interrupt_dispatch);
   bool has_presentation() const override { return presenter_ != nullptr; }
   void Shutdown() override;
 
@@ -76,6 +90,13 @@ class GraphicsSystem : public system::IGraphicsSystem {
 
   void SetInterruptCallback(uint32_t callback, uint32_t user_data) override;
   void DispatchInterruptCallback(uint32_t source, uint32_t cpu);
+
+  uint32_t ReadRegisterEmbedded(uint32_t addr) { return ReadRegister(addr); }
+  void WriteRegisterEmbedded(uint32_t addr, uint32_t value) { WriteRegister(addr, value); }
+  void NotifyPhysicalMemoryWrite(uint32_t address, uint32_t length);
+  // Host write of CPU-side data made inside the plugin (any thread, after the
+  // write): marked lock-free, published on the command processor thread.
+  void NotifyHostWrite(uint32_t address, uint32_t length);
 
   virtual void ClearCaches();
   virtual void InvalidateGpuMemory();
@@ -124,6 +145,8 @@ class GraphicsSystem : public system::IGraphicsSystem {
 
   std::atomic<bool> vsync_worker_running_;
   system::object_ref<system::XHostThread> vsync_worker_thread_;
+  std::thread embedded_vsync_worker_thread_;
+  std::function<void(uint32_t, uint32_t, uint32_t, uint32_t)> embedded_interrupt_dispatch_;
 
   RegisterFile register_file_;
   std::unique_ptr<CommandProcessor> command_processor_;

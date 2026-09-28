@@ -237,7 +237,10 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
   assert_not_null(driver);
 
   uint32_t ptr = memory()->SystemHeapAlloc(0x4);
-  memory::store_and_swap<uint32_t>(memory()->TranslateVirtual(ptr), callback_arg);
+  {
+    auto host_write = memory()->GuardVirtualWrite(ptr, sizeof(uint32_t));
+    memory::store_and_swap<uint32_t>(memory()->TranslateVirtual(ptr), callback_arg);
+  }
 
   clients_[index] = {driver, callback, callback_arg, ptr, true};
 

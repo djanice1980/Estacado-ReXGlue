@@ -18,6 +18,7 @@
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 
+#include <dxgi1_6.h>
 #include <malloc.h>
 
 REXCVAR_DEFINE_BOOL(d3d12_debug, false, "UI/D3D12", "Enable Direct3D 12 and DXGI debug layer")
@@ -250,10 +251,32 @@ bool D3D12Provider::Initialize() {
     return false;
   }
 
-  // Choose the adapter.
+  // Choose the adapter. By default the high-performance one first (the
+  // discrete GPU on hybrid laptops, where the first listed adapter is usually
+  // the integrated one), then the first hardware adapter.
   uint32_t adapter_index = 0;
   IDXGIAdapter1* adapter = nullptr;
-  while (dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
+  if (REXCVAR_GET(d3d12_adapter) == -1) {
+    IDXGIFactory6* dxgi_factory6 = nullptr;
+    if (SUCCEEDED(dxgi_factory->QueryInterface(IID_PPV_ARGS(&dxgi_factory6)))) {
+      for (UINT preference_index = 0;
+           !adapter && SUCCEEDED(dxgi_factory6->EnumAdapterByGpuPreference(
+                           preference_index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                           IID_PPV_ARGS(&adapter)));
+           ++preference_index) {
+        DXGI_ADAPTER_DESC1 preferred_desc;
+        if (FAILED(adapter->GetDesc1(&preferred_desc)) ||
+            (preferred_desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) ||
+            FAILED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0,
+                                            _uuidof(ID3D12Device), nullptr))) {
+          adapter->Release();
+          adapter = nullptr;
+        }
+      }
+      dxgi_factory6->Release();
+    }
+  }
+  while (!adapter && dxgi_factory->EnumAdapters1(adapter_index, &adapter) == S_OK) {
     DXGI_ADAPTER_DESC1 adapter_desc;
     if (SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
       if (SUCCEEDED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0, _uuidof(ID3D12Device),

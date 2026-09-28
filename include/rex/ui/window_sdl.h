@@ -32,6 +32,9 @@ class WindowSDL final : public Window {
   ~WindowSDL() override;
 
   void* GetNativeWindowHandle() const override;
+  // SDL window coordinates -> physical pixels (as HandleMouseEvent applies).
+  float PixelDensity() const;
+  bool SetRelativeMouseMode(bool enabled) override;
 
   // Called by SDLWindowedAppContext on the UI thread.
   void HandleWindowEvent(SDL_Event& event);

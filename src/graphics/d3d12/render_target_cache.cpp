@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iterator>
 #include <memory>
@@ -38,6 +39,16 @@
 #include <rex/string.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+#include "../shaders/bytecode/d3d12_5_1/diagnostic_depth_samples_single.h"
+#include "../shaders/bytecode/d3d12_5_1/diagnostic_depth_samples_msaa.h"
+#include "../shaders/bytecode/d3d12_5_1/diagnostic_color_samples_single.h"
+#include "../shaders/bytecode/d3d12_5_1/diagnostic_color_samples_msaa.h"
+
+REXCVAR_DEFINE_BOOL(embedded_camera_scene_alias_capture, false, "GPU/Diagnostics",
+                    "Selected scene frame: bounded individual colour samples before/after ownership aliases");
+
+REXCVAR_DEFINE_BOOL(embedded_resolve_depth_source_capture, false, "GPU",
+                    "Bounded deferred raw host depth/stencil samples before resolve");
 
 REXCVAR_DEFINE_BOOL(native_stencil_value_output_d3d12_intel, false, "GPU/D3D12",
                     "Native stencil value output for Intel D3D12");
@@ -48,7 +59,25 @@ REXCVAR_DEFINE_STRING(render_target_path_d3d12, "", "GPU/D3D12",
 
 REXCVAR_DEFINE_BOOL(native_stencil_value_output, true, "GPU", "Enable native stencil value output");
 
+REXCVAR_DEFINE_BOOL(
+    embedded_scene_depth_transfer_trace, false, "GPU/Diagnostics",
+    "Bounded ownership-transfer trace for the scaled title scene depth/stencil surface");
+
+// Defined by command_processor.cpp. The render-target cache consumes the same
+// opt-in diagnostic switch so the draw-side and ownership-transfer captures are
+// guaranteed to describe one selected frame.
+REXCVAR_DECLARE(bool, embedded_mixed_scale_transition_capture);
+REXCVAR_DECLARE(uint32_t, embedded_target_writer_capture_count);
+REXCVAR_DECLARE(bool, embedded_temporal_depth_resolve_capture);
+
 namespace rex::graphics::d3d12 {
+
+// Defined by command_processor.cpp. This is true only for the bounded swap
+// selected by embedded_gameplay_capture_* and for a physical manual capture.
+bool IsCurrentEmbeddedGameplayCaptureFrame();
+bool D3D12RenderTargetCache::current_draw_depth_float24_convert_in_pixel_shader() const {
+  return depth_float24_convert_in_pixel_shader_;
+}
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -202,6 +231,13 @@ bool D3D12RenderTargetCache::Initialize() {
   if (path_ == Path::kPixelShaderInterlock && !provider.AreRasterizerOrderedViewsSupported()) {
     path_ = Path::kHostRenderTargets;
   }
+  std::fprintf(stderr,
+               "REX_EMBEDDED_RENDER_TARGET_PATH requested=%s selected=%s rov_supported=%u "
+               "vendor=0x%04X\n",
+               REXCVAR_GET(render_target_path_d3d12).c_str(),
+               path_ == Path::kPixelShaderInterlock ? "rov" : "rtv",
+               provider.AreRasterizerOrderedViewsSupported() ? 1u : 0u,
+               static_cast<unsigned>(provider.GetAdapterVendorID()));
 
   // Create the buffer for reinterpreting EDRAM contents.
   uint32_t edram_buffer_size =
@@ -334,6 +370,22 @@ bool D3D12RenderTargetCache::Initialize() {
     Shutdown();
     return false;
   }
+  if (draw_resolution_scaled) {
+    // Native threshold resolves use full unscaled constants and authoritative
+    // shared memory, unlike the globally scaled resolve-buffer path.
+    resolve_copy_root_parameters[0].Constants.Num32BitValues =
+        sizeof(draw_util::ResolveCopyShaderConstants) / sizeof(uint32_t);
+    resolve_copy_native_root_signature_ =
+        ui::d3d12::util::CreateRootSignature(
+            provider, resolve_copy_root_signature_desc);
+    if (resolve_copy_native_root_signature_ == nullptr) {
+      REXGPU_ERROR(
+          "D3D12RenderTargetCache: Failed to create the native resolve-copy "
+          "root signature");
+      Shutdown();
+      return false;
+    }
+  }
   // Direct resolve currently shares the root signature shape with the resolve
   // copy pass (constants + destination UAV + source SRV) and may diverge later.
   direct_resolve_root_signature_color_ = resolve_copy_root_signature_;
@@ -366,6 +418,24 @@ bool D3D12RenderTargetCache::Initialize() {
         rex::string::to_utf16(resolve_copy_shader_info.debug_name);
     resolve_copy_pipeline->SetName(reinterpret_cast<LPCWSTR>(resolve_copy_pipeline_name.c_str()));
     resolve_copy_pipelines_[i] = resolve_copy_pipeline;
+    if (draw_resolution_scaled) {
+      ID3D12PipelineState* resolve_copy_native_pipeline =
+          ui::d3d12::util::CreateComputePipeline(
+              device, resolve_copy_shader_code.unscaled,
+              resolve_copy_shader_code.unscaled_size,
+              resolve_copy_native_root_signature_);
+      if (resolve_copy_native_pipeline == nullptr) {
+        REXGPU_ERROR(
+            "D3D12RenderTargetCache: Failed to create {} native "
+            "resolve-copy pipeline",
+            resolve_copy_shader_info.debug_name);
+        Shutdown();
+        return false;
+      }
+      resolve_copy_native_pipeline->SetName(
+          reinterpret_cast<LPCWSTR>(resolve_copy_pipeline_name.c_str()));
+      resolve_copy_native_pipelines_[i] = resolve_copy_native_pipeline;
+    }
   }
 
   // Using the cvar on emulator initialization so used pipelines are consistent
@@ -375,6 +445,12 @@ bool D3D12RenderTargetCache::Initialize() {
       provider.IsPSSpecifiedStencilReferenceSupported() &&
       (REXCVAR_GET(native_stencil_value_output_d3d12_intel) ||
        provider.GetAdapterVendorID() != ui::GraphicsProvider::GpuVendorID::kIntel);
+  std::fprintf(stderr,
+               "REX_RENDER_TARGET_TRANSFER_POLICY stencil_reference_output=%u "
+               "ps_specified_stencil_ref=%u\n",
+               use_stencil_reference_output_ ? 1u : 0u,
+               provider.IsPSSpecifiedStencilReferenceSupported() ? 1u : 0u);
+  std::fflush(stderr);
 
   if (path_ == Path::kHostRenderTargets) {
     // Host render targets.
@@ -960,7 +1036,1169 @@ bool D3D12RenderTargetCache::Initialize() {
   return true;
 }
 
+bool D3D12RenderTargetCache::CaptureEmbeddedColorTarget(
+    const char* diagnostic_label, const char* dump_path,
+    uint64_t maximum_fp16_bytes) {
+  if (path_ != Path::kHostRenderTargets) {
+    std::fprintf(stderr,
+                 "REX_EMBEDDED_PROMPT_RTV_READBACK result=skipped path=rov\n");
+    std::fflush(stderr);
+    return false;
+  }
+
+  RenderTarget* const* accumulated = last_update_accumulated_render_targets();
+  auto* render_target = static_cast<D3D12RenderTarget*>(accumulated[1]);
+  if (!render_target) {
+    std::fprintf(stderr,
+                 "REX_EMBEDDED_PROMPT_RTV_READBACK result=missing_color0\n");
+    std::fflush(stderr);
+    return false;
+  }
+
+  if (maximum_fp16_bytes) {
+    const auto desc = render_target->resource()->GetDesc();
+    // A configurable target selector must not send another host format into
+    // the legacy FP16 content interpreter, or allocate an unbounded readback.
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT ||
+        !desc.Height || desc.Width > maximum_fp16_bytes / 8 / desc.Height) {
+      std::fprintf(stderr,
+                   "REX_EMBEDDED_RTV_CAPTURE label=%s result=rejected_contract "
+                   "format=%u size=%llux%u limit=%llu\n",
+                   diagnostic_label, uint32_t(desc.Format),
+                   static_cast<unsigned long long>(desc.Width), desc.Height,
+                   static_cast<unsigned long long>(maximum_fp16_bytes));
+      std::fflush(stderr);
+      return false;
+    }
+  }
+  return CaptureEmbeddedColorTarget(render_target, diagnostic_label, dump_path);
+}
+
+bool D3D12RenderTargetCache::QueueEmbeddedColorTarget(
+    const char* diagnostic_label, const char* dump_path,
+    uint64_t maximum_fp16_bytes) {
+  if (path_ != Path::kHostRenderTargets || !diagnostic_label || !dump_path ||
+      !command_processor_.IsSubmissionOpen() ||
+      queued_color_target_readback_count_ >= 9 ||
+      maximum_fp16_bytes > UINT64_C(48) * 1024 * 1024) return false;
+  auto* target = static_cast<D3D12RenderTarget*>(
+      last_update_accumulated_render_targets()[1]);
+  if (!target) return false;
+  PendingColorTargetReadback pending;
+  if (!pending.copy.Create(command_processor_.GetD3D12Provider().GetDevice(),
+                            target->resource(), maximum_fp16_bytes)) return false;
+  pending.submission = command_processor_.GetCurrentSubmission();
+  pending.label = diagnostic_label;
+  pending.path = dump_path;
+  command_processor_.SubmitBarriers();
+  pending.copy.Enqueue(command_processor_.GetDeferredCommandList(),
+                        target->resource_state());
+  pending_color_target_readbacks_.push_back(std::move(pending));
+  ++queued_color_target_readback_count_;
+  return true;
+}
+
+bool D3D12RenderTargetCache::QueueCameraDepthClearReadback(
+    uint64_t frame, uint64_t draw, uint64_t clear_draw, bool after_alias) {
+  if (!frame || !draw || !clear_draw || path_ != Path::kHostRenderTargets ||
+      !command_processor_.IsSubmissionOpen()) return false;
+  auto* target = static_cast<D3D12RenderTarget*>(last_update_accumulated_render_targets()[0]);
+  if (!target) return false;
+  const auto key = target->key();
+  if (!key.is_depth || key.base_tiles != 0 || key.pitch_tiles_at_32bpp != 16 ||
+      key.msaa_samples != (after_alias ? xenos::MsaaSamples::k2X : xenos::MsaaSamples::k4X) ||
+      key.GetDepthFormat() != xenos::DepthRenderTargetFormat::kD24FS8 ||
+      GetKeyScaleX(key) != 1 || GetKeyScaleY(key) != 1) return false;
+  const auto desc = target->resource()->GetDesc();
+  const bool queued = QueueDepthSourceReadback(target, 0, 0, frame, draw, after_alias);
+  std::fprintf(stderr,
+      "REX_CAMERA_DEPTH_CLEAR frame=%llu draw=%llu clear_draw=%llu stage=%s queued=%u "
+      "key=%08X resource=%p guest_msaa=%u host_samples=%u source_width=%llu source_height=%u "
+      "rows=%u scope=host_depth_samples_first_rows_not_resolved_depth\n",
+      static_cast<unsigned long long>(frame), static_cast<unsigned long long>(draw),
+      static_cast<unsigned long long>(clear_draw), after_alias ? "after_alias" : "after_clear",
+      queued ? 1u : 0u, key.key, static_cast<void*>(target->resource()), uint32_t(key.msaa_samples),
+      desc.SampleDesc.Count, static_cast<unsigned long long>(desc.Width), desc.Height,
+      embedded_camera_depth_clear_policy::ReadbackBudget::kRows);
+  std::fflush(stderr);
+  return queued;
+}
+
+bool D3D12RenderTargetCache::QueueDepthSourceReadback(
+    D3D12RenderTarget* target, uint32_t ordinal, uint32_t destination,
+    uint64_t camera_frame, uint64_t camera_draw, bool after_alias) {
+  if (!target || !target->key().is_depth || !command_processor_.IsSubmissionOpen() ||
+      (!camera_frame && (captured_depth_sources_.size() >= 2 ||
+      std::find(captured_depth_sources_.begin(), captured_depth_sources_.end(),
+                target->resource()) != captured_depth_sources_.end()))) return false;
+  const auto desc = target->resource()->GetDesc();
+  const uint64_t camera_bytes = camera_frame
+      ? camera_depth_readback_budget_.Reserve(desc.Width, desc.Height, desc.SampleDesc.Count) : 0;
+  if (camera_frame && (!camera_draw || !camera_bytes)) return false;
+  constexpr uint64_t kLimit = UINT64_C(64) * 1024 * 1024;
+  if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+      desc.Format != DXGI_FORMAT_R32G8X24_TYPELESS || desc.DepthOrArraySize != 1 ||
+      desc.MipLevels != 1 || !desc.Width || !desc.Height ||
+      (desc.SampleDesc.Count != 1 && desc.SampleDesc.Count != 2 && desc.SampleDesc.Count != 4) ||
+      desc.Width > kLimit / 8 / desc.Height / desc.SampleDesc.Count) return false;
+  PendingDepthSourceReadback p;
+  p.source = target->resource(); p.width = uint32_t(desc.Width); p.height = desc.Height;
+  p.samples = desc.SampleDesc.Count; p.bytes = uint64_t(p.width) * p.height * p.samples * 8;
+  if (camera_frame) {
+    p.height = embedded_camera_depth_clear_policy::ReadbackBudget::kRows;
+    p.bytes = camera_bytes;
+    p.camera_frame = camera_frame;
+    p.camera_draw = camera_draw;
+  }
+  p.ordinal = ordinal; p.destination = destination;
+  p.path = "rex_resolve_depth_source_" + std::to_string(ordinal) + ".bin";
+  if (camera_frame) {
+    p.path = "rex_camera_depth_frame_" + std::to_string(camera_frame) + "_draw_" +
+        std::to_string(camera_draw) + (after_alias ? "_after_alias.bin" : "_after_clear.bin");
+  }
+  auto* device = command_processor_.GetD3D12Provider().GetDevice();
+  D3D12_RESOURCE_DESC buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(buffer_desc, p.bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+  if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
+      D3D12_HEAP_FLAG_NONE, &buffer_desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+      nullptr, IID_PPV_ARGS(&p.output)))) return false;
+  buffer_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+  if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesReadback,
+      D3D12_HEAP_FLAG_NONE, &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST,
+      nullptr, IID_PPV_ARGS(&p.readback)))) return false;
+  D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+  D3D12_ROOT_PARAMETER parameters[4] = {};
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[0].Constants.Num32BitValues = 3;
+  for (uint32_t i = 0; i < 2; ++i) {
+    ranges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[i].NumDescriptors = 1; ranges[i].BaseShaderRegister = i;
+    parameters[i + 1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[i + 1].DescriptorTable = {1, &ranges[i]};
+  }
+  parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+  D3D12_ROOT_SIGNATURE_DESC root_desc = {};
+  root_desc.NumParameters = 4; root_desc.pParameters = parameters;
+  Microsoft::WRL::ComPtr<ID3DBlob> serialized;
+  if (FAILED(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1,
+                                        &serialized, nullptr)) ||
+      FAILED(device->CreateRootSignature(0, serialized->GetBufferPointer(),
+          serialized->GetBufferSize(), IID_PPV_ARGS(&p.root)))) return false;
+  D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline_desc = {};
+  pipeline_desc.pRootSignature = p.root.Get();
+  pipeline_desc.CS = p.samples == 1
+      ? D3D12_SHADER_BYTECODE{diagnostic_depth_samples_single, sizeof(diagnostic_depth_samples_single)}
+      : D3D12_SHADER_BYTECODE{diagnostic_depth_samples_msaa, sizeof(diagnostic_depth_samples_msaa)};
+  if (FAILED(device->CreateComputePipelineState(&pipeline_desc, IID_PPV_ARGS(&p.pipeline)))) return false;
+  ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[2];
+  if (!command_processor_.RequestOneUseSingleViewDescriptors(2, descriptors)) return false;
+  device->CopyDescriptorsSimple(1, descriptors[0].first, target->descriptor_srv().GetHandle(),
+                                 D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  device->CopyDescriptorsSimple(1, descriptors[1].first, target->descriptor_srv_stencil().GetHandle(),
+                                 D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  p.submission = command_processor_.GetCurrentSubmission();
+  const auto previous = target->resource_state();
+  command_processor_.PushTransitionBarrier(target->resource(), previous,
+                                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  command_processor_.SubmitBarriers();
+  auto& commands = command_processor_.GetDeferredCommandList();
+  command_processor_.SetExternalPipeline(p.pipeline.Get());
+  commands.D3DSetComputeRootSignature(p.root.Get());
+  const uint32_t constants[] = {p.width, p.height, p.samples};
+  commands.D3DSetComputeRoot32BitConstants(0, 3, constants, 0);
+  commands.D3DSetComputeRootDescriptorTable(1, descriptors[0].second);
+  commands.D3DSetComputeRootDescriptorTable(2, descriptors[1].second);
+  commands.D3DSetComputeRootUnorderedAccessView(3, p.output->GetGPUVirtualAddress());
+  commands.D3DDispatch((p.width + 7) / 8, (p.height + 7) / 8, p.samples);
+  command_processor_.PushTransitionBarrier(target->resource(),
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, previous);
+  command_processor_.PushTransitionBarrier(p.output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                           D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.SubmitBarriers();
+  commands.D3DCopyBufferRegion(p.readback.Get(), 0, p.output.Get(), 0, p.bytes);
+  std::fprintf(stderr,
+      "%s ordinal=%u dest_base=0x%08X resource=%p "
+      "width=%u height=%u samples=%u bytes=%llu submission=%llu path=%s\n",
+      camera_frame ? "REX_CAMERA_DEPTH_CLEAR_QUEUED" : "REX_EMBEDDED_DEPTH_SOURCE_QUEUED",
+      ordinal, destination, static_cast<void*>(target->resource()), p.width, p.height, p.samples,
+      static_cast<unsigned long long>(p.bytes), static_cast<unsigned long long>(p.submission), p.path.c_str());
+  if (!camera_frame) captured_depth_sources_.push_back(target->resource());
+  pending_depth_source_readbacks_.push_back(std::move(p));
+  return true;
+}
+
+void D3D12RenderTargetCache::CompleteDepthSourceReadbacks() {
+  const uint64_t completed = command_processor_.GetCompletedSubmission();
+  while (!pending_depth_source_readbacks_.empty() &&
+         pending_depth_source_readbacks_.front().submission <= completed) {
+    const auto& p = pending_depth_source_readbacks_.front();
+    D3D12_RANGE range{0, SIZE_T(p.bytes)};
+    void* data = nullptr;
+    size_t written = 0;
+    uint32_t hash = 2166136261u;
+    if (SUCCEEDED(p.readback->Map(0, &range, &data))) {
+      if (p.camera_frame) {
+        const auto* bytes = static_cast<const uint8_t*>(data);
+        for (uint64_t i = 0; i < p.bytes; ++i) hash = (hash ^ bytes[i]) * 16777619u;
+      }
+      if (FILE* file = std::fopen(p.path.c_str(), "wb")) {
+        written = std::fwrite(data, 1, size_t(p.bytes), file);
+        if (std::fclose(file) != 0) written = 0;
+      }
+      D3D12_RANGE no_write{0, 0}; p.readback->Unmap(0, &no_write);
+    }
+    std::fprintf(stderr,
+        "%s result=%u ordinal=%u bytes=%llu written=%llu "
+        "submission=%llu completed=%llu path=%s camera_frame=%llu camera_draw=%llu hash=%08X\n",
+        p.camera_frame ? "REX_CAMERA_DEPTH_CLEAR_COMPLETE" :
+            (p.samples ? "REX_EMBEDDED_DEPTH_SOURCE_COMPLETE" : "REX_EMBEDDED_DEPTH_EDRAM_COMPLETE"),
+        written == p.bytes ? 1u : 0u,
+        p.ordinal, static_cast<unsigned long long>(p.bytes), static_cast<unsigned long long>(written),
+        static_cast<unsigned long long>(p.submission), static_cast<unsigned long long>(completed), p.path.c_str(),
+        static_cast<unsigned long long>(p.camera_frame), static_cast<unsigned long long>(p.camera_draw), hash);
+    pending_depth_source_readbacks_.pop_front();
+  }
+}
+
+void D3D12RenderTargetCache::CaptureSceneAliasTransfers(
+    RenderTarget* const* targets, const std::vector<Transfer>* transfers, bool after) {
+  if (!scene_update_capture_ || !REXCVAR_GET(embedded_camera_scene_alias_capture)) return;
+  const auto& context = *scene_update_capture_;
+  using Policy = embedded_scene_alias_capture_policy::Budget;
+  const auto record = [&](uint32_t ordinal, D3D12RenderTarget* color) {
+    auto& pair = scene_alias_pairs_[ordinal - 1];
+    ++scene_alias_budget_.attempts;
+    const bool queued = QueueSceneAliasReadback(color, ordinal, after);
+    if (queued) ++scene_alias_budget_.queued; else ++scene_alias_budget_.failures;
+    std::fprintf(stderr,
+        "REX_SCENE_ALIAS_EVENT frame=%llu update=%llu next_draw=%llu pair=%u out_update=%llu out_draw=%llu "
+        "stage=%s queued=%u color=%p color_key=%08X alias=%p alias_key=%08X start=%u end=%u "
+        "scope=sample_copy_at_transfer_boundary_not_payload_validity\n",
+        static_cast<unsigned long long>(context.frame), static_cast<unsigned long long>(context.update),
+        static_cast<unsigned long long>(context.next_draw), ordinal,
+        static_cast<unsigned long long>(pair.out_update), static_cast<unsigned long long>(pair.out_draw),
+        after ? "after_restore" : "before_alias", queued ? 1u : 0u,
+        static_cast<void*>(pair.color.Get()), Policy::kColorKey,
+        static_cast<void*>(pair.alias.Get()), Policy::kDepthKey, pair.start, pair.end);
+  };
+  for (uint32_t slot = 0; slot <= xenos::kMaxColorRenderTargets; ++slot) {
+    auto* dest = static_cast<D3D12RenderTarget*>(targets[slot]);
+    if (!dest) continue;
+    for (const auto& transfer : transfers[slot]) {
+      auto* source = static_cast<D3D12RenderTarget*>(transfer.source);
+      if (!source) continue;
+      if (!after && dest->key().key == Policy::kDepthKey && source->key().key == Policy::kColorKey) {
+        const auto desc = source->resource()->GetDesc();
+        const auto alias_desc = dest->resource()->GetDesc();
+        bool pending = false;
+        for (uint32_t i = 0; i < scene_alias_budget_.pairs; ++i)
+          pending |= !scene_alias_pairs_[i].returned;
+        if (pending || GetKeyScaleX(source->key()) != 1 || GetKeyScaleY(source->key()) != 1 ||
+            GetKeyScaleX(dest->key()) != 1 || GetKeyScaleY(dest->key()) != 1 ||
+            desc.Width != 1280 || desc.Height < 384 || desc.SampleDesc.Count != 2 ||
+            alias_desc.Width != 640 || alias_desc.SampleDesc.Count != 4 ||
+            alias_desc.Format != DXGI_FORMAT_R32G8X24_TYPELESS) {
+          ++scene_alias_budget_.dropped;
+          continue;
+        }
+        const uint32_t ordinal = scene_alias_budget_.Reserve(context.frame, transfer.start_tiles, transfer.end_tiles);
+        if (!ordinal) continue;
+        auto& pair = scene_alias_pairs_[ordinal - 1];
+        pair.color = source->resource(); pair.alias = dest->resource();
+        pair.out_update = context.update; pair.out_draw = context.next_draw;
+        pair.start = transfer.start_tiles; pair.end = transfer.end_tiles;
+        record(ordinal, source);
+      } else if (after && dest->key().key == Policy::kColorKey && source->key().key == Policy::kDepthKey) {
+        for (uint32_t i = 0; i < scene_alias_budget_.pairs; ++i) {
+          auto& pair = scene_alias_pairs_[i];
+          if (pair.returned || scene_alias_budget_.frame != context.frame ||
+              context.update <= pair.out_update || context.next_draw <= pair.out_draw ||
+              pair.color.Get() != dest->resource() || pair.alias.Get() != source->resource() ||
+              pair.start != transfer.start_tiles || pair.end != transfer.end_tiles) continue;
+          pair.returned = true;
+          record(i + 1, dest);
+        }
+      }
+    }
+  }
+  if (after) {
+    uint32_t pending = 0;
+    for (uint32_t i = 0; i < scene_alias_budget_.pairs; ++i)
+      pending += scene_alias_pairs_[i].returned ? 0u : 1u;
+    std::fprintf(stderr,
+        "REX_SCENE_ALIAS_UPDATE frame=%llu update=%llu next_draw=%llu pairs=%u attempts=%u queued=%u "
+        "failures=%u dropped=%u pending=%u reserved_bytes=%llu scope=bounded_capture_not_payload_validity\n",
+        static_cast<unsigned long long>(context.frame), static_cast<unsigned long long>(context.update),
+        static_cast<unsigned long long>(context.next_draw), scene_alias_budget_.pairs,
+        scene_alias_budget_.attempts, scene_alias_budget_.queued, scene_alias_budget_.failures,
+        scene_alias_budget_.dropped, pending, static_cast<unsigned long long>(scene_alias_budget_.reserved_bytes));
+  }
+}
+
+bool D3D12RenderTargetCache::QueueSceneAliasReadback(D3D12RenderTarget* target, uint32_t ordinal, bool after) {
+  if (!scene_update_capture_ || !target || !ordinal || ordinal > scene_alias_budget_.pairs ||
+      !command_processor_.IsSubmissionOpen()) return false;
+  const auto& pair = scene_alias_pairs_[ordinal - 1];
+  const auto& context = *scene_update_capture_;
+  PendingSceneAliasReadback pending;
+  auto* device = command_processor_.GetD3D12Provider().GetDevice();
+  if (!pending.copy.Create(device, target->resource(), 0, (pair.start - 768) / 16 * 8,
+      1280, (pair.end - pair.start) / 16 * 8,
+      embedded_scene_alias_capture_policy::Budget::CopyBytes(pair.start, pair.end),
+      {diagnostic_color_samples_single, sizeof(diagnostic_color_samples_single)},
+      {diagnostic_color_samples_msaa, sizeof(diagnostic_color_samples_msaa)})) return false;
+  ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor;
+  if (!command_processor_.RequestOneUseSingleViewDescriptors(1, &descriptor)) return false;
+  pending.copy.WriteSRV(device, descriptor.first);
+  pending.frame = context.frame; pending.update = context.update; pending.draw = context.next_draw;
+  pending.pair = ordinal; pending.after = after;
+  pending.path = "rex_scene_alias_frame_" + std::to_string(context.frame) + "_pair_" +
+      std::to_string(ordinal) + (after ? "_after_restore.bin" : "_before_alias.bin");
+  pending.submission = command_processor_.GetCurrentSubmission();
+  command_processor_.SubmitBarriers();
+  // Invalidate the cached guest pipeline. This runs before guest binding, and
+  // never changes a graphics root signature, viewport, scissor or attachment.
+  command_processor_.SetExternalPipeline(pending.copy.pipeline.Get());
+  pending.copy.Enqueue(command_processor_.GetDeferredCommandList(), target->resource_state(), descriptor.second);
+  std::fprintf(stderr,
+      "REX_SCENE_ALIAS_QUEUED frame=%llu update=%llu next_draw=%llu pair=%u stage=%s color=%p "
+      "rect=%u,%u,%u,%u host_width=%llu host_height=%u format=%u samples=%u bytes=%llu submission=%llu path=%s\n",
+      static_cast<unsigned long long>(pending.frame), static_cast<unsigned long long>(pending.update),
+      static_cast<unsigned long long>(pending.draw), ordinal, after ? "after_restore" : "before_alias",
+      static_cast<void*>(target->resource()), pending.copy.left, pending.copy.top,
+      pending.copy.width, pending.copy.height, static_cast<unsigned long long>(pending.copy.source_desc.Width),
+      pending.copy.source_desc.Height, uint32_t(pending.copy.source_desc.Format), pending.copy.samples,
+      static_cast<unsigned long long>(pending.copy.bytes), static_cast<unsigned long long>(pending.submission),
+      pending.path.c_str());
+  pending_scene_alias_readbacks_.push_back(std::move(pending));
+  return true;
+}
+
+void D3D12RenderTargetCache::CompleteSceneAliasReadbacks() {
+  const uint64_t completed = command_processor_.GetCompletedSubmission();
+  while (!pending_scene_alias_readbacks_.empty() && pending_scene_alias_readbacks_.front().submission <= completed) {
+    const auto& pending = pending_scene_alias_readbacks_.front();
+    D3D12_RANGE range{0, SIZE_T(pending.copy.bytes)};
+    void* data = nullptr;
+    size_t written = 0;
+    uint32_t hash = 2166136261u;
+    if (SUCCEEDED(pending.copy.readback->Map(0, &range, &data))) {
+      const auto* bytes = static_cast<const uint8_t*>(data);
+      for (uint64_t i = 0; i < pending.copy.bytes; ++i) hash = (hash ^ bytes[i]) * 16777619u;
+      if (FILE* file = std::fopen(pending.path.c_str(), "wb")) {
+        written = std::fwrite(data, 1, size_t(pending.copy.bytes), file);
+        if (std::fclose(file) != 0) written = 0;
+      }
+      D3D12_RANGE no_write{0, 0}; pending.copy.readback->Unmap(0, &no_write);
+    }
+    std::fprintf(stderr,
+        "REX_SCENE_ALIAS_COMPLETE frame=%llu update=%llu next_draw=%llu pair=%u stage=%s result=%u "
+        "bytes=%llu written=%llu submission=%llu completed=%llu hash=%08X path=%s\n",
+        static_cast<unsigned long long>(pending.frame), static_cast<unsigned long long>(pending.update),
+        static_cast<unsigned long long>(pending.draw), pending.pair, pending.after ? "after_restore" : "before_alias",
+        written == pending.copy.bytes ? 1u : 0u, static_cast<unsigned long long>(pending.copy.bytes),
+        static_cast<unsigned long long>(written), static_cast<unsigned long long>(pending.submission),
+        static_cast<unsigned long long>(completed), hash, pending.path.c_str());
+    std::fflush(stderr);
+    pending_scene_alias_readbacks_.pop_front();
+  }
+}
+
+void D3D12RenderTargetCache::CompleteColorTargetReadbacks() {
+  CompleteSceneAliasReadbacks();
+  CompleteDepthSourceReadbacks();
+  const uint64_t completed = command_processor_.GetCompletedSubmission();
+  while (!pending_color_target_readbacks_.empty() &&
+         pending_color_target_readbacks_.front().submission <= completed) {
+    const auto& pending = pending_color_target_readbacks_.front();
+    const auto& copy = pending.copy;
+    D3D12_RANGE range = {0, SIZE_T(copy.buffer_bytes)};
+    void* mapping = nullptr;
+    size_t written = 0;
+    uint32_t hash = 2166136261u;
+    const bool mapped = SUCCEEDED(copy.buffer->Map(0, &range, &mapping));
+    if (mapped) {
+      FILE* file = std::fopen(pending.path.c_str(), "wb");
+      for (UINT row = 0; row < copy.rows; ++row) {
+        const uint8_t* data = static_cast<const uint8_t*>(mapping) +
+            copy.footprint.Offset + size_t(row) * copy.footprint.Footprint.RowPitch;
+        for (UINT64 i = 0; i < copy.row_bytes; ++i) hash = (hash ^ data[i]) * 16777619u;
+        if (file) written += std::fwrite(data, 1, size_t(copy.row_bytes), file);
+      }
+      if (file && std::fclose(file) != 0) written = 0;
+      D3D12_RANGE no_write = {0, 0};
+      copy.buffer->Unmap(0, &no_write);
+    }
+    std::fprintf(stderr,
+        "REX_EMBEDDED_RTV_CAPTURE label=%s dump=%s dumped=%llu logical_bytes=%llu "
+        "deferred=1 submission=%llu completed=%llu\n",
+        pending.label.c_str(), pending.path.c_str(),
+        static_cast<unsigned long long>(written),
+        static_cast<unsigned long long>(copy.row_bytes * copy.rows),
+        static_cast<unsigned long long>(pending.submission),
+        static_cast<unsigned long long>(completed));
+    std::fprintf(stderr,
+        "REX_EMBEDDED_PROMPT_RTV_READBACK result=%s resource=%p "
+        "size=%llux%u format=%u source_samples=%u row_pitch=%u "
+        "row_bytes=%llu rows=%u bytes=%llu fnv1a=0x%08X\n",
+        mapped && written == copy.row_bytes * copy.rows ? "ok" : "failed",
+        static_cast<void*>(copy.source.Get()),
+        static_cast<unsigned long long>(copy.source_desc.Width), copy.source_desc.Height,
+        uint32_t(copy.source_desc.Format), copy.source_desc.SampleDesc.Count,
+        copy.footprint.Footprint.RowPitch, static_cast<unsigned long long>(copy.row_bytes),
+        copy.rows, static_cast<unsigned long long>(copy.buffer_bytes), hash);
+    std::fflush(stderr);
+    pending_color_target_readbacks_.pop_front();
+  }
+}
+
+bool D3D12RenderTargetCache::CaptureEmbeddedSceneDepthTarget(
+    const char* diagnostic_label, const char* dump_path) {
+  if (path_ != Path::kHostRenderTargets) {
+    std::fprintf(stderr,
+                 "REX_EMBEDDED_SCENE_DEPTH_READBACK result=skipped path=rov\n");
+    std::fflush(stderr);
+    return false;
+  }
+
+  RenderTarget* const* accumulated = last_update_accumulated_render_targets();
+  auto* render_target = static_cast<D3D12RenderTarget*>(accumulated[0]);
+  if (!render_target) {
+    std::fprintf(stderr,
+                 "REX_EMBEDDED_SCENE_DEPTH_READBACK result=missing_depth\n");
+    std::fflush(stderr);
+    return false;
+  }
+  const RenderTargetKey key = render_target->key();
+  const uint32_t scale_x = GetKeyScaleX(key);
+  const uint32_t scale_y = GetKeyScaleY(key);
+  if (!key.is_depth || key.base_tiles != 0 ||
+      key.pitch_tiles_at_32bpp != 16 ||
+      key.msaa_samples != xenos::MsaaSamples::k2X ||
+      key.GetDepthFormat() != xenos::DepthRenderTargetFormat::kD24FS8 ||
+      scale_x > 2 || scale_y > 2) {
+    std::fprintf(
+        stderr,
+        "REX_EMBEDDED_SCENE_DEPTH_READBACK result=unexpected_target "
+        "key=0x%08X scale=%ux%u\n",
+        key.key, scale_x, scale_y);
+    std::fflush(stderr);
+    return false;
+  }
+
+  // The dynamically observed ownership span is 0..768 tiles, represented as
+  // 48 rows at the target's 16-tile pitch (1280x384 guest samples). Dumping the
+  // host DSV through the ordinary packed-EDRAM shader preserves both float24
+  // depth and stencil in the canonical scaled sample layout.
+  constexpr uint32_t kDumpPitchTiles = 16;
+  constexpr uint32_t kDumpRows = 48;
+  constexpr uint32_t kDumpTileCount = kDumpPitchTiles * kDumpRows;
+  if (!DumpRenderTargets(0, kDumpPitchTiles, kDumpRows,
+                         kDumpPitchTiles)) {
+    std::fprintf(stderr,
+                 "REX_EMBEDDED_SCENE_DEPTH_READBACK result=dump_failed\n");
+    std::fflush(stderr);
+    return false;
+  }
+
+  const auto restore_render_targets = [&]() {
+    are_current_command_list_render_targets_valid_ = false;
+    SetCommandListRenderTargets(last_update_accumulated_render_targets());
+  };
+  constexpr uint64_t kBytesPerNativeTile =
+      xenos::kEdramSizeBytes / xenos::kEdramTileCount;
+  const uint64_t readback_size =
+      uint64_t(kDumpTileCount) * kBytesPerNativeTile * scale_x * scale_y;
+  D3D12_RESOURCE_DESC readback_desc;
+  ui::d3d12::util::FillBufferResourceDesc(
+      readback_desc, readback_size, D3D12_RESOURCE_FLAG_NONE);
+  const ui::d3d12::D3D12Provider& provider =
+      command_processor_.GetD3D12Provider();
+  Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+  if (FAILED(provider.GetDevice()->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback,
+          provider.GetHeapFlagCreateNotZeroed(), &readback_desc,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+          IID_PPV_ARGS(&readback)))) {
+    restore_render_targets();
+    std::fprintf(
+        stderr,
+        "REX_EMBEDDED_SCENE_DEPTH_READBACK result=create_failed bytes=%llu\n",
+        static_cast<unsigned long long>(readback_size));
+    std::fflush(stderr);
+    return false;
+  }
+
+  TransitionEdramBuffer(D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.SubmitBarriers();
+  command_processor_.GetDeferredCommandList().D3DCopyBufferRegion(
+      readback.Get(), 0, edram_buffer_, 0, readback_size);
+  if (!command_processor_.AwaitAllQueueOperationsCompletion()) {
+    restore_render_targets();
+    std::fprintf(stderr,
+                 "REX_EMBEDDED_SCENE_DEPTH_READBACK result=await_failed\n");
+    std::fflush(stderr);
+    return false;
+  }
+
+  D3D12_RANGE read_range = {0, SIZE_T(readback_size)};
+  void* mapping = nullptr;
+  if (FAILED(readback->Map(0, &read_range, &mapping))) {
+    restore_render_targets();
+    std::fprintf(stderr,
+                 "REX_EMBEDDED_SCENE_DEPTH_READBACK result=map_failed\n");
+    std::fflush(stderr);
+    return false;
+  }
+
+  const uint32_t* samples = static_cast<const uint32_t*>(mapping);
+  FILE* dump_file = dump_path ? std::fopen(dump_path, "wb") : nullptr;
+  const size_t dumped_bytes = dump_file
+                                  ? std::fwrite(mapping, 1, size_t(readback_size),
+                                                dump_file)
+                                  : 0;
+  if (dump_file) {
+    std::fclose(dump_file);
+  }
+
+  const uint32_t tile_width = xenos::kEdramTileWidthSamples * scale_x;
+  const uint32_t tile_height = xenos::kEdramTileHeightSamples * scale_y;
+  const uint32_t tile_samples = tile_width * tile_height;
+  uint64_t group_count = 0;
+  uint64_t exact_group_count = 0;
+  uint64_t mismatch_group_count = 0;
+  uint64_t parity_stencil_nonzero[4] = {};
+  uint64_t parity_stencil_80[4] = {};
+  uint64_t parity_stencil_histogram[4][256] = {};
+  uint64_t parity_depth_nonzero[4] = {};
+  uint64_t parity_depth_nonzero_stencil_7f[4] = {};
+  uint64_t parity_depth_nonzero_stencil_80[4] = {};
+  uint32_t parity_hash[4] = {2166136261u, 2166136261u, 2166136261u,
+                             2166136261u};
+  uint32_t parity_depth_hash[4] = {2166136261u, 2166136261u,
+                                   2166136261u, 2166136261u};
+  for (uint32_t tile = 0; tile < kDumpTileCount; ++tile) {
+    const uint32_t tile_base = tile * tile_samples;
+    for (uint32_t guest_y = 0;
+         guest_y < xenos::kEdramTileHeightSamples; ++guest_y) {
+      for (uint32_t guest_x = 0;
+           guest_x < xenos::kEdramTileWidthSamples; ++guest_x) {
+        uint32_t first_value = 0;
+        bool exact = true;
+        for (uint32_t parity_y = 0; parity_y < scale_y; ++parity_y) {
+          for (uint32_t parity_x = 0; parity_x < scale_x; ++parity_x) {
+            const uint32_t parity = parity_y * scale_x + parity_x;
+            const uint32_t scaled_x = guest_x * scale_x + parity_x;
+            const uint32_t scaled_y = guest_y * scale_y + parity_y;
+            const int32_t depth_half_swap =
+                scaled_x >= tile_width / 2 ? -int32_t(tile_width / 2)
+                                           : int32_t(tile_width / 2);
+            const uint32_t sample_index =
+                tile_base + scaled_y * tile_width + scaled_x +
+                depth_half_swap;
+            const uint32_t value = samples[sample_index];
+            if (!parity) {
+              first_value = value;
+            } else if (value != first_value) {
+              exact = false;
+            }
+            const uint32_t stencil = value & 0xFF;
+            parity_stencil_nonzero[parity] += stencil != 0;
+            parity_stencil_80[parity] += stencil == 0x80;
+            ++parity_stencil_histogram[parity][stencil];
+            const uint32_t depth = value >> 8;
+            const bool depth_nonzero = depth != 0;
+            parity_depth_nonzero[parity] += depth_nonzero;
+            parity_depth_nonzero_stencil_7f[parity] +=
+                depth_nonzero && stencil == 0x7F;
+            parity_depth_nonzero_stencil_80[parity] +=
+                depth_nonzero && stencil == 0x80;
+            for (uint32_t byte_index = 0; byte_index < 4; ++byte_index) {
+              parity_hash[parity] =
+                  (parity_hash[parity] ^
+                   uint8_t(value >> (byte_index * 8))) *
+                  16777619u;
+            }
+            // Hash only the 24 stored depth bits. This distinguishes a real
+            // depth mutation from the expected stencil-only changes between
+            // the prepass/control and shaded draws.
+            for (uint32_t byte_index = 0; byte_index < 3; ++byte_index) {
+              parity_depth_hash[parity] =
+                  (parity_depth_hash[parity] ^
+                   uint8_t(depth >> (byte_index * 8))) *
+                  16777619u;
+            }
+          }
+        }
+        ++group_count;
+        if (exact) {
+          ++exact_group_count;
+        } else {
+          ++mismatch_group_count;
+        }
+      }
+    }
+  }
+
+  D3D12_RANGE write_range = {0, 0};
+  readback->Unmap(0, &write_range);
+  restore_render_targets();
+  std::fprintf(
+      stderr,
+      "REX_EMBEDDED_SCENE_DEPTH_READBACK result=ok label=%s dump=%s "
+      "bytes=%llu dumped=%llu key=0x%08X scale=%ux%u groups=%llu "
+      "exact=%llu mismatch=%llu hash=%08X,%08X,%08X,%08X "
+      "depth_hash=%08X,%08X,%08X,%08X "
+      "stencil_nonzero=%llu,%llu,%llu,%llu "
+      "stencil_80=%llu,%llu,%llu,%llu "
+      "stencil_7B=%llu,%llu,%llu,%llu "
+      "stencil_7C=%llu,%llu,%llu,%llu "
+      "stencil_7D=%llu,%llu,%llu,%llu "
+      "stencil_7E=%llu,%llu,%llu,%llu "
+      "stencil_7F=%llu,%llu,%llu,%llu "
+      "stencil_81=%llu,%llu,%llu,%llu "
+      "depth_nonzero=%llu,%llu,%llu,%llu "
+      "depth_nonzero_stencil_7F=%llu,%llu,%llu,%llu "
+      "depth_nonzero_stencil_80=%llu,%llu,%llu,%llu\n",
+      diagnostic_label ? diagnostic_label : "unnamed",
+      dump_path ? dump_path : "disabled",
+      static_cast<unsigned long long>(readback_size),
+      static_cast<unsigned long long>(dumped_bytes), key.key, scale_x, scale_y,
+      static_cast<unsigned long long>(group_count),
+      static_cast<unsigned long long>(exact_group_count),
+      static_cast<unsigned long long>(mismatch_group_count), parity_hash[0],
+      parity_hash[1], parity_hash[2], parity_hash[3],
+      parity_depth_hash[0], parity_depth_hash[1], parity_depth_hash[2],
+      parity_depth_hash[3],
+      static_cast<unsigned long long>(parity_stencil_nonzero[0]),
+      static_cast<unsigned long long>(parity_stencil_nonzero[1]),
+      static_cast<unsigned long long>(parity_stencil_nonzero[2]),
+      static_cast<unsigned long long>(parity_stencil_nonzero[3]),
+      static_cast<unsigned long long>(parity_stencil_80[0]),
+      static_cast<unsigned long long>(parity_stencil_80[1]),
+      static_cast<unsigned long long>(parity_stencil_80[2]),
+      static_cast<unsigned long long>(parity_stencil_80[3]),
+      static_cast<unsigned long long>(parity_stencil_histogram[0][0x7B]),
+      static_cast<unsigned long long>(parity_stencil_histogram[1][0x7B]),
+      static_cast<unsigned long long>(parity_stencil_histogram[2][0x7B]),
+      static_cast<unsigned long long>(parity_stencil_histogram[3][0x7B]),
+      static_cast<unsigned long long>(parity_stencil_histogram[0][0x7C]),
+      static_cast<unsigned long long>(parity_stencil_histogram[1][0x7C]),
+      static_cast<unsigned long long>(parity_stencil_histogram[2][0x7C]),
+      static_cast<unsigned long long>(parity_stencil_histogram[3][0x7C]),
+      static_cast<unsigned long long>(parity_stencil_histogram[0][0x7D]),
+      static_cast<unsigned long long>(parity_stencil_histogram[1][0x7D]),
+      static_cast<unsigned long long>(parity_stencil_histogram[2][0x7D]),
+      static_cast<unsigned long long>(parity_stencil_histogram[3][0x7D]),
+      static_cast<unsigned long long>(parity_stencil_histogram[0][0x7E]),
+      static_cast<unsigned long long>(parity_stencil_histogram[1][0x7E]),
+      static_cast<unsigned long long>(parity_stencil_histogram[2][0x7E]),
+      static_cast<unsigned long long>(parity_stencil_histogram[3][0x7E]),
+      static_cast<unsigned long long>(parity_stencil_histogram[0][0x7F]),
+      static_cast<unsigned long long>(parity_stencil_histogram[1][0x7F]),
+      static_cast<unsigned long long>(parity_stencil_histogram[2][0x7F]),
+      static_cast<unsigned long long>(parity_stencil_histogram[3][0x7F]),
+      static_cast<unsigned long long>(parity_stencil_histogram[0][0x81]),
+      static_cast<unsigned long long>(parity_stencil_histogram[1][0x81]),
+      static_cast<unsigned long long>(parity_stencil_histogram[2][0x81]),
+      static_cast<unsigned long long>(parity_stencil_histogram[3][0x81]),
+      static_cast<unsigned long long>(parity_depth_nonzero[0]),
+      static_cast<unsigned long long>(parity_depth_nonzero[1]),
+      static_cast<unsigned long long>(parity_depth_nonzero[2]),
+      static_cast<unsigned long long>(parity_depth_nonzero[3]),
+      static_cast<unsigned long long>(parity_depth_nonzero_stencil_7f[0]),
+      static_cast<unsigned long long>(parity_depth_nonzero_stencil_7f[1]),
+      static_cast<unsigned long long>(parity_depth_nonzero_stencil_7f[2]),
+      static_cast<unsigned long long>(parity_depth_nonzero_stencil_7f[3]),
+      static_cast<unsigned long long>(parity_depth_nonzero_stencil_80[0]),
+      static_cast<unsigned long long>(parity_depth_nonzero_stencil_80[1]),
+      static_cast<unsigned long long>(parity_depth_nonzero_stencil_80[2]),
+      static_cast<unsigned long long>(parity_depth_nonzero_stencil_80[3]));
+  std::fflush(stderr);
+  return true;
+}
+
+bool D3D12RenderTargetCache::CaptureEmbeddedColorTarget(
+    D3D12RenderTarget* render_target, const char* diagnostic_label,
+    const char* dump_path,
+    EmbeddedColorTargetDiagnosticSummary* summary_out) {
+  assert_not_null(render_target);
+
+  ID3D12Resource* resource = render_target->resource();
+  const D3D12_RESOURCE_DESC resource_desc = resource->GetDesc();
+  if (resource_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+    std::fprintf(stderr,
+                 "REX_EMBEDDED_PROMPT_RTV_READBACK result=unsupported dimension=%u\n",
+                 uint32_t(resource_desc.Dimension));
+    std::fflush(stderr);
+    return false;
+  }
+
+  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  D3D12_RESOURCE_DESC copy_resource_desc = resource_desc;
+  Microsoft::WRL::ComPtr<ID3D12Resource> resolved_resource;
+  ID3D12Resource* copy_resource = resource;
+  if (resource_desc.SampleDesc.Count > 1) {
+    copy_resource_desc.Alignment = 0;
+    copy_resource_desc.SampleDesc.Count = 1;
+    copy_resource_desc.SampleDesc.Quality = 0;
+    copy_resource_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    const HRESULT create_resolve_target_result = device->CreateCommittedResource(
+        &ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE,
+        &copy_resource_desc, D3D12_RESOURCE_STATE_RESOLVE_DEST, nullptr,
+        IID_PPV_ARGS(&resolved_resource));
+    if (FAILED(create_resolve_target_result)) {
+      std::fprintf(stderr,
+                   "REX_EMBEDDED_PROMPT_RTV_READBACK result=resolve_target_failed "
+                   "hr=0x%08X size=%llux%u format=%u samples=%u flags=0x%X\n",
+                   uint32_t(create_resolve_target_result),
+                   static_cast<unsigned long long>(copy_resource_desc.Width),
+                   copy_resource_desc.Height, uint32_t(copy_resource_desc.Format),
+                   resource_desc.SampleDesc.Count, uint32_t(copy_resource_desc.Flags));
+      std::fflush(stderr);
+      return false;
+    }
+    copy_resource = resolved_resource.Get();
+  }
+
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+  UINT footprint_rows = 0;
+  UINT64 footprint_row_size = 0;
+  UINT64 readback_size = 0;
+  device->GetCopyableFootprints(&copy_resource_desc, 0, 1, 0, &footprint,
+                                &footprint_rows, &footprint_row_size,
+                                &readback_size);
+
+  D3D12_RESOURCE_DESC readback_desc;
+  ui::d3d12::util::FillBufferResourceDesc(readback_desc, readback_size,
+                                          D3D12_RESOURCE_FLAG_NONE);
+  Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback,
+          provider.GetHeapFlagCreateNotZeroed(), &readback_desc,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+          IID_PPV_ARGS(&readback)))) {
+    std::fprintf(stderr,
+                 "REX_EMBEDDED_PROMPT_RTV_READBACK result=create_failed bytes=%llu\n",
+                 static_cast<unsigned long long>(readback_size));
+    std::fflush(stderr);
+    return false;
+  }
+
+  const D3D12_RESOURCE_STATES old_state = render_target->SetResourceState(
+      resource_desc.SampleDesc.Count > 1 ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE
+                                         : D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.PushTransitionBarrier(
+      resource, old_state,
+      resource_desc.SampleDesc.Count > 1 ? D3D12_RESOURCE_STATE_RESOLVE_SOURCE
+                                         : D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.SubmitBarriers();
+  if (resource_desc.SampleDesc.Count > 1) {
+    command_processor_.GetDeferredCommandList().D3DResolveSubresource(
+        resolved_resource.Get(), 0, resource, 0, resource_desc.Format);
+    command_processor_.PushTransitionBarrier(
+        resolved_resource.Get(), D3D12_RESOURCE_STATE_RESOLVE_DEST,
+        D3D12_RESOURCE_STATE_COPY_SOURCE);
+    command_processor_.PushTransitionBarrier(
+        resource, render_target->SetResourceState(old_state), old_state);
+    command_processor_.SubmitBarriers();
+  }
+  D3D12_TEXTURE_COPY_LOCATION source_location = {};
+  source_location.pResource = copy_resource;
+  source_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  source_location.SubresourceIndex = 0;
+  D3D12_TEXTURE_COPY_LOCATION dest_location = {};
+  dest_location.pResource = readback.Get();
+  dest_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  dest_location.PlacedFootprint = footprint;
+  command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(
+      &dest_location, 0, 0, 0, &source_location, nullptr);
+  if (resource_desc.SampleDesc.Count == 1) {
+    command_processor_.PushTransitionBarrier(
+        resource, render_target->SetResourceState(old_state), old_state);
+    command_processor_.SubmitBarriers();
+  }
+  if (!command_processor_.AwaitAllQueueOperationsCompletion()) {
+    std::fprintf(stderr,
+                 "REX_EMBEDDED_PROMPT_RTV_READBACK result=await_failed\n");
+    std::fflush(stderr);
+    return false;
+  }
+
+  D3D12_RANGE read_range = {0, SIZE_T(readback_size)};
+  void* mapping = nullptr;
+  if (FAILED(readback->Map(0, &read_range, &mapping))) {
+    std::fprintf(stderr,
+                 "REX_EMBEDDED_PROMPT_RTV_READBACK result=map_failed\n");
+    std::fflush(stderr);
+    return false;
+  }
+
+  const uint8_t* bytes = static_cast<const uint8_t*>(mapping) + footprint.Offset;
+  uint32_t hash = 2166136261u;
+  const size_t logical_row_bytes = size_t(footprint_row_size);
+  FILE* dump_file = dump_path ? std::fopen(dump_path, "wb") : nullptr;
+  size_t dumped_bytes = 0;
+  for (UINT row = 0; row < footprint_rows; ++row) {
+    const uint8_t* row_bytes = bytes + size_t(row) * footprint.Footprint.RowPitch;
+    for (size_t i = 0; i < logical_row_bytes; ++i) {
+      hash = (hash ^ row_bytes[i]) * 16777619u;
+    }
+    if (dump_file) {
+      dumped_bytes += std::fwrite(row_bytes, 1, logical_row_bytes, dump_file);
+    }
+  }
+  if (dump_file) {
+    std::fclose(dump_file);
+  }
+
+  uint64_t nonzero_pixels = 0;
+  uint64_t nonzero_rgb_pixels = 0;
+  uint64_t nonzero_alpha_pixels = 0;
+  uint64_t beige_like_pixels = 0;
+  uint32_t nonzero_min_x = uint32_t(copy_resource_desc.Width);
+  uint32_t nonzero_min_y = copy_resource_desc.Height;
+  uint32_t nonzero_max_x = 0;
+  uint32_t nonzero_max_y = 0;
+  float component_min[4] = {1.0e30f, 1.0e30f, 1.0e30f, 1.0e30f};
+  float component_max[4] = {-1.0e30f, -1.0e30f, -1.0e30f, -1.0e30f};
+  uint32_t first_nonzero_logged = 0;
+  // Eight distinct raw FP16 pixel values are sufficient to reject the common
+  // zero-plus-clear initialization surfaces without retaining a large set or
+  // introducing an unbounded diagnostic allocation.
+  std::array<uint64_t, 8> unique_pixel_values = {};
+  uint32_t unique_pixel_value_count = 0;
+  for (uint32_t y = 0; y < copy_resource_desc.Height; ++y) {
+    const uint8_t* row_bytes = bytes + size_t(y) * footprint.Footprint.RowPitch;
+    for (uint32_t x = 0; x < copy_resource_desc.Width; ++x) {
+      const uint16_t* pixel =
+          reinterpret_cast<const uint16_t*>(row_bytes + size_t(x) * 8);
+      uint64_t raw_pixel = 0;
+      std::memcpy(&raw_pixel, pixel, sizeof(raw_pixel));
+      bool raw_pixel_seen = false;
+      for (uint32_t unique_index = 0;
+           unique_index < unique_pixel_value_count; ++unique_index) {
+        if (unique_pixel_values[unique_index] == raw_pixel) {
+          raw_pixel_seen = true;
+          break;
+        }
+      }
+      if (!raw_pixel_seen &&
+          unique_pixel_value_count < unique_pixel_values.size()) {
+        unique_pixel_values[unique_pixel_value_count++] = raw_pixel;
+      }
+      const bool rgb_nonzero = pixel[0] || pixel[1] || pixel[2];
+      const bool alpha_nonzero = pixel[3] != 0;
+      if (rgb_nonzero) {
+        ++nonzero_rgb_pixels;
+      }
+      if (alpha_nonzero) {
+        ++nonzero_alpha_pixels;
+      }
+      if (!rgb_nonzero && !alpha_nonzero) {
+        continue;
+      }
+      ++nonzero_pixels;
+      nonzero_min_x = std::min(nonzero_min_x, x);
+      nonzero_min_y = std::min(nonzero_min_y, y);
+      nonzero_max_x = std::max(nonzero_max_x, x);
+      nonzero_max_y = std::max(nonzero_max_y, y);
+      float values[4];
+      for (uint32_t component = 0; component < 4; ++component) {
+        values[component] = rex::xenos_half_to_float(pixel[component]);
+        component_min[component] =
+            std::min(component_min[component], values[component]);
+        component_max[component] =
+            std::max(component_max[component], values[component]);
+      }
+      if (values[0] > 0.8f && values[1] > 0.8f && values[2] > 0.7f) {
+        ++beige_like_pixels;
+      }
+      if (first_nonzero_logged < 8) {
+        std::fprintf(stderr,
+                     "REX_EMBEDDED_PROMPT_RTV_NONZERO ordinal=%u xy=%u,%u "
+                     "raw=%04X,%04X,%04X,%04X value=%.9g,%.9g,%.9g,%.9g\n",
+                     first_nonzero_logged, x, y, pixel[0], pixel[1], pixel[2],
+                     pixel[3], values[0], values[1], values[2], values[3]);
+        ++first_nonzero_logged;
+      }
+    }
+  }
+
+  const auto log_pixel = [&](const char* name, uint32_t x, uint32_t y) {
+    x = std::min(x, uint32_t(copy_resource_desc.Width - 1));
+    y = std::min(y, uint32_t(copy_resource_desc.Height - 1));
+    const uint16_t* pixel = reinterpret_cast<const uint16_t*>(
+        bytes + size_t(y) * footprint.Footprint.RowPitch + size_t(x) * 8);
+    std::fprintf(stderr,
+                 "REX_EMBEDDED_PROMPT_RTV_PIXEL name=%s xy=%u,%u "
+                 "raw=%04X,%04X,%04X,%04X value=%.9g,%.9g,%.9g,%.9g\n",
+                 name, x, y, pixel[0], pixel[1], pixel[2], pixel[3],
+                 rex::xenos_half_to_float(pixel[0]),
+                 rex::xenos_half_to_float(pixel[1]),
+                 rex::xenos_half_to_float(pixel[2]),
+                 rex::xenos_half_to_float(pixel[3]));
+  };
+  std::fprintf(stderr,
+               "REX_EMBEDDED_RTV_CAPTURE label=%s dump=%s dumped=%llu "
+               "logical_bytes=%llu\n",
+               diagnostic_label ? diagnostic_label : "unnamed",
+               dump_path ? dump_path : "disabled",
+               static_cast<unsigned long long>(dumped_bytes),
+               static_cast<unsigned long long>(logical_row_bytes) *
+                   footprint_rows);
+  std::fprintf(stderr,
+               "REX_EMBEDDED_PROMPT_RTV_READBACK result=ok resource=%p "
+               "size=%llux%u format=%u source_samples=%u row_pitch=%u "
+               "row_bytes=%llu rows=%u bytes=%llu fnv1a=0x%08X\n",
+               static_cast<void*>(resource),
+               static_cast<unsigned long long>(copy_resource_desc.Width),
+               copy_resource_desc.Height, uint32_t(copy_resource_desc.Format),
+               resource_desc.SampleDesc.Count,
+               footprint.Footprint.RowPitch,
+               static_cast<unsigned long long>(footprint_row_size), footprint_rows,
+               static_cast<unsigned long long>(readback_size), hash);
+  std::fprintf(
+      stderr,
+      "REX_EMBEDDED_PROMPT_RTV_SUMMARY pixels=%llu nonzero=%llu rgb=%llu alpha=%llu "
+      "beige_like=%llu bounds=%u,%u-%u,%u min=%.9g,%.9g,%.9g,%.9g "
+      "max=%.9g,%.9g,%.9g,%.9g\n",
+      static_cast<unsigned long long>(copy_resource_desc.Width) *
+          copy_resource_desc.Height,
+      static_cast<unsigned long long>(nonzero_pixels),
+      static_cast<unsigned long long>(nonzero_rgb_pixels),
+      static_cast<unsigned long long>(nonzero_alpha_pixels),
+      static_cast<unsigned long long>(beige_like_pixels), nonzero_min_x,
+      nonzero_min_y, nonzero_max_x, nonzero_max_y, component_min[0],
+      component_min[1], component_min[2], component_min[3], component_max[0],
+      component_max[1], component_max[2], component_max[3]);
+  log_pixel("top_left", 0, 0);
+  log_pixel("quarter", uint32_t(copy_resource_desc.Width / 4),
+            uint32_t(copy_resource_desc.Height / 4));
+  log_pixel("center", uint32_t(copy_resource_desc.Width / 2),
+            uint32_t(copy_resource_desc.Height / 2));
+  log_pixel("prompt_center", uint32_t(copy_resource_desc.Width / 2), 600);
+  std::fflush(stderr);
+
+  D3D12_RANGE write_range = {0, 0};
+  readback->Unmap(0, &write_range);
+  if (summary_out) {
+    summary_out->fnv1a = hash;
+    summary_out->unique_pixel_values_capped = unique_pixel_value_count;
+    summary_out->width = uint32_t(copy_resource_desc.Width);
+    summary_out->height = copy_resource_desc.Height;
+    summary_out->source_samples = resource_desc.SampleDesc.Count;
+  }
+  return !dump_path || dumped_bytes == logical_row_bytes * footprint_rows;
+}
+
+bool D3D12RenderTargetCache::CaptureEmbeddedResolveSource(
+    const draw_util::ResolveInfo& resolve_info, const char* diagnostic_label,
+    const char* dump_path) {
+  if (GetPath() != Path::kHostRenderTargets) {
+    std::fprintf(stderr,
+                 "REX_EMBEDDED_RESOLVE_SOURCE result=skipped label=%s path=rov\n",
+                 diagnostic_label ? diagnostic_label : "unnamed");
+    std::fflush(stderr);
+    return false;
+  }
+
+  uint32_t dump_base;
+  uint32_t dump_row_length_used;
+  uint32_t dump_rows;
+  uint32_t dump_pitch;
+  resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used,
+                                    dump_rows, dump_pitch);
+  std::vector<ResolveCopyDumpRectangle> rectangles;
+  GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows,
+                                 dump_pitch, rectangles);
+  if (rectangles.empty()) {
+    std::fprintf(
+        stderr,
+        "REX_EMBEDDED_RESOLVE_SOURCE result=missing_owner label=%s "
+        "base=%u row_length=%u rows=%u pitch=%u\n",
+        diagnostic_label ? diagnostic_label : "unnamed", dump_base,
+        dump_row_length_used, dump_rows, dump_pitch);
+    std::fflush(stderr);
+    return false;
+  }
+
+  std::vector<D3D12RenderTarget*> unique_render_targets;
+  unique_render_targets.reserve(rectangles.size());
+  for (size_t rectangle_index = 0; rectangle_index < rectangles.size();
+       ++rectangle_index) {
+    const ResolveCopyDumpRectangle& rectangle = rectangles[rectangle_index];
+    auto* render_target =
+        static_cast<D3D12RenderTarget*>(rectangle.render_target);
+    if (!render_target) {
+      continue;
+    }
+    const RenderTargetKey key = render_target->key();
+    std::fprintf(
+        stderr,
+        "REX_EMBEDDED_RESOLVE_SOURCE_RECT label=%s rectangle=%llu "
+        "resource=%p key=0x%08X base=%u pitch32=%u pitch=%u msaa=%u "
+        "depth=%u format=%u scale_native=%u scale=%ux%u "
+        "row_first=%u rows=%u first_start=%u last_end=%u\n",
+        diagnostic_label ? diagnostic_label : "unnamed",
+        static_cast<unsigned long long>(rectangle_index),
+        static_cast<void*>(render_target->resource()), key.key, key.base_tiles,
+        key.pitch_tiles_at_32bpp, key.GetPitchTiles(),
+        uint32_t(key.msaa_samples), key.is_depth, key.resource_format,
+        key.scale_native, GetKeyScaleX(key), GetKeyScaleY(key),
+        rectangle.row_first, rectangle.rows, rectangle.row_first_start,
+        rectangle.row_last_end);
+    if (std::find(unique_render_targets.begin(), unique_render_targets.end(),
+                  render_target) == unique_render_targets.end()) {
+      unique_render_targets.push_back(render_target);
+    }
+  }
+
+  if (unique_render_targets.empty()) {
+    std::fprintf(stderr,
+                 "REX_EMBEDDED_RESOLVE_SOURCE result=missing_resource label=%s\n",
+                 diagnostic_label ? diagnostic_label : "unnamed");
+    std::fflush(stderr);
+    return false;
+  }
+
+  bool all_captured = true;
+  for (size_t target_index = 0; target_index < unique_render_targets.size();
+       ++target_index) {
+    std::string indexed_path;
+    const char* target_dump_path = dump_path;
+    if (dump_path && unique_render_targets.size() > 1) {
+      indexed_path = dump_path;
+      indexed_path += ".source";
+      indexed_path += std::to_string(target_index);
+      target_dump_path = indexed_path.c_str();
+    }
+    const bool captured = CaptureEmbeddedColorTarget(
+        unique_render_targets[target_index], diagnostic_label,
+        target_dump_path);
+    all_captured &= captured;
+    std::fprintf(stderr,
+                 "REX_EMBEDDED_RESOLVE_SOURCE_TARGET result=%u label=%s "
+                 "target=%llu targets=%llu dump=%s\n",
+                 captured ? 1u : 0u,
+                 diagnostic_label ? diagnostic_label : "unnamed",
+                 static_cast<unsigned long long>(target_index),
+                 static_cast<unsigned long long>(unique_render_targets.size()),
+                 target_dump_path ? target_dump_path : "disabled");
+  }
+  std::fflush(stderr);
+  return all_captured;
+}
+
+bool D3D12RenderTargetCache::CaptureEmbeddedEdramBuffer(
+    const draw_util::ResolveInfo& resolve_info, const char* diagnostic_label,
+    const char* dump_path) {
+  if (!dump_path || !edram_buffer_) {
+    return false;
+  }
+
+  const uint64_t readback_size = edram_buffer_->GetDesc().Width;
+  if (!readback_size || readback_size > SIZE_MAX) {
+    std::fprintf(stderr,
+                 "REX_EMBEDDED_RESOLVE_BOUNDARY result=invalid_size "
+                 "stage=edram_after_dump label=%s bytes=%llu\n",
+                 diagnostic_label ? diagnostic_label : "unnamed",
+                 static_cast<unsigned long long>(readback_size));
+    std::fflush(stderr);
+    return false;
+  }
+
+  D3D12_RESOURCE_DESC readback_desc;
+  ui::d3d12::util::FillBufferResourceDesc(
+      readback_desc, readback_size, D3D12_RESOURCE_FLAG_NONE);
+  const ui::d3d12::D3D12Provider& provider =
+      command_processor_.GetD3D12Provider();
+  Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+  if (FAILED(provider.GetDevice()->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback,
+          provider.GetHeapFlagCreateNotZeroed(), &readback_desc,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+          IID_PPV_ARGS(&readback)))) {
+    std::fprintf(stderr,
+                 "REX_EMBEDDED_RESOLVE_BOUNDARY result=create_failed "
+                 "stage=edram_after_dump label=%s bytes=%llu\n",
+                 diagnostic_label ? diagnostic_label : "unnamed",
+                 static_cast<unsigned long long>(readback_size));
+    std::fflush(stderr);
+    return false;
+  }
+
+  const D3D12_RESOURCE_STATES old_state = edram_buffer_state_;
+  TransitionEdramBuffer(D3D12_RESOURCE_STATE_COPY_SOURCE);
+  command_processor_.SubmitBarriers();
+  command_processor_.GetDeferredCommandList().D3DCopyBufferRegion(
+      readback.Get(), 0, edram_buffer_, 0, readback_size);
+  TransitionEdramBuffer(old_state);
+  command_processor_.SubmitBarriers();
+  if (!command_processor_.AwaitAllQueueOperationsCompletion()) {
+    std::fprintf(stderr,
+                 "REX_EMBEDDED_RESOLVE_BOUNDARY result=await_failed "
+                 "stage=edram_after_dump label=%s\n",
+                 diagnostic_label ? diagnostic_label : "unnamed");
+    std::fflush(stderr);
+    return false;
+  }
+
+  D3D12_RANGE read_range = {0, SIZE_T(readback_size)};
+  void* mapping = nullptr;
+  if (FAILED(readback->Map(0, &read_range, &mapping))) {
+    std::fprintf(stderr,
+                 "REX_EMBEDDED_RESOLVE_BOUNDARY result=map_failed "
+                 "stage=edram_after_dump label=%s\n",
+                 diagnostic_label ? diagnostic_label : "unnamed");
+    std::fflush(stderr);
+    return false;
+  }
+
+  const uint8_t* bytes = static_cast<const uint8_t*>(mapping);
+  uint32_t hash = 2166136261u;
+  for (uint64_t i = 0; i < readback_size; ++i) {
+    hash = (hash ^ bytes[i]) * 16777619u;
+  }
+  FILE* dump_file = std::fopen(dump_path, "wb");
+  const size_t dumped_bytes =
+      dump_file ? std::fwrite(mapping, 1, size_t(readback_size), dump_file) : 0;
+  if (dump_file) {
+    std::fclose(dump_file);
+  }
+
+  uint32_t dump_base = 0;
+  uint32_t dump_row_length_used = 0;
+  uint32_t dump_rows = 0;
+  uint32_t dump_pitch = 0;
+  resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows,
+                                    dump_pitch);
+  std::fprintf(
+      stderr,
+      "REX_EMBEDDED_RESOLVE_BOUNDARY result=%s stage=edram_after_dump "
+      "label=%s dump=%s bytes=%llu fnv1a=0x%08X scale=%ux%u "
+      "span_base=%u span_row_length=%u span_rows=%u span_pitch=%u\n",
+      dumped_bytes == size_t(readback_size) ? "ok" : "write_failed",
+      diagnostic_label ? diagnostic_label : "unnamed", dump_path,
+      static_cast<unsigned long long>(readback_size), hash,
+      draw_resolution_scale_x(), draw_resolution_scale_y(), dump_base,
+      dump_row_length_used, dump_rows, dump_pitch);
+  std::fflush(stderr);
+  D3D12_RANGE write_range = {0, 0};
+  readback->Unmap(0, &write_range);
+  return dumped_bytes == size_t(readback_size);
+}
+
 void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
+  pending_scene_alias_readbacks_.clear();
+  scene_alias_pairs_ = {};
+  scene_alias_budget_ = {};
+  pending_color_target_readbacks_.clear();
+  pending_depth_source_readbacks_.clear();
+  camera_depth_readback_budget_ = {};
+  captured_depth_sources_.clear();
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_64bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_32bpp_pipeline_);
   ui::d3d12::util::ReleaseAndNull(resolve_rov_clear_root_signature_);
@@ -1027,6 +2265,10 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
   descriptor_pool_depth_.reset();
   descriptor_pool_color_.reset();
 
+  for (size_t i = 0; i < rex::countof(resolve_copy_native_pipelines_); ++i) {
+    ui::d3d12::util::ReleaseAndNull(resolve_copy_native_pipelines_[i]);
+  }
+  ui::d3d12::util::ReleaseAndNull(resolve_copy_native_root_signature_);
   for (size_t i = 0; i < rex::countof(resolve_copy_pipelines_); ++i) {
     ui::d3d12::util::ReleaseAndNull(resolve_copy_pipelines_[i]);
   }
@@ -1044,6 +2286,7 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
 }
 
 void D3D12RenderTargetCache::CompletedSubmissionUpdated() {
+  CompleteColorTargetReadbacks();
   if (edram_snapshot_restore_pool_) {
     edram_snapshot_restore_pool_->Reclaim(command_processor_.GetCompletedSubmission());
   }
@@ -1065,18 +2308,97 @@ void D3D12RenderTargetCache::BeginSubmission() {
 
 bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
                                     reg::RB_DEPTHCONTROL normalized_depth_control,
-                                    uint32_t normalized_color_mask, const Shader& vertex_shader) {
+                                    uint32_t normalized_color_mask, const Shader& vertex_shader,
+                                    bool native_shader_grid) {
+  // scene_update_capture_ is set only by the measurement-build scene capture.
+  if (kGpuDiagnostics && scene_update_capture_) {
+    // The capture records this draw's complete ownership update.
+    InvalidateUpdateMemo();
+  }
   if (!RenderTargetCache::Update(is_rasterization_done, normalized_depth_control,
-                                 normalized_color_mask, vertex_shader)) {
+                                 normalized_color_mask, vertex_shader, native_shader_grid)) {
     return false;
   }
   switch (GetPath()) {
     case Path::kHostRenderTargets: {
       RenderTarget* const* depth_and_color_render_targets =
           last_update_accumulated_render_targets();
-      PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
-                                       depth_and_color_render_targets, last_update_transfers());
+      if (kGpuDiagnostics && scene_update_capture_) {
+        RecordSceneUpdateTargets(depth_and_color_render_targets, last_update_transfers(),
+                                 *scene_update_capture_);
+      }
+      if (kGpuDiagnostics && scene_update_capture_) {
+        CaptureSceneAliasTransfers(depth_and_color_render_targets, last_update_transfers(), false);
+      }
+      // Update already established ownership. Keep the empty-work check at the
+      // caller so a draw with no transfer also avoids the transfer helper's
+      // register saves and stack setup. Resolve clears use their own call below.
+      bool has_transfer = false;
+      for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+        if (!last_update_transfers()[i].empty()) {
+          has_transfer = true;
+          break;
+        }
+      }
+      if (LastUpdateSkippedDepthTransfers() && command_processor_.GpuTimingTransferLogFrame()) {
+        const RenderTarget* depth_rt = depth_and_color_render_targets[0];
+        std::fprintf(stderr,
+                     "REX_GPU_TRANSFER_SKIPPED frame=%llu dest_key=%08X reason=overwritten_depth "
+                     "ranges=%u\n",
+                     static_cast<unsigned long long>(command_processor_.GetCurrentFrame()),
+                     depth_rt ? depth_rt->key().key : 0u, LastUpdateSkippedDepthTransfers());
+      }
+      if (has_transfer && command_processor_.GpuTimingTransferLogFrame()) {
+        // The draw whose render target bindings caused the transfers below.
+        const RegisterFile& regs = register_file();
+        std::fprintf(
+            stderr,
+            "REX_GPU_TRANSFER_DRAW frame=%llu vs=%016llX depthcontrol=%08X "
+            "normalized_depthcontrol=%08X color_mask=%08X normalized_color_mask=%08X "
+            "stencilrefmask=%08X stencilrefmask_bf=%08X modecontrol=%08X surface_info=%08X "
+            "depth_info=%08X color_info0=%08X clip_cntl=%08X sc_mode_cntl=%08X "
+            "draw_initiator=%08X window_scissor_br=%08X vport_yscale=%.2f vport_yoffset=%.2f "
+            "window_scissor_tl=%08X window_offset=%08X vte_cntl=%08X vtx_cntl=%08X "
+            "overwrite_check=%s rect=%.2f,%.2f,%.2f,%.2f range=%ux%u scissor=%d,%d,%d,%d\n",
+            static_cast<unsigned long long>(command_processor_.GetCurrentFrame()),
+            static_cast<unsigned long long>(vertex_shader.ucode_data_hash()),
+            regs[XE_GPU_REG_RB_DEPTHCONTROL], normalized_depth_control.value,
+            regs[XE_GPU_REG_RB_COLOR_MASK], normalized_color_mask,
+            regs[XE_GPU_REG_RB_STENCILREFMASK], regs[XE_GPU_REG_RB_STENCILREFMASK_BF],
+            regs[XE_GPU_REG_RB_MODECONTROL], regs[XE_GPU_REG_RB_SURFACE_INFO],
+            regs[XE_GPU_REG_RB_DEPTH_INFO], regs[XE_GPU_REG_RB_COLOR_INFO],
+            regs[XE_GPU_REG_PA_CL_CLIP_CNTL], regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL],
+            regs[XE_GPU_REG_VGT_DRAW_INITIATOR], regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR],
+            regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE),
+            regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET),
+            regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL], regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET],
+            regs[XE_GPU_REG_PA_CL_VTE_CNTL], regs[XE_GPU_REG_PA_SU_VTX_CNTL],
+            LastDepthOverwriteCheck().result, LastDepthOverwriteCheck().rect[0],
+            LastDepthOverwriteCheck().rect[1], LastDepthOverwriteCheck().rect[2],
+            LastDepthOverwriteCheck().rect[3], LastDepthOverwriteCheck().range_width,
+            LastDepthOverwriteCheck().range_height, LastDepthOverwriteCheck().scissor[0],
+            LastDepthOverwriteCheck().scissor[1], LastDepthOverwriteCheck().scissor[2],
+            LastDepthOverwriteCheck().scissor[3]);
+      }
+      if (has_transfer) {
+        D3D12CommandProcessor::GpuTimingScope transfer_timing(command_processor_,
+                                                              GpuTimingCategory::kTransfer);
+        PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
+                                         depth_and_color_render_targets, last_update_transfers(),
+                                         nullptr, nullptr, nullptr, scene_update_capture_);
+      } else if (kGpuDiagnostics && scene_update_capture_) {
+        scene_update_capture_->helper_completed = true;
+      }
+      if (kGpuDiagnostics && scene_update_capture_) {
+        CaptureSceneAliasTransfers(depth_and_color_render_targets, last_update_transfers(), true);
+      }
       SetCommandListRenderTargets(depth_and_color_render_targets);
+      if (command_processor_.GpuTimingEnabled()) {
+        // Draw time from here on belongs to this render-target set.
+        uint32_t keys[1 + xenos::kMaxColorRenderTargets];
+        LastUpdateRenderTargetKeys(keys);
+        command_processor_.GpuTimingNotePass(keys);
+      }
     } break;
     case Path::kPixelShaderInterlock: {
       // For ROV, only the barrier is needed - already scheduled if required.
@@ -1168,9 +2490,85 @@ void D3D12RenderTargetCache::WriteEdramUintPow2UAVDescriptor(D3D12_CPU_DESCRIPTO
 
 bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMemory& shared_memory,
                                      D3D12TextureCache& texture_cache,
-                                     uint32_t& written_address_out, uint32_t& written_length_out) {
+                                     uint32_t& written_address_out, uint32_t& written_length_out,
+                                     const char* embedded_capture_label,
+                                     const char* embedded_capture_path,
+                                     bool* written_scaled_out,
+                                     const char* embedded_edram_capture_path,
+                                     const char* embedded_scaled_capture_path,
+                                     const embedded_scene_resolve_capture_policy::Context* scene_capture_context) {
   written_address_out = 0;
   written_length_out = 0;
+  if (written_scaled_out) {
+    *written_scaled_out = false;
+  }
+
+  // The embedded title host doesn't initialize ReXGlue's normal logging
+  // frontend. Keep failure diagnostics local and bounded so dropped resolves
+  // can be classified without changing their behavior.
+  const auto log_embedded_resolve_failure = [&](const char* stage) {
+    static uint64_t failure_ordinal = 0;
+    const uint64_t ordinal = ++failure_ordinal;
+    // Empty-after-scissor resolves are common in this title when UI/video
+    // rectangles are deliberately positioned wholly outside the active
+    // scissor. Preserve enough evidence to catch a new failure class without
+    // synchronously flushing one record every 256 no-op resolves forever.
+    // First occurrences and powers of two retain ordering and growth evidence.
+    if (ordinal > 8 && (ordinal & (ordinal - 1))) {
+      return;
+    }
+    const RegisterFile& regs = register_file();
+    const reg::RB_COPY_CONTROL control = regs.Get<reg::RB_COPY_CONTROL>();
+    const reg::RB_COPY_DEST_INFO dest_info = regs.Get<reg::RB_COPY_DEST_INFO>();
+    const reg::RB_COPY_DEST_PITCH dest_pitch = regs.Get<reg::RB_COPY_DEST_PITCH>();
+    const reg::RB_SURFACE_INFO surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+    const xenos::xe_gpu_vertex_fetch_t fetch = regs.GetVertexFetch(0);
+    const char* rejection_reason = "downstream";
+    if (!std::strcmp(stage, "get_resolve_info")) {
+      if (control.copy_command != xenos::CopyCommand::kRaw &&
+          control.copy_command != xenos::CopyCommand::kConvert) {
+        rejection_reason = "copy_command";
+      } else if (fetch.type != xenos::FetchConstantType::kVertex || fetch.size != 6) {
+        rejection_reason = "vertex_fetch";
+      } else if (surface_info.msaa_samples > xenos::MsaaSamples::k4X) {
+        rejection_reason = "msaa";
+      } else {
+        // These are the only early exits in the pinned GetResolveInfo after
+        // the validated checks above.
+        rejection_reason = "empty_after_scissor";
+      }
+    }
+    uint32_t vertex_words[6]{};
+    const uint32_t vertex_address = fetch.address * sizeof(uint32_t);
+    if (const uint8_t* vertex_data = memory.TranslatePhysical(vertex_address)) {
+      std::memcpy(vertex_words, vertex_data, sizeof(vertex_words));
+    }
+    uint32_t source_color_info = 0;
+    if (control.copy_src_select < xenos::kMaxColorRenderTargets) {
+      source_color_info =
+          regs.Get<reg::RB_COLOR_INFO>(
+                  reg::RB_COLOR_INFO::rt_register_indices[control.copy_src_select])
+              .value;
+    }
+    std::fprintf(
+        stderr,
+        "REX_EMBEDDED_RESOLVE_FAILURE ordinal=%llu stage=%s reason=%s control=0x%08X "
+        "dest_info=0x%08X dest_base=0x%08X dest_pitch=0x%08X surface=0x%08X "
+        "source_color=0x%08X vertex_fetch=%08X,%08X vertex_address=0x%08X "
+        "window_scissor=%08X,%08X screen_scissor=%08X,%08X window_offset=%08X "
+        "sc_mode=%08X vtx_control=%08X "
+        "vertex_words=%08X,%08X,%08X,%08X,%08X,%08X\n",
+        static_cast<unsigned long long>(ordinal), stage, rejection_reason, control.value,
+        dest_info.value,
+        regs[XE_GPU_REG_RB_COPY_DEST_BASE], dest_pitch.value, surface_info.value,
+        source_color_info, fetch.dword_0, fetch.dword_1, vertex_address,
+        regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL], regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR],
+        regs[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_TL], regs[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR],
+        regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET], regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL],
+        regs[XE_GPU_REG_PA_SU_VTX_CNTL], vertex_words[0],
+        vertex_words[1], vertex_words[2], vertex_words[3], vertex_words[4], vertex_words[5]);
+    std::fflush(stderr);
+  };
 
   bool draw_resolution_scaled = IsDrawResolutionScaled();
 
@@ -1179,6 +2577,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
   if (!draw_util::GetResolveInfo(register_file(), memory, trace_writer_, draw_resolution_scale_x(),
                                  draw_resolution_scale_y(), fixed_16_truncated_to_minus_1_to_1,
                                  fixed_16_truncated_to_minus_1_to_1, resolve_info)) {
+    log_embedded_resolve_failure("get_resolve_info");
     return false;
   }
 
@@ -1187,25 +2586,197 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
     return true;
   }
 
+  if (embedded_capture_label && resolve_info.copy_dest_extent_length) {
+    const bool capture_ok = CaptureEmbeddedResolveSource(
+        resolve_info, embedded_capture_label, embedded_capture_path);
+    std::fprintf(
+        stderr,
+        "REX_EMBEDDED_RESOLVE_SOURCE_CAPTURE result=%u label=%s "
+        "dest_start=0x%08X dest_length=%u\n",
+        capture_ok ? 1u : 0u, embedded_capture_label,
+        resolve_info.copy_dest_extent_start,
+        resolve_info.copy_dest_extent_length);
+    std::fflush(stderr);
+  }
+
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
 
   // Copying.
   bool copied = false;
   if (resolve_info.copy_dest_extent_length) {
+    D3D12CommandProcessor::GpuTimingScope copy_timing(command_processor_,
+                                                      GpuTimingCategory::kResolveCopy);
+    bool copy_native = false;
+    uint32_t dump_base = 0;
+    uint32_t dump_row_length_used = 0;
+    uint32_t dump_rows = 0;
+    uint32_t dump_pitch = 0;
+    if (GetPath() == Path::kHostRenderTargets) {
+      resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used,
+                                        dump_rows, dump_pitch);
+      copy_native = IsResolveSourceNativeOnly(
+          dump_base, dump_row_length_used, dump_rows, dump_pitch);
+      if (copy_native &&
+          !draw_util::GetResolveInfo(
+              register_file(), memory, trace_writer_, 1, 1,
+              fixed_16_truncated_to_minus_1_to_1,
+              fixed_16_truncated_to_minus_1_to_1, resolve_info)) {
+        log_embedded_resolve_failure("native_get_resolve_info");
+        return false;
+      }
+    }
+    const bool copy_dest_scaled = draw_resolution_scaled && !copy_native;
+    if (command_processor_.GpuTimingEnabled()) {
+      command_processor_.GpuTimingCount(GpuTimingCounter::kResolveCopies, 1);
+      command_processor_.GpuTimingCount(
+          GpuTimingCounter::kResolveCopyBytes,
+          uint64_t(resolve_info.copy_dest_extent_length) *
+              (copy_dest_scaled ? draw_resolution_scale_x() * draw_resolution_scale_y() : 1));
+    }
+    uint32_t depth_boundary_ordinal = 0;
+    // Bounded provenance only: explain native/mixed EDRAM ownership before
+    // the existing resolve chooses its destination representation. Metadata is
+    // passive; the separate default-off depth observer adds deferred copies,
+    // never ownership edits or new submission boundaries.
+    static uint32_t resolve_grid_trace_count = 0;
+    // The depth exporter needs the actual post-clipping resolve rectangle and
+    // encoding too. Reuse this bounded, selected-frame provenance observer;
+    // window scissors or contiguous addresses alone do not prove image layout.
+    if ((REXCVAR_GET(embedded_target_writer_capture_count) ||
+         (REXCVAR_GET(embedded_temporal_depth_resolve_capture) &&
+          resolve_info.IsCopyingDepth())) &&
+        IsCurrentEmbeddedGameplayCaptureFrame() && resolve_grid_trace_count < 64 &&
+        GetPath() == Path::kHostRenderTargets) {
+      ++resolve_grid_trace_count;
+      std::vector<ResolveCopyDumpRectangle> grid_rectangles;
+      GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows,
+                                     dump_pitch, grid_rectangles);
+      uint32_t native_rectangles = 0;
+      for (const auto& rectangle : grid_rectangles) {
+        native_rectangles += rectangle.render_target->key().scale_native ? 1u : 0u;
+      }
+      std::fprintf(stderr,
+          "REX_EMBEDDED_RESOLVE_GRID ordinal=%u source_native=%u dest_scaled=%u "
+          "dest_base=0x%08X extent=0x%08X+%u tiles=%u,%u,%u,%u "
+          "rectangles=%u native_rectangles=%u original_base=%08X rect=%u,%u,%u,%u pitch=%u format=%u endian=%u\n",
+          resolve_grid_trace_count, copy_native ? 1u : 0u, copy_dest_scaled ? 1u : 0u,
+          resolve_info.copy_dest_base, resolve_info.copy_dest_extent_start,
+          resolve_info.copy_dest_extent_length, dump_base, dump_row_length_used,
+          dump_rows, dump_pitch, uint32_t(grid_rectangles.size()), native_rectangles,
+          resolve_info.copy_dest_original_base, resolve_info.copy_dest_rect[0],
+          resolve_info.copy_dest_rect[1], resolve_info.copy_dest_rect[2], resolve_info.copy_dest_rect[3],
+          uint32_t(resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32) << 5,
+          uint32_t(resolve_info.copy_dest_info.copy_dest_format),
+          uint32_t(resolve_info.copy_dest_info.copy_dest_endian));
+      // Counts alone don't prove the requested EDRAM rectangle is owned.
+      // Keep this metadata under the existing one-frame/64-resolve budget,
+      // with a separate global 64-owner cap. Unlogged owners remain explicitly
+      // unknown. The opt-in source observer selects at most one owner resource
+      // per resolve ordinal so filenames and the paired EDRAM epoch are unique.
+      static uint32_t resolve_owner_trace_count = 0;
+      uint32_t owner_logged = 0;
+      for (const auto& rectangle : grid_rectangles) {
+        if (resolve_owner_trace_count >= 64) break;
+        ++resolve_owner_trace_count;
+        ++owner_logged;
+        auto* owner = static_cast<D3D12RenderTarget*>(rectangle.render_target);
+        const auto owner_key = owner->key();
+        const auto desc = owner->resource()->GetDesc();
+        if (REXCVAR_GET(embedded_resolve_depth_source_capture) && owner_key.is_depth &&
+            !depth_boundary_ordinal) {
+          const bool queued = QueueDepthSourceReadback(owner, resolve_grid_trace_count,
+                                                       resolve_info.copy_dest_base);
+          if (queued) depth_boundary_ordinal = resolve_grid_trace_count;
+          std::fprintf(stderr,
+              "REX_EMBEDDED_DEPTH_SOURCE_SELECTION ordinal=%u queued=%u\n",
+              resolve_grid_trace_count, queued ? 1u : 0u);
+        }
+        std::fprintf(stderr,
+            "REX_EMBEDDED_RESOLVE_OWNER ordinal=%u owner=%u dest_base=0x%08X "
+            "resource=%p key=0x%08X base=%u pitch32=%u pitch=%u msaa=%u "
+            "depth=%u format=%u scale_native=%u row_first=%u rows=%u "
+            "first_start=%u last_end=%u host_width=%llu host_height=%u "
+            "host_format=%u host_samples=%u\n",
+            resolve_grid_trace_count, owner_logged - 1, resolve_info.copy_dest_base,
+            static_cast<void*>(owner->resource()), owner_key.key, owner_key.base_tiles,
+            owner_key.pitch_tiles_at_32bpp, owner_key.GetPitchTiles(),
+            uint32_t(owner_key.msaa_samples), owner_key.is_depth,
+            owner_key.resource_format, owner_key.scale_native, rectangle.row_first,
+            rectangle.rows, rectangle.row_first_start, rectangle.row_last_end,
+            static_cast<unsigned long long>(desc.Width), desc.Height,
+            uint32_t(desc.Format), desc.SampleDesc.Count);
+      }
+      if (owner_logged != grid_rectangles.size()) {
+        std::fprintf(stderr,
+            "REX_EMBEDDED_RESOLVE_OWNER_TRUNCATED ordinal=%u logged=%u total=%u\n",
+            resolve_grid_trace_count, owner_logged, uint32_t(grid_rectangles.size()));
+      }
+    }
+
+    // Separate passive scene chronology. The caller reserved one of at most64
+    // events in its single selected frame. Do not consume the existing depth/
+    // writer metadata counters or arm their optional depth-source copies.
+    if (scene_capture_context && GetPath() == Path::kHostRenderTargets) {
+      const auto& c = *scene_capture_context;
+      std::vector<ResolveCopyDumpRectangle> rectangles;
+      GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows,
+                                    dump_pitch, rectangles);
+      static uint32_t scene_owner_trace_count = 0;
+      uint32_t logged = 0;
+      std::fprintf(stderr,
+          "REX_SCENE_RESOLVE_LAYOUT frame=%llu resolve=%llu last_draw=%llu "
+          "source_native=%u dest_scaled=%u dest_base=%08X extent=%08X+%u "
+          "tiles=%u,%u,%u,%u rectangles=%u original_base=%08X rect=%u,%u,%u,%u "
+          "pitch=%u format=%u endian=%u\n",
+          static_cast<unsigned long long>(c.frame), static_cast<unsigned long long>(c.ordinal),
+          static_cast<unsigned long long>(c.last_draw), copy_native ? 1u : 0u, copy_dest_scaled ? 1u : 0u,
+          resolve_info.copy_dest_base, resolve_info.copy_dest_extent_start,
+          resolve_info.copy_dest_extent_length, dump_base, dump_row_length_used, dump_rows, dump_pitch,
+          uint32_t(rectangles.size()), resolve_info.copy_dest_original_base,
+          resolve_info.copy_dest_rect[0], resolve_info.copy_dest_rect[1],
+          resolve_info.copy_dest_rect[2], resolve_info.copy_dest_rect[3],
+          uint32_t(resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32) << 5,
+          uint32_t(resolve_info.copy_dest_info.copy_dest_format),
+          uint32_t(resolve_info.copy_dest_info.copy_dest_endian));
+      for (const auto& rectangle : rectangles) {
+        if (scene_owner_trace_count == 128) break;
+        ++scene_owner_trace_count;
+        auto* owner = static_cast<D3D12RenderTarget*>(rectangle.render_target);
+        const auto key = owner->key();
+        const auto desc = owner->resource()->GetDesc();
+        std::fprintf(stderr,
+            "REX_SCENE_RESOLVE_OWNER frame=%llu resolve=%llu last_draw=%llu owner=%u "
+            "resource=%p key=%08X base=%u pitch32=%u pitch=%u msaa=%u depth=%u format=%u "
+            "scale_native=%u row_first=%u rows=%u first_start=%u last_end=%u "
+            "host_width=%llu host_height=%u host_format=%u host_samples=%u\n",
+            static_cast<unsigned long long>(c.frame), static_cast<unsigned long long>(c.ordinal),
+            static_cast<unsigned long long>(c.last_draw), logged++, static_cast<void*>(owner->resource()),
+            key.key, key.base_tiles, key.pitch_tiles_at_32bpp, key.GetPitchTiles(),
+            uint32_t(key.msaa_samples), key.is_depth, key.resource_format, key.scale_native,
+            rectangle.row_first, rectangle.rows, rectangle.row_first_start, rectangle.row_last_end,
+            static_cast<unsigned long long>(desc.Width), desc.Height, uint32_t(desc.Format), desc.SampleDesc.Count);
+      }
+      std::fprintf(stderr,
+          "REX_SCENE_RESOLVE_OWNERS frame=%llu resolve=%llu logged=%u total=%u\n",
+          static_cast<unsigned long long>(c.frame), static_cast<unsigned long long>(c.ordinal),
+          logged, uint32_t(rectangles.size()));
+    }
+
     draw_util::ResolveCopyShaderConstants copy_shader_constants;
     uint32_t copy_group_count_x, copy_group_count_y;
     draw_util::ResolveCopyShaderIndex copy_shader =
-        resolve_info.GetCopyShader(draw_resolution_scale_x(), draw_resolution_scale_y(),
-                                   copy_shader_constants, copy_group_count_x, copy_group_count_y);
+        resolve_info.GetCopyShader(copy_native ? 1 : draw_resolution_scale_x(),
+                                   copy_native ? 1 : draw_resolution_scale_y(),
+                                   copy_shader_constants, copy_group_count_x,
+                                   copy_group_count_y);
     assert_true(copy_group_count_x && copy_group_count_y);
     if (copy_shader != draw_util::ResolveCopyShaderIndex::kUnknown) {
-      const draw_util::ResolveCopyShaderInfo& copy_shader_info =
-          draw_util::resolve_copy_shader_info[size_t(copy_shader)];
       bool direct_resolved = false;
       if (GetPath() == Path::kHostRenderTargets) {
-        if (REXCVAR_GET(direct_host_resolve)) {
+        if (!copy_native && REXCVAR_GET(direct_host_resolve)) {
           direct_resolved =
-              TryResolveCopyDirectly(resolve_info, copy_shader, draw_resolution_scaled);
+              TryResolveCopyDirectly(resolve_info, copy_shader,
+                                     copy_dest_scaled);
           if (direct_resolved) {
             ++direct_resolve_success_count_;
           } else {
@@ -1215,25 +2786,85 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
         if (!direct_resolved) {
           // Dump the current contents of the render targets owning the affected
           // range to edram_buffer_.
-          uint32_t dump_base;
-          uint32_t dump_row_length_used;
-          uint32_t dump_rows;
-          uint32_t dump_pitch;
-          resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
-          if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
+          D3D12CommandProcessor::GpuTimingScope dump_timing(command_processor_,
+                                                            GpuTimingCategory::kResolveDump);
+          if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows,
+                                 dump_pitch, copy_native)) {
             REXGPU_ERROR("D3D12RenderTargetCache: Failed to dump host render targets for resolve");
+            log_embedded_resolve_failure("dump_render_targets");
             return false;
           }
         }
+        if (depth_boundary_ordinal) {
+          // Pair the actual production dump with the host-source snapshot.
+          // Copy only; no additional dump, CPU wait, or guest-memory upload.
+          PendingDepthSourceReadback p;
+          p.source = edram_buffer_;
+          p.bytes = edram_buffer_->GetDesc().Width;
+          p.ordinal = depth_boundary_ordinal;
+          p.destination = resolve_info.copy_dest_base;
+          p.path = "rex_resolve_depth_edram_" + std::to_string(p.ordinal) + ".bin";
+          D3D12_RESOURCE_DESC buffer_desc;
+          ui::d3d12::util::FillBufferResourceDesc(buffer_desc, p.bytes, D3D12_RESOURCE_FLAG_NONE);
+          const bool prepared = p.bytes && p.bytes <= UINT64_C(64) * 1024 * 1024 &&
+              SUCCEEDED(command_processor_.GetD3D12Provider().GetDevice()->CreateCommittedResource(
+                  &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE,
+                  &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                  IID_PPV_ARGS(&p.readback)));
+          if (prepared) {
+            p.submission = command_processor_.GetCurrentSubmission();
+            const auto previous = edram_buffer_state_;
+            TransitionEdramBuffer(D3D12_RESOURCE_STATE_COPY_SOURCE);
+            command_processor_.SubmitBarriers();
+            command_list.D3DCopyBufferRegion(p.readback.Get(), 0, edram_buffer_, 0, p.bytes);
+            TransitionEdramBuffer(previous);
+            command_processor_.SubmitBarriers();
+          }
+          std::fprintf(stderr,
+              "REX_EMBEDDED_DEPTH_EDRAM_QUEUED result=%u ordinal=%u dest_base=0x%08X "
+              "bytes=%llu submission=%llu scale=%ux%u path=%s\n",
+              prepared ? 1u : 0u, p.ordinal, p.destination,
+              static_cast<unsigned long long>(p.bytes), static_cast<unsigned long long>(p.submission),
+              draw_resolution_scale_x(), draw_resolution_scale_y(), p.path.c_str());
+          if (prepared) pending_depth_source_readbacks_.push_back(std::move(p));
+        }
+        if (embedded_edram_capture_path) {
+          const bool edram_capture_ok = CaptureEmbeddedEdramBuffer(
+              resolve_info, embedded_capture_label,
+              embedded_edram_capture_path);
+          std::fprintf(
+              stderr,
+              "REX_EMBEDDED_RESOLVE_BOUNDARY_STAGE stage=edram_after_dump "
+              "result=%u label=%s\n",
+              edram_capture_ok ? 1u : 0u,
+              embedded_capture_label ? embedded_capture_label : "unnamed");
+          std::fflush(stderr);
+        }
       }
+
+      const FormatInfo* copy_dest_format_info = FormatInfo::Get(
+          uint32_t(resolve_info.copy_dest_info.copy_dest_format));
+      uint32_t copy_dest_pixel_size_log2 = 0;
+      bool copy_dest_pixel_size_supported =
+          copy_dest_format_info && copy_dest_format_info->bits_per_pixel >= 8 &&
+          copy_dest_format_info->bits_per_pixel <= 128 &&
+          rex::bit_scan_forward(copy_dest_format_info->bits_per_pixel >> 3,
+                                &copy_dest_pixel_size_log2) &&
+          copy_dest_format_info->bits_per_pixel ==
+              (UINT32_C(8) << copy_dest_pixel_size_log2);
 
       // Make sure there is memory to write to.
       bool copy_dest_committed;
-      if (draw_resolution_scaled) {
+      if (copy_dest_scaled) {
         // Committing starting with the beginning of the potentially written
         // extent, but making the buffer containing the base current as the
         // beginning of the bound buffer is the base.
         copy_dest_committed =
+            copy_dest_pixel_size_supported &&
+            texture_cache.InitializeUnscaledResolvePagesFromSharedMemory(
+                resolve_info.copy_dest_extent_start,
+                resolve_info.copy_dest_extent_length,
+                copy_dest_pixel_size_log2) &&
             texture_cache.EnsureScaledResolveMemoryCommitted(
                 resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length) &&
             texture_cache.MakeScaledResolveRangeCurrent(resolve_info.copy_dest_base,
@@ -1245,6 +2876,14 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                                                          resolve_info.copy_dest_extent_length);
       }
       if (copy_dest_committed) {
+        // Every embedded D3D12 resolve-copy shader declares ByteAddressBuffer
+        // and RWByteAddressBuffer (native and scaled). The shared shader-info
+        // table still describes typed views used by other backends; it is not
+        // this DXBC binding ABI. In particular a uint4 EDRAM SRV has one quarter
+        // as many elements and truncates raw loads at 2.5MiB on the tested GPU.
+        // Probe331 + gpu_resolve_raw_views reproduce depth rows256..383 missing
+        // and an all-zero base1536 shadow resolve with that mismatched view.
+        // Keep raw descriptors at both ends; do not alter Vulkan's metadata.
         // Write the descriptors and transition the resources.
         // Full shared memory without resolution scaling, range of the scaled
         // resolve buffer with scaling because only at least 128 * 2^20 R32
@@ -1254,38 +2893,27 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
         ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor_source;
         ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[2];
         if (command_processor_.RequestOneUseSingleViewDescriptors(
-                bindless_resources_used_ ? uint32_t(draw_resolution_scaled) : 2, descriptors)) {
+                bindless_resources_used_ ? uint32_t(copy_dest_scaled) : 2,
+                descriptors)) {
           if (bindless_resources_used_) {
-            if (draw_resolution_scaled) {
+            if (copy_dest_scaled) {
               descriptor_dest = descriptors[0];
             } else {
-              descriptor_dest = command_processor_.GetSharedMemoryUintPow2BindlessUAVHandlePair(
-                  copy_shader_info.dest_bpe_log2);
+              descriptor_dest = command_processor_.GetSystemBindlessViewHandlePair(
+                  D3D12CommandProcessor::SystemBindlessView::kSharedMemoryRawUAV);
             }
-            if (copy_shader_info.source_is_raw) {
-              descriptor_source = command_processor_.GetSystemBindlessViewHandlePair(
-                  D3D12CommandProcessor::SystemBindlessView::kEdramRawSRV);
-            } else {
-              descriptor_source = command_processor_.GetEdramUintPow2BindlessSRVHandlePair(
-                  copy_shader_info.source_bpe_log2);
-            }
+            descriptor_source = command_processor_.GetSystemBindlessViewHandlePair(
+                D3D12CommandProcessor::SystemBindlessView::kEdramRawSRV);
           } else {
             descriptor_dest = descriptors[0];
-            if (!draw_resolution_scaled) {
-              shared_memory.WriteUintPow2UAVDescriptor(descriptor_dest.first,
-                                                       copy_shader_info.dest_bpe_log2);
+            if (!copy_dest_scaled) {
+              shared_memory.WriteRawUAVDescriptor(descriptor_dest.first);
             }
             descriptor_source = descriptors[1];
-            if (copy_shader_info.source_is_raw) {
-              WriteEdramRawSRVDescriptor(descriptor_source.first);
-            } else {
-              WriteEdramUintPow2SRVDescriptor(descriptor_source.first,
-                                              copy_shader_info.source_bpe_log2);
-            }
+            WriteEdramRawSRVDescriptor(descriptor_source.first);
           }
-          if (draw_resolution_scaled) {
-            texture_cache.CreateCurrentScaledResolveRangeUintPow2UAV(
-                descriptor_dest.first, copy_shader_info.dest_bpe_log2);
+          if (copy_dest_scaled) {
+            texture_cache.CreateCurrentScaledResolveRangeRawUAV(descriptor_dest.first);
             texture_cache.TransitionCurrentScaledResolveRange(
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
           } else {
@@ -1294,10 +2922,12 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           TransitionEdramBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
           // Submit the resolve.
-          command_list.D3DSetComputeRootSignature(resolve_copy_root_signature_);
+          command_list.D3DSetComputeRootSignature(
+              copy_native ? resolve_copy_native_root_signature_
+                          : resolve_copy_root_signature_);
           command_list.D3DSetComputeRootDescriptorTable(2, descriptor_source.second);
           command_list.D3DSetComputeRootDescriptorTable(1, descriptor_dest.second);
-          if (draw_resolution_scaled) {
+          if (copy_dest_scaled) {
             command_list.D3DSetComputeRoot32BitConstants(
                 0, sizeof(copy_shader_constants.dest_relative) / sizeof(uint32_t),
                 &copy_shader_constants.dest_relative, 0);
@@ -1305,29 +2935,72 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             command_list.D3DSetComputeRoot32BitConstants(
                 0, sizeof(copy_shader_constants) / sizeof(uint32_t), &copy_shader_constants, 0);
           }
-          command_processor_.SetExternalPipeline(resolve_copy_pipelines_[size_t(copy_shader)]);
+          command_processor_.SetExternalPipeline(
+              copy_native
+                  ? resolve_copy_native_pipelines_[size_t(copy_shader)]
+                  : resolve_copy_pipelines_[size_t(copy_shader)]);
           command_processor_.SubmitBarriers();
           command_list.D3DDispatch(copy_group_count_x, copy_group_count_y, 1);
 
           // Order the resolve with other work using the destination as a UAV.
-          if (draw_resolution_scaled) {
+          if (copy_dest_scaled) {
             texture_cache.MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
           } else {
             shared_memory.MarkUAVWritesCommitNeeded();
           }
 
+          if (copy_dest_scaled && embedded_scaled_capture_path) {
+            const bool scaled_capture_ok =
+                texture_cache.CaptureCurrentScaledResolveRange(
+                    resolve_info.copy_dest_extent_start,
+                    resolve_info.copy_dest_extent_length,
+                    embedded_capture_label,
+                    embedded_scaled_capture_path);
+            std::fprintf(
+                stderr,
+                "REX_EMBEDDED_RESOLVE_BOUNDARY_STAGE "
+                "stage=scaled_after_copy result=%u label=%s\n",
+                scaled_capture_ok ? 1u : 0u,
+                embedded_capture_label ? embedded_capture_label : "unnamed");
+            std::fflush(stderr);
+          }
+
           // Invalidate textures and mark the range as scaled if needed.
+          native_resolve::Write native_region_write;
+          native_region_write.layout = {
+              resolve_info.copy_dest_original_base,
+              uint32_t(resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32) << 5,
+              uint32_t(resolve_info.copy_dest_info.copy_dest_format),
+              uint32_t(resolve_info.copy_dest_info.copy_dest_endian),
+              copy_dest_pixel_size_log2};
+          native_region_write.rect = {resolve_info.copy_dest_rect[0],
+              resolve_info.copy_dest_rect[1], resolve_info.copy_dest_rect[2],
+              resolve_info.copy_dest_rect[3]};
+          native_region_write.extent_start = resolve_info.copy_dest_extent_start;
+          native_region_write.extent_length = resolve_info.copy_dest_extent_length;
+          native_region_write.layout_known =
+              !resolve_info.copy_dest_info.copy_dest_array && !resolve_info.IsCopyingDepth();
           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
-                                            resolve_info.copy_dest_extent_length);
+                                            resolve_info.copy_dest_extent_length,
+                                            copy_dest_pixel_size_log2,
+                                            copy_dest_scaled, &native_region_write);
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
+          if (written_scaled_out) {
+            *written_scaled_out = copy_dest_scaled;
+          }
           copied = true;
+        } else {
+          log_embedded_resolve_failure("copy_descriptor_request");
         }
       } else {
+        log_embedded_resolve_failure("copy_destination_memory");
         REXGPU_ERROR(
             "D3D12RenderTargetCache: Failed to obtain the resolve destination "
             "memory region");
       }
+    } else {
+      log_embedded_resolve_failure("copy_shader_unknown");
     }
   } else {
     copied = true;
@@ -1338,21 +3011,35 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
   bool clear_depth = resolve_info.IsClearingDepth();
   bool clear_color = resolve_info.IsClearingColor();
   if (clear_depth || clear_color) {
+    D3D12CommandProcessor::GpuTimingScope clear_timing(command_processor_,
+                                                       GpuTimingCategory::kResolveClear);
     switch (GetPath()) {
       case Path::kHostRenderTargets: {
         Transfer::Rectangle clear_rectangle;
         RenderTarget* clear_render_targets[2];
         // If PrepareHostRenderTargetsResolveClear returns false, may be just an
         // empty region (success) or an error - don't care.
-        if (PrepareHostRenderTargetsResolveClear(resolve_info, clear_rectangle,
-                                                 clear_render_targets[0], clear_transfers_[0],
-                                                 clear_render_targets[1], clear_transfers_[1])) {
+        const bool clear_prepared = PrepareHostRenderTargetsResolveClear(
+            resolve_info, clear_rectangle, clear_render_targets[0], clear_transfers_[0],
+            clear_render_targets[1], clear_transfers_[1]);
+        if (scene_capture_context) {
+          const auto& c = *scene_capture_context;
+          std::fprintf(stderr,
+              "REX_SCENE_CLEAR_PREPARE frame=%llu resolve=%llu last_draw=%llu "
+              "depth_requested=%u color_requested=%u prepared=%u submission=%llu "
+              "scope=actual_preparation_not_clear_execution\n",
+              static_cast<unsigned long long>(c.frame), static_cast<unsigned long long>(c.ordinal),
+              static_cast<unsigned long long>(c.last_draw), clear_depth ? 1u : 0u,
+              clear_color ? 1u : 0u, clear_prepared ? 1u : 0u,
+              static_cast<unsigned long long>(command_processor_.GetCurrentSubmission()));
+        }
+        if (clear_prepared) {
           uint64_t clear_values[2];
           clear_values[0] = resolve_info.rb_depth_clear;
           clear_values[1] =
               resolve_info.rb_color_clear | (uint64_t(resolve_info.rb_color_clear_lo) << 32);
           PerformTransfersAndResolveClears(2, clear_render_targets, clear_transfers_, clear_values,
-                                           &clear_rectangle);
+                                           &clear_rectangle, scene_capture_context);
         }
         cleared = true;
       } break;
@@ -1412,6 +3099,8 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           }
           MarkEdramBufferModified();
           cleared = true;
+        } else {
+          log_embedded_resolve_failure("clear_descriptor_request");
         }
       } break;
       default:
@@ -1419,6 +3108,10 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
     }
   } else {
     cleared = true;
+  }
+
+  if (!copied || !cleared) {
+    log_embedded_resolve_failure(!copied ? "copy_incomplete" : "clear_incomplete");
   }
 
   return copied && cleared;
@@ -1715,9 +3408,10 @@ RenderTargetCache::RenderTarget* D3D12RenderTargetCache::CreateRenderTarget(Rend
   D3D12_RESOURCE_DESC resource_desc;
   resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
   resource_desc.Alignment = 0;
-  resource_desc.Width = key.GetWidth() * draw_resolution_scale_x();
+  resource_desc.Width = key.GetWidth() * GetKeyScaleX(key);
   resource_desc.Height =
-      GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples) * draw_resolution_scale_y();
+      GetRenderTargetHeight(key.pitch_tiles_at_32bpp, key.msaa_samples) *
+      GetKeyScaleY(key);
   resource_desc.DepthOrArraySize = 1;
   resource_desc.MipLevels = 1;
   if (key.is_depth) {
@@ -1909,6 +3603,121 @@ void D3D12RenderTargetCache::CommitEdramBufferUAVWrites(
   }
   edram_buffer_modification_status_ = EdramBufferModificationStatus::kUnmodified;
   PixelShaderInterlockFullEdramBarrierPlaced();
+}
+
+// Host sample indices used by the transfer remapping helpers:
+// - 4x bit 0 is horizontal and bit 1 is vertical in Direct3D 10.1+.
+// - Native 2x uses top sample 1 and bottom sample 0.
+// - 2x emulated as 4x uses top sample 0 and bottom sample 3.
+
+// Convert view pixel coordinates in r0.xy and a host sample index to the
+// canonical guest sample coordinates. The guest pixel and scaled subpixel are
+// kept in r1.xy and r2.xy when resolution scaling is active.
+static void CanonicalizeSample(dxbc::Assembler& a,
+                               xenos::MsaaSamples msaa_samples,
+                               dxbc::Src host_sample, bool msaa_2x_supported,
+                               uint32_t scale_x, uint32_t scale_y,
+                               dxbc::Src& u_out, dxbc::Src& v_out,
+                               bool& scaled_out) {
+  bool scaled = scale_x > 1 || scale_y > 1;
+  scaled_out = scaled;
+  dxbc::Src guest_x(dxbc::Src::R(0, dxbc::Src::kXXXX));
+  dxbc::Src guest_y(dxbc::Src::R(0, dxbc::Src::kYYYY));
+  if (scaled) {
+    a.OpUDiv(dxbc::Dest::R(1, 0b0011), dxbc::Dest::R(2, 0b0011),
+             dxbc::Src::R(0, 0b01000100),
+             dxbc::Src::LU(scale_x, scale_y, scale_x, scale_y));
+    guest_x = dxbc::Src::R(1, dxbc::Src::kXXXX);
+    guest_y = dxbc::Src::R(1, dxbc::Src::kYYYY);
+  }
+  u_out = guest_x;
+  v_out = guest_y;
+  if (msaa_samples >= xenos::MsaaSamples::k4X) {
+    a.OpBFI(dxbc::Dest::R(2, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1),
+            host_sample, guest_x);
+    a.OpUShR(dxbc::Dest::R(2, 0b1000), guest_x, dxbc::Src::LU(1));
+    a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(30), dxbc::Src::LU(2),
+            dxbc::Src::R(2, dxbc::Src::kWWWW),
+            dxbc::Src::R(2, dxbc::Src::kZZZZ));
+    a.OpUShR(dxbc::Dest::R(2, 0b0100), host_sample, dxbc::Src::LU(1));
+    a.OpBFI(dxbc::Dest::R(2, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1),
+            dxbc::Src::R(2, dxbc::Src::kZZZZ), guest_y);
+    a.OpUShR(dxbc::Dest::R(2, 0b1000), guest_y, dxbc::Src::LU(1));
+    a.OpBFI(dxbc::Dest::R(1, 0b0010), dxbc::Src::LU(30), dxbc::Src::LU(2),
+            dxbc::Src::R(2, dxbc::Src::kWWWW),
+            dxbc::Src::R(2, dxbc::Src::kZZZZ));
+    u_out = dxbc::Src::R(1, dxbc::Src::kXXXX);
+    v_out = dxbc::Src::R(1, dxbc::Src::kYYYY);
+  } else if (msaa_samples == xenos::MsaaSamples::k2X) {
+    if (msaa_2x_supported) {
+      a.OpXOr(dxbc::Dest::R(2, 0b0100), host_sample, dxbc::Src::LU(1));
+    } else {
+      a.OpUShR(dxbc::Dest::R(2, 0b0100), host_sample, dxbc::Src::LU(1));
+    }
+    a.OpUShR(dxbc::Dest::R(2, 0b1000), guest_x, dxbc::Src::LU(1));
+    a.OpBFI(dxbc::Dest::R(2, 0b1000), dxbc::Src::LU(1), dxbc::Src::LU(1),
+            dxbc::Src::R(2, dxbc::Src::kWWWW), guest_y);
+    a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(1), dxbc::Src::LU(1),
+            dxbc::Src::R(2, dxbc::Src::kZZZZ), guest_x);
+    a.OpUShR(dxbc::Dest::R(2, 0b0100), guest_y, dxbc::Src::LU(1));
+    a.OpBFI(dxbc::Dest::R(1, 0b0010), dxbc::Src::LU(30), dxbc::Src::LU(2),
+            dxbc::Src::R(2, dxbc::Src::kZZZZ),
+            dxbc::Src::R(2, dxbc::Src::kWWWW));
+    u_out = dxbc::Src::R(1, dxbc::Src::kXXXX);
+    v_out = dxbc::Src::R(1, dxbc::Src::kYYYY);
+  }
+}
+
+// Convert canonical guest sample coordinates back to view pixels and host
+// sample index, preserving the subpixel within a resolution-scaled sample.
+static void DecanonicalizeSample(dxbc::Assembler& a,
+                                 xenos::MsaaSamples msaa_samples, dxbc::Src u,
+                                 dxbc::Src v, bool scaled,
+                                 bool msaa_2x_supported, uint32_t scale_x,
+                                 uint32_t scale_y, dxbc::Src& x_out,
+                                 dxbc::Src& y_out, dxbc::Src& sample_out) {
+  x_out = u;
+  y_out = v;
+  if (msaa_samples >= xenos::MsaaSamples::k4X) {
+    a.OpUBFE(dxbc::Dest::R(2, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1), u);
+    a.OpAnd(dxbc::Dest::R(2, 0b1000), v, dxbc::Src::LU(2));
+    a.OpOr(dxbc::Dest::R(1, 0b0100), dxbc::Src::R(2, dxbc::Src::kZZZZ),
+           dxbc::Src::R(2, dxbc::Src::kWWWW));
+    sample_out = dxbc::Src::R(1, dxbc::Src::kZZZZ);
+    a.OpUShR(dxbc::Dest::R(2, 0b0100), u, dxbc::Src::LU(2));
+    a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(31), dxbc::Src::LU(1),
+            dxbc::Src::R(2, dxbc::Src::kZZZZ), u);
+    a.OpUShR(dxbc::Dest::R(2, 0b1000), v, dxbc::Src::LU(2));
+    a.OpBFI(dxbc::Dest::R(1, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
+            dxbc::Src::R(2, dxbc::Src::kWWWW), v);
+    x_out = dxbc::Src::R(1, dxbc::Src::kXXXX);
+    y_out = dxbc::Src::R(1, dxbc::Src::kYYYY);
+  } else if (msaa_samples == xenos::MsaaSamples::k2X) {
+    a.OpUBFE(dxbc::Dest::R(2, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1), u);
+    if (msaa_2x_supported) {
+      a.OpXOr(dxbc::Dest::R(1, 0b0100), dxbc::Src::R(2, dxbc::Src::kZZZZ),
+              dxbc::Src::LU(1));
+    } else {
+      a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1),
+              dxbc::Src::R(2, dxbc::Src::kZZZZ),
+              dxbc::Src::R(2, dxbc::Src::kZZZZ));
+    }
+    sample_out = dxbc::Src::R(1, dxbc::Src::kZZZZ);
+    a.OpUShR(dxbc::Dest::R(2, 0b1000), v, dxbc::Src::LU(1));
+    a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(1), dxbc::Src::LU(1),
+            dxbc::Src::R(2, dxbc::Src::kWWWW), u);
+    a.OpUShR(dxbc::Dest::R(2, 0b1000), v, dxbc::Src::LU(2));
+    a.OpBFI(dxbc::Dest::R(1, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
+            dxbc::Src::R(2, dxbc::Src::kWWWW), v);
+    x_out = dxbc::Src::R(1, dxbc::Src::kXXXX);
+    y_out = dxbc::Src::R(1, dxbc::Src::kYYYY);
+  }
+  if (scaled) {
+    a.OpUMAd(dxbc::Dest::R(1, 0b0011), dxbc::Src::R(1),
+             dxbc::Src::LU(scale_x, scale_y, 1, 1), dxbc::Src::R(2));
+    x_out = dxbc::Src::R(1, dxbc::Src::kXXXX);
+    y_out = dxbc::Src::R(1, dxbc::Src::kYYYY);
+  }
 }
 
 ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines(
@@ -2579,24 +4388,38 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   }
   // r0:r2 are involved at least in common addressing code. Texture loads
   // usually can overwrite some of the addressing temps as they are only needed
-  // for the coordinates for that load. Currently 3 temps are enough.
-  a.OpDclTemps(3);
+  // for the coordinates for that load. Cross-class transfers keep the original
+  // destination coordinates in one additional temp for host-depth access.
+  bool cross_scale_class = key.source_scale_native != key.dest_scale_native;
+  a.OpDclTemps(3 + uint32_t(cross_scale_class));
 
-  uint32_t draw_resolution_scale_x = this->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = this->draw_resolution_scale_y();
-
-  uint32_t tile_width_samples = xenos::kEdramTileWidthSamples * draw_resolution_scale_x;
-  uint32_t tile_height_samples = xenos::kEdramTileHeightSamples * draw_resolution_scale_y;
+  uint32_t dest_scale_x =
+      key.dest_scale_native ? 1 : this->draw_resolution_scale_x();
+  uint32_t dest_scale_y =
+      key.dest_scale_native ? 1 : this->draw_resolution_scale_y();
+  uint32_t source_scale_x =
+      key.source_scale_native ? 1 : this->draw_resolution_scale_x();
+  uint32_t source_scale_y =
+      key.source_scale_native ? 1 : this->draw_resolution_scale_y();
+  uint32_t dest_tile_width_samples =
+      xenos::kEdramTileWidthSamples * dest_scale_x;
+  uint32_t dest_tile_height_samples =
+      xenos::kEdramTileHeightSamples * dest_scale_y;
+  uint32_t source_tile_width_samples =
+      xenos::kEdramTileWidthSamples * source_scale_x;
+  uint32_t source_tile_height_samples =
+      xenos::kEdramTileHeightSamples * source_scale_y;
 
   // Split the destination pixel index into 32bpp tile in r0.zw and
   // 32bpp-tile-relative pixel index in r0.xy.
   // r0.xy = pixel XY as uint
   a.OpFToU(dxbc::Dest::R(0, 0b0011), dxbc::Src::V1D(kInputRegisterPosition));
   uint32_t dest_tile_width_pixels =
-      tile_width_samples >>
+      dest_tile_width_samples >>
       (uint32_t(dest_is_64bpp) + uint32_t(key.dest_msaa_samples >= xenos::MsaaSamples::k4X));
   uint32_t dest_tile_height_pixels =
-      tile_height_samples >> uint32_t(key.dest_msaa_samples >= xenos::MsaaSamples::k2X);
+      dest_tile_height_samples >>
+      uint32_t(key.dest_msaa_samples >= xenos::MsaaSamples::k2X);
   // r0.xy = destination pixel XY index within the 32bpp tile
   // r0.zw = 32bpp tile XY index
   a.OpUDiv(dxbc::Dest::R(0, 0b1100), dxbc::Dest::R(0, 0b0011), dxbc::Src::R(0, 0b01000100),
@@ -2611,6 +4434,26 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   // r1.x = free
   a.OpUMAd(dxbc::Dest::R(0, 0b0100), dxbc::Src::R(1, dxbc::Src::kXXXX),
            dxbc::Src::R(0, dxbc::Src::kWWWW), dxbc::Src::R(0, dxbc::Src::kZZZZ));
+
+  if (cross_scale_class) {
+    // Convert tile-local destination coordinates to source scale space. The
+    // remaining address remapping assumes both sides use one scale.
+    a.OpMov(dxbc::Dest::R(3, 0b0011), dxbc::Src::R(0));
+    if (key.dest_scale_native) {
+      // Native destination reading a scaled source: choose the center host
+      // sample corresponding to each guest pixel.
+      a.OpUMAd(dxbc::Dest::R(0, 0b0011),
+               dxbc::Src::LU(source_scale_x, source_scale_y, 0, 0),
+               dxbc::Src::R(0),
+               dxbc::Src::LU(source_scale_x >> 1, source_scale_y >> 1, 0,
+                             0));
+    } else {
+      // Scaled destination reading a native source: duplicate guest pixels.
+      a.OpUDiv(dxbc::Dest::R(0, 0b0011), dxbc::Dest::Null(),
+               dxbc::Src::R(0),
+               dxbc::Src::LU(dest_scale_x, dest_scale_y, 1, 1));
+    }
+  }
 
   // Now the tile index doesn't have any dependencies on the destination. The
   // dword index within the source tile, however, is calculated from both the
@@ -2634,264 +4477,40 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   dxbc::Src source_sample(dest_sample);
   uint32_t source_tile_pixel_x_reg = 0;
   uint32_t source_tile_pixel_y_reg = 0;
-
-  // First sample bit at 4x in Direct3D 10.1+ - horizontal sample.
-  // Second sample bit at 4x in Direct3D 10.1+ - vertical sample.
-  // At 2x:
-  // - Native 2x: top is 1 in Direct3D 10.1+, bottom is 0.
-  // - 2x as 4x: top is 0, bottom is 3.
-
-  if (!source_is_64bpp && dest_is_64bpp) {
-    // 32bpp -> 64bpp, need two samples of the source.
-    if (key.source_msaa_samples >= xenos::MsaaSamples::k4X) {
-      // 32bpp -> 64bpp, 4x ->.
-      // Source has 32bpp halves in two adjacent samples.
-      if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-        // 32bpp -> 64bpp, 4x -> 4x.
-        // 1 destination horizontal sample = 2 source horizontal samples.
-        // D p0,0 s0,0 = S p0,0 s0,0 | S p0,0 s1,0
-        // D p0,0 s1,0 = S p1,0 s0,0 | S p1,0 s1,0
-        // D p0,0 s0,1 = S p0,0 s0,1 | S p0,0 s1,1
-        // D p0,0 s1,1 = S p1,0 s0,1 | S p1,0 s1,1
-        // Thus destination horizontal sample -> source horizontal pixel,
-        // vertical samples are 1:1.
-        a.OpAnd(dxbc::Dest::R(1, 0b0100), dest_sample, dxbc::Src::LU(0b10));
-        source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                dxbc::Src::R(0, dxbc::Src::kXXXX),
-                dxbc::Src::V1D(kInputRegisterSampleIndex, dxbc::Src::kXXXX));
-        source_tile_pixel_x_reg = 1;
-      } else if (key.dest_msaa_samples == xenos::MsaaSamples::k2X) {
-        // 32bpp -> 64bpp, 4x -> 2x.
-        // 1 destination horizontal pixel = 2 source horizontal samples.
-        // D p0,0 s0 = S p0,0 s0,0 | S p0,0 s1,0
-        // D p0,0 s1 = S p0,0 s0,1 | S p0,0 s1,1
-        // D p1,0 s0 = S p1,0 s0,0 | S p1,0 s1,0
-        // D p1,0 s1 = S p1,0 s0,1 | S p1,0 s1,1
-        // Pixel index can be reused. Sample 1 (for native 2x) or 0 (for 2x as
-        // 4x) should become samples 01, sample 0 or 3 should become samples 23.
-        source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        if (msaa_2x_supported_) {
-          a.OpXOr(dxbc::Dest::R(1, 0b0100), dest_sample, dxbc::Src::LU(1));
-          a.OpIShL(dxbc::Dest::R(1, 0b0100), source_sample, dxbc::Src::LU(1));
-        } else {
-          a.OpAnd(dxbc::Dest::R(1, 0b0100), dest_sample, dxbc::Src::LU(0b10));
-        }
-      } else {
-        // 32bpp -> 64bpp, 4x -> 1x.
-        // 1 destination horizontal pixel = 2 source horizontal samples.
-        // D p0,0 = S p0,0 s0,0 | S p0,0 s1,0
-        // D p0,1 = S p0,0 s0,1 | S p0,0 s1,1
-        // Horizontal pixel index can be reused. Vertical pixel 1 should
-        // become sample 2.
-        a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::LU(0));
-        source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        a.OpUShR(dxbc::Dest::R(1, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::LU(1));
-        source_tile_pixel_y_reg = 1;
-      }
-    } else {
-      // 32bpp -> 64bpp, 1x/2x ->.
-      // Source has 32bpp halves in two adjacent pixels.
-      if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-        // 32bpp -> 64bpp, 1x/2x -> 4x.
-        // The X part.
-        // 1 destination horizontal sample = 2 source horizontal pixels.
-        a.OpIShL(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(2));
-        a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                dxbc::Src::V1D(kInputRegisterSampleIndex, dxbc::Src::kXXXX),
-                dxbc::Src::R(1, dxbc::Src::kXXXX));
-        source_tile_pixel_x_reg = 1;
-        // Y is handled by common code.
-      } else {
-        // 32bpp -> 64bpp, 1x/2x -> 1x/2x.
-        // The X part.
-        // 1 destination horizontal pixel = 2 source horizontal pixels.
-        a.OpIShL(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-        source_tile_pixel_x_reg = 1;
-        // Y is handled by common code.
-      }
+  // Remap destination samples to source samples through canonical EDRAM sample
+  // coordinates. All 1x, 2x and 4x views of an allocation share this layout.
+  if (key.source_msaa_samples != key.dest_msaa_samples ||
+      source_is_64bpp != dest_is_64bpp) {
+    dxbc::Src canonical_u(dxbc::Src::R(0, dxbc::Src::kXXXX));
+    dxbc::Src canonical_v(dxbc::Src::R(0, dxbc::Src::kYYYY));
+    bool canonical_scaled;
+    CanonicalizeSample(a, key.dest_msaa_samples, dest_sample,
+                       msaa_2x_supported_, source_scale_x, source_scale_y,
+                       canonical_u, canonical_v, canonical_scaled);
+    if (dest_is_64bpp && !source_is_64bpp) {
+      // A 64bpp destination sample is formed from two adjacent canonical
+      // 32bpp source columns.
+      a.OpIShL(dxbc::Dest::R(1, 0b0001), canonical_u, dxbc::Src::LU(1));
+      canonical_u = dxbc::Src::R(1, dxbc::Src::kXXXX);
+    } else if (!dest_is_64bpp && source_is_64bpp) {
+      // Select one half of the 64bpp source sample.
+      a.OpAnd(dxbc::Dest::R(0, 0b1000), canonical_u, dxbc::Src::LU(1));
+      a.OpUShR(dxbc::Dest::R(1, 0b0001), canonical_u, dxbc::Src::LU(1));
+      canonical_u = dxbc::Src::R(1, dxbc::Src::kXXXX);
     }
-  } else if (source_is_64bpp && !dest_is_64bpp) {
-    // 64bpp -> 32bpp, also the half to r0.w.
-    if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-      // 64bpp -> 32bpp, -> 4x.
-      // The needed half is in the destination horizontal sample index.
-      if (key.source_msaa_samples >= xenos::MsaaSamples::k4X) {
-        // 64bpp -> 32bpp, 4x -> 4x.
-        // D p0,0 s0,0 = S s0,0 low
-        // D p0,0 s1,0 = S s0,0 high
-        // D p1,0 s0,0 = S s1,0 low
-        // D p1,0 s1,0 = S s1,0 high
-        // Vertical pixel and sample (second bit) addressing is the same.
-        // However, 1 horizontal destination pixel = 1 horizontal source sample.
-        a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(0),
-                dxbc::Src::R(0, dxbc::Src::kXXXX), dest_sample);
-        source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        // 2 destination horizontal samples = 1 source horizontal sample, thus
-        // 2 destination horizontal pixels = 1 source horizontal pixel.
-        a.OpUShR(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-        source_tile_pixel_x_reg = 1;
-      } else {
-        // 64bpp -> 32bpp, 1x/2x -> 4x.
-        // 2 destination horizontal samples = 1 source horizontal pixel, thus
-        // 1 destination horizontal pixel = 1 source horizontal pixel. Can reuse
-        // horizontal pixel index.
-        // Y is handled by common code.
-      }
-      // Half in r0.w from the destination horizontal sample index.
-      a.OpAnd(dxbc::Dest::R(0, 0b1000), dest_sample, dxbc::Src::LU(1));
-    } else {
-      // 64bpp -> 32bpp, -> 1x/2x.
-      // The needed half is in the destination horizontal pixel index.
-      if (key.source_msaa_samples >= xenos::MsaaSamples::k4X) {
-        // 64bpp -> 32bpp, 4x -> 1x/2x.
-        // (Destination horizontal pixel >> 1) & 1 = source horizontal sample
-        // (first bit).
-        a.OpUBFE(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                 dxbc::Src::R(0, dxbc::Src::kXXXX));
-        source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        if (key.dest_msaa_samples == xenos::MsaaSamples::k2X) {
-          // 64bpp -> 32bpp, 4x -> 2x.
-          // Destination vertical samples (1/0 in the first bit for native 2x or
-          // 0/1 in the second bit for 2x as 4x) = source vertical samples
-          // (second bit).
-          if (msaa_2x_supported_) {
-            a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1), dest_sample,
-                    source_sample);
-            a.OpXOr(dxbc::Dest::R(1, 0b0100), source_sample, dxbc::Src::LU(1 << 1));
-          } else {
-            a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(0), source_sample,
-                    dest_sample);
-          }
-        } else {
-          // 64bpp -> 32bpp, 4x -> 1x.
-          // 1 destination vertical pixel = 1 source vertical sample.
-          a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                  dxbc::Src::R(0, dxbc::Src::kYYYY), source_sample);
-          a.OpUShR(dxbc::Dest::R(1, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::LU(1));
-          source_tile_pixel_y_reg = 1;
-        }
-        // 2 destination horizontal pixels = 1 source horizontal sample.
-        // 4 destination horizontal pixels = 1 source horizontal pixel.
-        a.OpUShR(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(2));
-        source_tile_pixel_x_reg = 1;
-      } else {
-        // 64bpp -> 32bpp, 1x/2x -> 1x/2x.
-        // The X part.
-        // 2 destination horizontal pixels = 1 destination source pixel.
-        a.OpUShR(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-        source_tile_pixel_x_reg = 1;
-        // Y is handled by common code.
-      }
-      // Half in r0.w from the destination horizontal pixel index.
-      a.OpAnd(dxbc::Dest::R(0, 0b1000), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-    }
-  } else {
-    // Same bit count.
-    if (key.source_msaa_samples != key.dest_msaa_samples) {
-      if (key.source_msaa_samples >= xenos::MsaaSamples::k4X) {
-        // Same BPP, 4x -> 1x/2x.
-        if (key.dest_msaa_samples == xenos::MsaaSamples::k2X) {
-          // Same BPP, 4x -> 2x.
-          // Horizontal pixels to samples. Vertical sample (1/0 in the first bit
-          // for native 2x or 0/1 in the second bit for 2x as 4x) to second
-          // sample bit.
-          source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-          if (msaa_2x_supported_) {
-            a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(31), dxbc::Src::LU(1), dest_sample,
-                    dxbc::Src::R(0, dxbc::Src::kXXXX));
-            a.OpXOr(dxbc::Dest::R(1, 0b0100), source_sample, dxbc::Src::LU(1 << 1));
-          } else {
-            a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(0),
-                    dxbc::Src::R(0, dxbc::Src::kXXXX), dest_sample);
-          }
-          a.OpUShR(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-          source_tile_pixel_x_reg = 1;
-        } else {
-          // Same BPP, 4x -> 1x.
-          // Pixels to samples.
-          a.OpAnd(dxbc::Dest::R(1, 0b0100), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-          source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-          a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                  dxbc::Src::R(0, dxbc::Src::kYYYY), source_sample);
-          a.OpUShR(dxbc::Dest::R(1, 0b0011), dxbc::Src::R(0), dxbc::Src::LU(1));
-          source_tile_pixel_x_reg = 1;
-          source_tile_pixel_y_reg = 1;
-        }
-      } else {
-        // Same BPP, 1x/2x -> 1x/2x/4x (as long as they're different).
-        // Only the X part - Y is handled by common code.
-        if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-          // Horizontal samples to pixels.
-          a.OpBFI(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                  dxbc::Src::R(0, dxbc::Src::kXXXX), dest_sample);
-          source_tile_pixel_x_reg = 1;
-        }
-      }
-    }
+    dxbc::Src source_pixel_x(canonical_u);
+    dxbc::Src source_pixel_y(canonical_v);
+    DecanonicalizeSample(a, key.source_msaa_samples, canonical_u, canonical_v,
+                         canonical_scaled, msaa_2x_supported_, source_scale_x,
+                         source_scale_y, source_pixel_x, source_pixel_y,
+                         source_sample);
+    source_tile_pixel_x_reg = 1;
+    source_tile_pixel_y_reg =
+        (key.source_msaa_samples == xenos::MsaaSamples::k1X &&
+         key.dest_msaa_samples == xenos::MsaaSamples::k1X && !canonical_scaled)
+            ? 0
+            : 1;
   }
-  // Common source Y and sample index for 1x/2x AA sources, independent of bits
-  // per sample.
-  if (key.source_msaa_samples < xenos::MsaaSamples::k4X &&
-      key.source_msaa_samples != key.dest_msaa_samples) {
-    if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-      // 1x/2x -> 4x.
-      if (key.source_msaa_samples == xenos::MsaaSamples::k2X) {
-        // 2x -> 4x.
-        // Vertical samples (second bit) of 4x destination to vertical sample
-        // (1, 0 for native 2x, or 0, 3 for 2x as 4x) of 2x source.
-        a.OpUShR(dxbc::Dest::R(1, 0b0100), dest_sample, dxbc::Src::LU(1));
-        source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        if (msaa_2x_supported_) {
-          a.OpXOr(dxbc::Dest::R(1, 0b0100), source_sample, dxbc::Src::LU(1));
-        } else {
-          a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1), source_sample,
-                  source_sample);
-        }
-      } else {
-        // 1x -> 4x.
-        // Vertical samples (second bit) to Y pixels.
-        a.OpUShR(dxbc::Dest::R(1, 0b0010), dest_sample, dxbc::Src::LU(1));
-        a.OpBFI(dxbc::Dest::R(1, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::R(1, dxbc::Src::kYYYY));
-        source_tile_pixel_y_reg = 1;
-      }
-    } else {
-      // 1x/2x -> different 1x/2x.
-      if (key.source_msaa_samples == xenos::MsaaSamples::k2X) {
-        // 2x -> 1x.
-        // Vertical pixels of 2x destination to vertical samples (1, 0 for
-        // native 2x, or 0, 3 for 2x as 4x) of 1x source.
-        a.OpAnd(dxbc::Dest::R(1, 0b0100), dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::LU(1));
-        source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        if (msaa_2x_supported_) {
-          a.OpXOr(dxbc::Dest::R(1, 0b0100), source_sample, dxbc::Src::LU(1));
-        } else {
-          a.OpBFI(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1), source_sample,
-                  source_sample);
-        }
-        a.OpUShR(dxbc::Dest::R(1, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::LU(1));
-        source_tile_pixel_y_reg = 1;
-      } else {
-        // 1x -> 2x.
-        // Vertical samples (1/0 in the first bit for native 2x or 0/1 in the
-        // second bit for 2x as 4x) of 2x destination to vertical pixels of 1x
-        // source.
-        if (msaa_2x_supported_) {
-          a.OpBFI(dxbc::Dest::R(1, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                  dxbc::Src::R(0, dxbc::Src::kYYYY), dest_sample);
-          a.OpXOr(dxbc::Dest::R(1, 0b0010), dxbc::Src::R(1, dxbc::Src::kYYYY), dxbc::Src::LU(1));
-        } else {
-          a.OpUShR(dxbc::Dest::R(1, 0b0010), dest_sample, dxbc::Src::LU(1));
-          a.OpBFI(dxbc::Dest::R(1, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                  dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::R(1, dxbc::Src::kYYYY));
-        }
-        source_tile_pixel_y_reg = 1;
-      }
-    }
-  }
-
   uint32_t source_pixel_width_dwords_log2 =
       uint32_t(key.source_msaa_samples >= xenos::MsaaSamples::k4X) + uint32_t(source_is_64bpp);
 
@@ -2899,7 +4518,7 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
     // Copying between color and depth / stencil - swap 40-32bpp-sample columns
     // in the pixel index within the source 32bpp tile using r1.w as temporary.
     uint32_t source_32bpp_tile_half_pixels =
-        tile_width_samples >> (1 + source_pixel_width_dwords_log2);
+        source_tile_width_samples >> (1 + source_pixel_width_dwords_log2);
     a.OpULT(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(source_tile_pixel_x_reg, dxbc::Src::kXXXX),
             dxbc::Src::LU(source_32bpp_tile_half_pixels));
     a.OpMovC(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW),
@@ -2941,13 +4560,15 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
            dxbc::Src::R(2, dxbc::Src::kXXXX));
   // r1.x = pixel X within the source texture
   // r2.x = free
-  a.OpUMAd(
-      dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(tile_width_samples >> source_pixel_width_dwords_log2),
-      dxbc::Src::R(2, dxbc::Src::kXXXX), dxbc::Src::R(source_tile_pixel_x_reg, dxbc::Src::kXXXX));
+  a.OpUMAd(dxbc::Dest::R(1, 0b0001),
+           dxbc::Src::LU(source_tile_width_samples >>
+                         source_pixel_width_dwords_log2),
+           dxbc::Src::R(2, dxbc::Src::kXXXX),
+           dxbc::Src::R(source_tile_pixel_x_reg, dxbc::Src::kXXXX));
   // r1.y = pixel Y within the source texture
   // r1.w = free
   a.OpUMAd(dxbc::Dest::R(1, 0b0010),
-           dxbc::Src::LU(tile_height_samples >>
+           dxbc::Src::LU(source_tile_height_samples >>
                          uint32_t(key.source_msaa_samples >= xenos::MsaaSamples::k2X)),
            dxbc::Src::R(1, dxbc::Src::kWWWW),
            dxbc::Src::R(source_tile_pixel_y_reg, dxbc::Src::kYYYY));
@@ -2978,13 +4599,11 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
                  source_sample);
       }
       if (source_load_is_two_dwords && !i) {
-        // Go to the next sample or pixel along X if need to load two dwords.
-        if (key.source_msaa_samples >= xenos::MsaaSamples::k4X) {
-          a.OpOr(dxbc::Dest::R(1, 0b0100), source_sample, dxbc::Src::LU(1));
-          source_sample = dxbc::Src::R(1, dxbc::Src::kZZZZ);
-        } else {
-          a.OpOr(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-        }
+        // The high 32bpp half of a 64bpp destination sample is the same
+        // sample of the horizontally adjacent source pixel in canonical space.
+        a.OpIAdd(dxbc::Dest::R(1, 0b0001),
+                 dxbc::Src::R(1, dxbc::Src::kXXXX),
+                 dxbc::Src::LU(source_scale_x));
       }
     }
   } else {
@@ -3006,8 +4625,9 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
                dxbc::Src::T(srv_index_color, kTransferSRVRegisterColor));
       }
       if (source_load_is_two_dwords && !i) {
-        // Go to the next pixel along X if need to load two dwords.
-        a.OpOr(dxbc::Dest::R(1, 0b0001), dxbc::Src::R(1, dxbc::Src::kXXXX), dxbc::Src::LU(1));
+        a.OpIAdd(dxbc::Dest::R(1, 0b0001),
+                 dxbc::Src::R(1, dxbc::Src::kXXXX),
+                 dxbc::Src::LU(source_scale_x));
       }
     }
   }
@@ -3331,7 +4951,7 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
     } else if (rs & kTransferUsedRootParameterDepthSRVBit) {
       if (dest_is_color || dest_depth_format != source_depth_format) {
         // Need to reinterpret the depth value as color or as a different depth
-        // format. Convert the depth within r1.w.
+        // format.
         depth_loaded_in_guest_format = true;
         switch (source_depth_format) {
           case xenos::DepthRenderTargetFormat::kD24S8: {
@@ -3458,6 +5078,11 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
             // r0.z = 32bpp tile index relative to the destination base
             // r1.w = depth in guest format
 
+            if (cross_scale_class) {
+              // Host-depth sources always share the destination scale.
+              a.OpMov(dxbc::Dest::R(0, 0b0011), dxbc::Src::R(3));
+            }
+
             if (key.host_depth_source_is_copy) {
               // Get the address in the EDRAM scratch buffer and load from
               // there.
@@ -3492,10 +5117,12 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
               // The tile index doesn't need to be wrapped, as the host depth is
               // written to the beginning of the buffer, without the base
               // offset.
-              a.OpUMAd(dxbc::Dest::R(0, 0b0001), dxbc::Src::LU(tile_width_samples),
+              a.OpUMAd(dxbc::Dest::R(0, 0b0001),
+                       dxbc::Src::LU(dest_tile_width_samples),
                        dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::R(0, dxbc::Src::kXXXX));
               a.OpUMAd(dxbc::Dest::R(0, 0b0001),
-                       dxbc::Src::LU(tile_width_samples * tile_height_samples),
+                       dxbc::Src::LU(dest_tile_width_samples *
+                                     dest_tile_height_samples),
                        dxbc::Src::R(0, dxbc::Src::kZZZZ), dxbc::Src::R(0, dxbc::Src::kXXXX));
               // Load from the buffer.
               a.OpLd(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX), 0b0001,
@@ -3524,110 +5151,24 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
               // render target, but for 32bpp -> 32bpp only.
               dxbc::Src host_depth_source_sample(dest_sample);
               if (key.host_depth_source_msaa_samples != key.dest_msaa_samples) {
-                if (key.host_depth_source_msaa_samples >= xenos::MsaaSamples::k4X) {
-                  // 4x -> 1x/2x.
-                  if (key.dest_msaa_samples == xenos::MsaaSamples::k2X) {
-                    // 4x -> 2x.
-                    // Horizontal pixels to samples. Vertical sample (1, 0 in
-                    // the first bit for native 2x or 0, 1 in the second bit for
-                    // 2x as 4x) to second sample bit.
-                    host_depth_source_sample = dxbc::Src::R(0, dxbc::Src::kWWWW);
-                    if (msaa_2x_supported_) {
-                      a.OpBFI(dxbc::Dest::R(0, 0b1000), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                              dest_sample, dxbc::Src::R(0, dxbc::Src::kXXXX));
-                      a.OpXOr(dxbc::Dest::R(0, 0b1000), host_depth_source_sample,
-                              dxbc::Src::LU(1 << 1));
-                    } else {
-                      a.OpBFI(dxbc::Dest::R(0, 0b1000), dxbc::Src::LU(1), dxbc::Src::LU(0),
-                              dxbc::Src::R(0, dxbc::Src::kXXXX), dest_sample);
-                    }
-                    a.OpUShR(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX),
-                             dxbc::Src::LU(1));
-                  } else {
-                    // 4x -> 1x.
-                    // Pixels to samples.
-                    a.OpAnd(dxbc::Dest::R(0, 0b1000), dxbc::Src::R(0, dxbc::Src::kXXXX),
-                            dxbc::Src::LU(1));
-                    host_depth_source_sample = dxbc::Src::R(0, dxbc::Src::kWWWW);
-                    a.OpBFI(dxbc::Dest::R(0, 0b1000), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                            dxbc::Src::R(0, dxbc::Src::kYYYY), host_depth_source_sample);
-                    a.OpUShR(dxbc::Dest::R(0, 0b0011), dxbc::Src::R(0), dxbc::Src::LU(1));
-                  }
-                } else {
-                  // 1x/2x -> 1x/2x/4x (as long as they're different).
-                  // Only the X part - Y is handled by common code.
-                  if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-                    // Horizontal samples to pixels.
-                    a.OpBFI(dxbc::Dest::R(0, 0b0001), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                            dxbc::Src::R(0, dxbc::Src::kXXXX), dest_sample);
-                  }
-                }
-                // Host depth source Y and sample index for 1x/2x AA sources.
-                if (key.host_depth_source_msaa_samples < xenos::MsaaSamples::k4X) {
-                  if (key.dest_msaa_samples >= xenos::MsaaSamples::k4X) {
-                    // 1x/2x -> 4x.
-                    if (key.host_depth_source_msaa_samples == xenos::MsaaSamples::k2X) {
-                      // 2x -> 4x.
-                      // Vertical samples (second bit) of 4x destination to
-                      // vertical sample (1, 0 for native 2x, or 0, 3 for 2x as
-                      // 4x) of 2x source.
-                      a.OpUShR(dxbc::Dest::R(0, 0b1000), dest_sample, dxbc::Src::LU(1));
-                      host_depth_source_sample = dxbc::Src::R(0, dxbc::Src::kWWWW);
-                      if (msaa_2x_supported_) {
-                        a.OpXOr(dxbc::Dest::R(0, 0b1000), host_depth_source_sample,
-                                dxbc::Src::LU(1));
-                      } else {
-                        a.OpBFI(dxbc::Dest::R(0, 0b1000), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                                host_depth_source_sample, host_depth_source_sample);
-                      }
-                    } else {
-                      // 1x -> 4x.
-                      // Vertical samples (second bit) to Y pixels, using r0.w
-                      // (not needed without source MSAA) as a temporary.
-                      a.OpUShR(dxbc::Dest::R(0, 0b1000), dest_sample, dxbc::Src::LU(1));
-                      a.OpBFI(dxbc::Dest::R(0, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                              dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::R(0, dxbc::Src::kWWWW));
-                    }
-                  } else {
-                    // 1x/2x -> different 1x/2x.
-                    if (key.host_depth_source_msaa_samples == xenos::MsaaSamples::k2X) {
-                      // 2x -> 1x.
-                      // Vertical pixels of 2x destination to vertical samples
-                      // (1, 0 for native 2x, or 0, 3 for 2x as 4x) of 1x
-                      // source.
-                      a.OpAnd(dxbc::Dest::R(0, 0b1000), dxbc::Src::R(0, dxbc::Src::kYYYY),
-                              dxbc::Src::LU(1));
-                      host_depth_source_sample = dxbc::Src::R(0, dxbc::Src::kWWWW);
-                      if (msaa_2x_supported_) {
-                        a.OpXOr(dxbc::Dest::R(0, 0b1000), host_depth_source_sample,
-                                dxbc::Src::LU(1));
-                      } else {
-                        a.OpBFI(dxbc::Dest::R(0, 0b1000), dxbc::Src::LU(1), dxbc::Src::LU(1),
-                                host_depth_source_sample, host_depth_source_sample);
-                      }
-                      a.OpUShR(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY),
-                               dxbc::Src::LU(1));
-                    } else {
-                      // 1x -> 2x.
-                      // Vertical samples (1, 0 in the first bit for native 2x
-                      // or 0, 1 in the second bit for 2x as 4x) of 2x
-                      // destination to vertical pixels of 1x source.
-                      // Using r0.w (not needed without source MSAA) as a
-                      // temporary.
-                      if (msaa_2x_supported_) {
-                        a.OpBFI(dxbc::Dest::R(0, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                                dxbc::Src::R(0, dxbc::Src::kYYYY), dest_sample);
-                        a.OpXOr(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY),
-                                dxbc::Src::LU(1));
-                      } else {
-                        a.OpUShR(dxbc::Dest::R(0, 0b1000), dest_sample, dxbc::Src::LU(1));
-                        a.OpBFI(dxbc::Dest::R(0, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
-                                dxbc::Src::R(0, dxbc::Src::kYYYY),
-                                dxbc::Src::R(0, dxbc::Src::kWWWW));
-                      }
-                    }
-                  }
-                }
+                dxbc::Src host_depth_u(dxbc::Src::R(0, dxbc::Src::kXXXX));
+                dxbc::Src host_depth_v(dxbc::Src::R(0, dxbc::Src::kYYYY));
+                bool host_depth_scaled;
+                CanonicalizeSample(a, key.dest_msaa_samples, dest_sample,
+                                   msaa_2x_supported_, dest_scale_x,
+                                   dest_scale_y, host_depth_u, host_depth_v,
+                                   host_depth_scaled);
+                dxbc::Src host_depth_x(host_depth_u);
+                dxbc::Src host_depth_y(host_depth_v);
+                DecanonicalizeSample(a, key.host_depth_source_msaa_samples,
+                                     host_depth_u, host_depth_v,
+                                     host_depth_scaled, msaa_2x_supported_,
+                                     dest_scale_x, dest_scale_y, host_depth_x,
+                                     host_depth_y, host_depth_source_sample);
+                // The remapped coordinates are in r1.xy. The helpers preserve
+                // r1.w (guest depth), and the sample index is consumed before
+                // the pitch reuses r1.x.
+                a.OpMov(dxbc::Dest::R(0, 0b0011), dxbc::Src::R(1));
               }
               // r1.x = host depth source pitch in tiles
               a.OpUBFE(dxbc::Dest::R(1, 0b0001), dxbc::Src::LU(xenos::kEdramPitchTilesBits),
@@ -3642,14 +5183,16 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
               // r1.x = free
               a.OpUMAd(
                   dxbc::Dest::R(0, 0b0001),
-                  dxbc::Src::LU(tile_width_samples >> uint32_t(key.host_depth_source_msaa_samples >=
-                                                               xenos::MsaaSamples::k4X)),
+                  dxbc::Src::LU(
+                      dest_tile_width_samples >>
+                      uint32_t(key.host_depth_source_msaa_samples >=
+                               xenos::MsaaSamples::k4X)),
                   dxbc::Src::R(1, dxbc::Src::kXXXX), dxbc::Src::R(0, dxbc::Src::kXXXX));
               // r0.y = pixel Y within the host depth source texture
               // r0.z = free
               a.OpUMAd(dxbc::Dest::R(0, 0b0010),
                        dxbc::Src::LU(
-                           tile_height_samples >>
+                            dest_tile_height_samples >>
                            uint32_t(key.host_depth_source_msaa_samples >= xenos::MsaaSamples::k2X)),
                        dxbc::Src::R(0, dxbc::Src::kZZZZ), dxbc::Src::R(0, dxbc::Src::kYYYY));
               // Load from the host depth texture.
@@ -3951,11 +5494,63 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
   return pipelines;
 }
 
+void D3D12RenderTargetCache::RecordSceneUpdateTargets(
+    RenderTarget* const* targets, const std::vector<Transfer>* transfers,
+    embedded_scene_transfer_capture_policy::UpdateContext& c) {
+  const auto resource_id = [](RenderTarget* rt) -> unsigned long long {
+    return rt ? reinterpret_cast<uintptr_t>(static_cast<D3D12RenderTarget*>(rt)->resource()) : 0;
+  };
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (!targets[i]) continue;
+    ++c.targets;
+    if (c.Record()) {
+      const auto& rt = *static_cast<D3D12RenderTarget*>(targets[i]);
+      const auto desc = rt.resource()->GetDesc();
+      std::fprintf(stderr,
+          "REX_SCENE_UPDATE_TARGET frame=%llu update=%llu next_draw=%llu slot=%u resource=%016llX key=%08X "
+          "host_width=%llu host_height=%u host_format=%u host_samples=%u scale=%ux%u\n",
+          static_cast<unsigned long long>(c.frame), static_cast<unsigned long long>(c.update),
+          static_cast<unsigned long long>(c.next_draw), i, resource_id(targets[i]), rt.key().key,
+          static_cast<unsigned long long>(desc.Width), desc.Height, uint32_t(desc.Format), desc.SampleDesc.Count,
+          GetKeyScaleX(rt.key()), GetKeyScaleY(rt.key()));
+    }
+    for (const auto& transfer : transfers[i]) {
+      ++c.planned;
+      if (!c.Record()) continue;
+      std::fprintf(stderr,
+          "REX_SCENE_UPDATE_PLAN frame=%llu update=%llu next_draw=%llu slot=%u start=%u end=%u "
+          "source=%016llX source_key=%08X dest=%016llX dest_key=%08X host_depth=%016llX host_depth_key=%08X "
+          "scope=planned_transfer_not_execution\n",
+          static_cast<unsigned long long>(c.frame), static_cast<unsigned long long>(c.update),
+          static_cast<unsigned long long>(c.next_draw), i, transfer.start_tiles, transfer.end_tiles,
+          resource_id(transfer.source), transfer.source ? transfer.source->key().key : 0,
+          resource_id(targets[i]), targets[i]->key().key, resource_id(transfer.host_depth_source),
+          transfer.host_depth_source ? transfer.host_depth_source->key().key : 0);
+    }
+  }
+  OwnershipSnapshot owners[32];
+  c.owners = CopyOwnershipSnapshot(owners, uint32_t(rex::countof(owners)));
+  if (c.owners > rex::countof(owners)) c.Drop(c.owners - uint32_t(rex::countof(owners)));
+  for (uint32_t i = 0; i < std::min(c.owners, uint32_t(rex::countof(owners))); ++i) {
+    if (!c.Record()) continue;
+    const auto& owner = owners[i];
+    std::fprintf(stderr,
+        "REX_SCENE_UPDATE_OWNER frame=%llu update=%llu next_draw=%llu owner=%u start=%u end=%u "
+        "resource=%016llX key=%08X host_depth_unorm=%08X host_depth_float=%08X "
+        "scope=post_update_bookkeeping_not_transfer_completion\n",
+        static_cast<unsigned long long>(c.frame), static_cast<unsigned long long>(c.update),
+        static_cast<unsigned long long>(c.next_draw), i, owner.start, owner.end,
+        resource_id(owner.render_target), owner.key, owner.host_depth_unorm, owner.host_depth_float);
+  }
+}
+
 void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     uint32_t render_target_count, RenderTarget* const* render_targets,
     const std::vector<Transfer>* render_target_transfers,
     const uint64_t* render_target_resolve_clear_values,
-    const Transfer::Rectangle* resolve_clear_rectangle) {
+    const Transfer::Rectangle* resolve_clear_rectangle,
+    const embedded_scene_resolve_capture_policy::Context* scene_capture_context,
+    embedded_scene_transfer_capture_policy::UpdateContext* update_capture) {
   assert_true(GetPath() == Path::kHostRenderTargets);
 
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
@@ -3963,19 +5558,42 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
   uint64_t current_submission = command_processor_.GetCurrentSubmission();
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
 
-  bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
+  embedded_scene_resolve_capture_policy::ClearCommands scene_clear_command_budget;
+  const auto record_update_failure = [&](const char* reason) {
+    if (!update_capture) return;
+    ++update_capture->failures;
+    if (!update_capture->Record()) return;
+    const auto& c = *update_capture;
+    std::fprintf(stderr,
+        "REX_SCENE_UPDATE_FAILURE frame=%llu update=%llu next_draw=%llu reason=%s submission=%llu\n",
+        static_cast<unsigned long long>(c.frame), static_cast<unsigned long long>(c.update),
+        static_cast<unsigned long long>(c.next_draw), reason,
+        static_cast<unsigned long long>(command_processor_.GetCurrentSubmission()));
+  };
   D3D12_RECT clear_rect;
+  bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
   if (resolve_clear_needed) {
+    uint32_t resolve_clear_scale_x = draw_resolution_scale_x();
+    uint32_t resolve_clear_scale_y = draw_resolution_scale_y();
+    for (uint32_t i = 0; i < render_target_count; ++i) {
+      if (render_targets[i]) {
+        resolve_clear_scale_x = GetKeyScaleX(render_targets[i]->key());
+        resolve_clear_scale_y = GetKeyScaleY(render_targets[i]->key());
+        break;
+      }
+    }
     // Assuming the rectangle is already clamped by the setup function from the
     // common render target cache.
-    clear_rect.left = LONG(resolve_clear_rectangle->x_pixels * draw_resolution_scale_x());
-    clear_rect.top = LONG(resolve_clear_rectangle->y_pixels * draw_resolution_scale_y());
+    clear_rect.left =
+        LONG(resolve_clear_rectangle->x_pixels * resolve_clear_scale_x);
+    clear_rect.top =
+        LONG(resolve_clear_rectangle->y_pixels * resolve_clear_scale_y);
     clear_rect.right =
         LONG((resolve_clear_rectangle->x_pixels + resolve_clear_rectangle->width_pixels) *
-             draw_resolution_scale_x());
+             resolve_clear_scale_x);
     clear_rect.bottom =
         LONG((resolve_clear_rectangle->y_pixels + resolve_clear_rectangle->height_pixels) *
-             draw_resolution_scale_y());
+             resolve_clear_scale_y);
   }
 
   // Do host depth storing for the depth destination (assuming there can be only
@@ -3996,6 +5614,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       if (transfer.host_depth_source != dest_rt) {
         continue;
       }
+      assert_false(dest_rt_key.scale_native);
       if (!host_depth_store_set_up) {
         // Bindings.
         // 0 - source.
@@ -4003,6 +5622,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         ui::d3d12::util::DescriptorCpuGpuHandlePair host_depth_store_descriptors[2];
         if (!command_processor_.RequestOneUseSingleViewDescriptors(
                 1 + uint32_t(!bindless_resources_used_), host_depth_store_descriptors)) {
+          record_update_failure("host_depth_store_descriptors");
           continue;
         }
         command_list.D3DSetComputeRootSignature(host_depth_store_root_signature_);
@@ -4066,9 +5686,50 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             sizeof(host_depth_store_rectangle_constant) / sizeof(uint32_t),
             &host_depth_store_rectangle_constant,
             offsetof(HostDepthStoreConstants, rectangle) / sizeof(uint32_t));
-        command_processor_.SubmitBarriers();
-        command_list.D3DDispatch(group_count_x, group_count_y, 1);
+        {
+          D3D12CommandProcessor::GpuTimingScope host_depth_timing(
+              command_processor_, GpuTimingCategory::kTransferHostDepth);
+          command_processor_.SubmitBarriers();
+          command_list.D3DDispatch(group_count_x, group_count_y, 1);
+        }
+        if (command_processor_.GpuTimingEnabled()) {
+          const uint64_t samples = (uint64_t(transfer_rectangles[j].width_pixels) *
+                                    transfer_rectangles[j].height_pixels *
+                                    GetKeyScaleX(dest_rt_key) * GetKeyScaleY(dest_rt_key))
+                                   << uint32_t(dest_rt_key.msaa_samples);
+          command_processor_.GpuTimingCount(GpuTimingCounter::kHostDepthStores, 1);
+          command_processor_.GpuTimingCount(GpuTimingCounter::kHostDepthStoreSamples, samples);
+          if (command_processor_.GpuTimingTransferLogFrame()) {
+            std::fprintf(stderr,
+                         "REX_GPU_TRANSFER_HOST_DEPTH_STORE frame=%llu dest_key=%08X base=%u "
+                         "pitch=%u msaa=%u rect=%u,%u,%u,%u samples=%llu\n",
+                         static_cast<unsigned long long>(command_processor_.GetCurrentFrame()),
+                         dest_rt_key.key, dest_rt_key.base_tiles, dest_rt_key.GetPitchTiles(),
+                         uint32_t(dest_rt_key.msaa_samples), transfer_rectangles[j].x_pixels,
+                         transfer_rectangles[j].y_pixels, transfer_rectangles[j].width_pixels,
+                         transfer_rectangles[j].height_pixels,
+                         static_cast<unsigned long long>(samples));
+          }
+        }
         MarkEdramBufferModified();
+        if (update_capture) {
+          ++update_capture->depth_stores;
+          if (update_capture->Record()) {
+            const auto& c = *update_capture;
+            const auto& rect = transfer_rectangles[j];
+            std::fprintf(stderr,
+                "REX_SCENE_UPDATE_DEPTH_STORE frame=%llu update=%llu next_draw=%llu slot=%u "
+                "resource=%016llX key=%08X start=%u end=%u rect=%u,%u,%u,%u groups=%u,%u "
+                "submission=%llu scope=queued_host_depth_store_not_gpu_completion\n",
+                static_cast<unsigned long long>(c.frame), static_cast<unsigned long long>(c.update),
+                static_cast<unsigned long long>(c.next_draw), i,
+                static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(dest_d3d12_rt.resource())),
+                dest_rt_key.key, transfer.start_tiles, transfer.end_tiles,
+                rect.x_pixels, rect.y_pixels, rect.width_pixels, rect.height_pixels,
+                group_count_x, group_count_y,
+                static_cast<unsigned long long>(command_processor_.GetCurrentSubmission()));
+          }
+        }
       }
     }
     break;
@@ -4219,6 +5880,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
   current_temporary_descriptors_gpu_.resize(descriptor_count);
   if (!command_processor_.RequestOneUseSingleViewDescriptors(
           descriptor_count, current_temporary_descriptors_gpu_.data())) {
+    record_update_failure("transfer_descriptors");
     return;
   }
   for (uint32_t i = 0; i < descriptor_count; ++i) {
@@ -4231,8 +5893,6 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
 
   bool transfer_viewport_set = false;
   float pixels_to_ndc_unscaled = 2.0f / float(D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION);
-  float pixels_to_ndc_x = pixels_to_ndc_unscaled * draw_resolution_scale_x();
-  float pixels_to_ndc_y = pixels_to_ndc_unscaled * draw_resolution_scale_y();
 
   TransferRootSignatureIndex last_transfer_root_signature_index =
       TransferRootSignatureIndex::kCount;
@@ -4258,6 +5918,75 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
 
     auto& dest_d3d12_rt = *static_cast<D3D12RenderTarget*>(dest_rt);
     RenderTargetKey dest_rt_key = dest_d3d12_rt.key();
+    bool capture_embedded_mixed_scale_dest_after_transfer = false;
+
+    // Probe160 localized the first bad scaled scene writer to a pass whose
+    // color shader is unconditional, but whose depth/stencil test consumes the
+    // D24FS8 surface at EDRAM base 0. Record only ownership changes for that
+    // exact surface. This is observational, disabled by default, and bounded
+    // across the process lifetime so it can't become per-frame tracing.
+    static uint32_t embedded_scene_depth_transfer_trace_count = 0;
+    const bool trace_embedded_scene_depth_transfer =
+        REXCVAR_GET(embedded_scene_depth_transfer_trace) &&
+        embedded_scene_depth_transfer_trace_count < 32 &&
+        dest_rt_key.is_depth && !dest_rt_key.scale_native &&
+        dest_rt_key.base_tiles == 0 &&
+        dest_rt_key.pitch_tiles_at_32bpp == 16 &&
+        dest_rt_key.msaa_samples == xenos::MsaaSamples::k2X &&
+        dest_rt_key.GetDepthFormat() ==
+            xenos::DepthRenderTargetFormat::kD24FS8 &&
+        !current_transfers.empty();
+    if (trace_embedded_scene_depth_transfer) {
+      const uint32_t trace_ordinal =
+          ++embedded_scene_depth_transfer_trace_count;
+      std::fprintf(
+          stderr,
+          "REX_EMBEDDED_SCENE_DEPTH_TRANSFER ordinal=%u dest_key=0x%08X "
+          "dest_scale=%ux%u transfers=%llu clear=%u\n",
+          trace_ordinal, dest_rt_key.key, GetKeyScaleX(dest_rt_key),
+          GetKeyScaleY(dest_rt_key),
+          static_cast<unsigned long long>(current_transfers.size()),
+          resolve_clear_needed ? 1u : 0u);
+      for (size_t transfer_index = 0;
+           transfer_index < current_transfers.size(); ++transfer_index) {
+        const Transfer& transfer = current_transfers[transfer_index];
+        assert_not_null(transfer.source);
+        const RenderTargetKey source_key = transfer.source->key();
+        const RenderTargetKey host_depth_key =
+            transfer.host_depth_source
+                ? transfer.host_depth_source->key()
+                : RenderTargetKey();
+        Transfer::Rectangle rectangles[Transfer::kMaxRectanglesWithCutout];
+        const uint32_t rectangle_count = transfer.GetRectangles(
+            dest_rt_key.base_tiles, dest_rt_key.GetPitchTiles(),
+            dest_rt_key.msaa_samples, dest_rt_key.Is64bpp(), rectangles,
+            resolve_clear_rectangle);
+        std::fprintf(
+            stderr,
+            "REX_EMBEDDED_SCENE_DEPTH_TRANSFER_SOURCE ordinal=%u index=%llu "
+            "tiles=%u-%u source_key=0x%08X source_depth=%u "
+            "source_scale=%ux%u source_msaa=%u source_format=%u "
+            "host_depth_key=0x%08X rectangles=%u\n",
+            trace_ordinal, static_cast<unsigned long long>(transfer_index),
+            transfer.start_tiles, transfer.end_tiles, source_key.key,
+            source_key.is_depth, GetKeyScaleX(source_key),
+            GetKeyScaleY(source_key), uint32_t(source_key.msaa_samples),
+            source_key.resource_format, host_depth_key.key, rectangle_count);
+        for (uint32_t rectangle_index = 0;
+             rectangle_index < rectangle_count; ++rectangle_index) {
+          const Transfer::Rectangle& rectangle = rectangles[rectangle_index];
+          std::fprintf(
+              stderr,
+              "REX_EMBEDDED_SCENE_DEPTH_TRANSFER_RECT ordinal=%u "
+              "source=%llu rectangle=%u xy=%u,%u size=%ux%u\n",
+              trace_ordinal,
+              static_cast<unsigned long long>(transfer_index), rectangle_index,
+              rectangle.x_pixels, rectangle.y_pixels,
+              rectangle.width_pixels, rectangle.height_pixels);
+        }
+      }
+      std::fflush(stderr);
+    }
 
     // Late barrier in case there was cross-copying that prevented merging of
     // barriers.
@@ -4284,6 +6013,10 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
 
       uint32_t dest_pitch_tiles = dest_rt_key.GetPitchTiles();
       bool dest_is_64bpp = dest_rt_key.Is64bpp();
+      float pixels_to_ndc_x =
+          pixels_to_ndc_unscaled * GetKeyScaleX(dest_rt_key);
+      float pixels_to_ndc_y =
+          pixels_to_ndc_unscaled * GetKeyScaleY(dest_rt_key);
 
       // Gather shader keys and sort to reduce pipeline state and binding
       // switches. Also gather stencil rectangles to clear if needed.
@@ -4295,6 +6028,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       TransferShaderKey new_transfer_shader_key;
       new_transfer_shader_key.dest_msaa_samples = dest_rt_key.msaa_samples;
       new_transfer_shader_key.dest_resource_format = dest_rt_key.resource_format;
+      new_transfer_shader_key.dest_scale_native = dest_rt_key.scale_native;
       uint32_t stencil_clear_rectangle_count = 0;
       for (uint32_t j = 0; j <= uint32_t(need_stencil_bit_draws); ++j) {
         // j == 0 - color or depth.
@@ -4327,6 +6061,11 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           RenderTargetKey source_rt_key = source_d3d12_rt.key();
           new_transfer_shader_key.source_msaa_samples = source_rt_key.msaa_samples;
           new_transfer_shader_key.source_resource_format = source_rt_key.resource_format;
+          new_transfer_shader_key.source_scale_native =
+              source_rt_key.scale_native;
+          assert_true(!host_depth_source_d3d12_rt ||
+                      host_depth_source_d3d12_rt->key().scale_native ==
+                          dest_rt_key.scale_native);
           bool host_depth_source_is_copy = host_depth_source_d3d12_rt == &dest_d3d12_rt;
           new_transfer_shader_key.host_depth_source_is_copy = host_depth_source_is_copy;
           // The host depth copy buffer has only raw samples.
@@ -4364,11 +6103,100 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
       }
       std::sort(current_transfer_invocations_.begin(), current_transfer_invocations_.end());
 
+      // The old draw-side mixed-scale observer only caught a uniform
+      // initialization pass. Inspect the actual ownership transfers in the
+      // selected frame and preserve the first source with real image content.
+      // This is disabled by default, restricted to The Darkness' dynamically
+      // observed color allocation at EDRAM base 0x300, and bounded for the
+      // process lifetime. It is diagnostic only and never changes guest data.
+      static uint32_t embedded_mixed_scale_transfer_inspection_count = 0;
+      static bool embedded_mixed_scale_nonuniform_transfer_captured = false;
+      if (REXCVAR_GET(embedded_mixed_scale_transition_capture) &&
+          IsCurrentEmbeddedGameplayCaptureFrame() &&
+          !embedded_mixed_scale_nonuniform_transfer_captured &&
+          !dest_rt_key.is_depth && dest_rt_key.base_tiles == 0x300) {
+        for (const TransferInvocation& invocation :
+             current_transfer_invocations_) {
+          if (embedded_mixed_scale_transfer_inspection_count >= 64) {
+            break;
+          }
+          const TransferShaderKey shader_key = invocation.shader_key;
+          if (shader_key.mode != TransferMode::kColorToColor ||
+              shader_key.source_scale_native ==
+                  shader_key.dest_scale_native ||
+              !invocation.transfer.source) {
+            continue;
+          }
+          auto* source = static_cast<D3D12RenderTarget*>(
+              invocation.transfer.source);
+          const RenderTargetKey source_key = source->key();
+          if (source_key.is_depth || source_key.base_tiles != 0x300) {
+            continue;
+          }
+          // CaptureEmbeddedColorTarget's detailed content summary interprets
+          // eight-byte FP16 pixels. The dynamically reached HDR ownership pair
+          // uses this format; ignore unrelated aliases rather than
+          // misclassifying a different host representation.
+          if (source->resource()->GetDesc().Format !=
+                  DXGI_FORMAT_R16G16B16A16_FLOAT ||
+              dest_d3d12_rt.resource()->GetDesc().Format !=
+                  DXGI_FORMAT_R16G16B16A16_FLOAT) {
+            continue;
+          }
+          const uint32_t inspection_ordinal =
+              ++embedded_mixed_scale_transfer_inspection_count;
+          EmbeddedColorTargetDiagnosticSummary source_summary;
+          const bool inspected = CaptureEmbeddedColorTarget(
+              source, "mixed_scale_transfer_source_inspect", nullptr,
+              &source_summary);
+          std::fprintf(
+              stderr,
+              "REX_EMBEDDED_MIXED_SCALE_TRANSFER ordinal=%u inspected=%u "
+              "source_key=0x%08X dest_key=0x%08X source_scale=%ux%u "
+              "dest_scale=%ux%u source_msaa=%u dest_msaa=%u "
+              "source_format=%u dest_format=%u tiles=%u-%u "
+              "source_size=%ux%u source_samples=%u source_hash=0x%08X "
+              "source_unique_capped=%u\n",
+              inspection_ordinal, inspected ? 1u : 0u, source_key.key,
+              dest_rt_key.key, GetKeyScaleX(source_key),
+              GetKeyScaleY(source_key), GetKeyScaleX(dest_rt_key),
+              GetKeyScaleY(dest_rt_key),
+              uint32_t(source_key.msaa_samples),
+              uint32_t(dest_rt_key.msaa_samples),
+              source_key.resource_format, dest_rt_key.resource_format,
+              invocation.transfer.start_tiles,
+              invocation.transfer.end_tiles, source_summary.width,
+              source_summary.height, source_summary.source_samples,
+              source_summary.fnv1a,
+              source_summary.unique_pixel_values_capped);
+          std::fflush(stderr);
+          if (!inspected ||
+              source_summary.unique_pixel_values_capped < 8) {
+            continue;
+          }
+          embedded_mixed_scale_nonuniform_transfer_captured = true;
+          capture_embedded_mixed_scale_dest_after_transfer = true;
+          const bool source_captured = CaptureEmbeddedColorTarget(
+              source, "mixed_scale_transfer_source_nonuniform",
+              "rex_mixed_scale_transfer_source_nonuniform_fp16.bin");
+          std::fprintf(
+              stderr,
+              "REX_EMBEDDED_MIXED_SCALE_TRANSFER_SOURCE result=%u "
+              "ordinal=%u path=%s\n",
+              source_captured ? 1u : 0u, inspection_ordinal,
+              "rex_mixed_scale_transfer_source_nonuniform_fp16.bin");
+          std::fflush(stderr);
+          break;
+        }
+      }
+
       // Clear the stencil to 0 where it will be loaded - will be setting the
       // bits that need to be 1 by discarding samples. Clearing everything here
       // to reduce context switches internally in the driver if clear causes
       // them.
       if (stencil_clear_rectangle_count) {
+        D3D12CommandProcessor::GpuTimingScope stencil_clear_timing(
+            command_processor_, GpuTimingCategory::kTransferStencil);
         command_processor_.SubmitBarriers();
         D3D12_RECT* stencil_clear_rect_write_ptr = command_list.ClearDepthStencilViewAllocatedRects(
             dest_d3d12_rt.descriptor_draw().GetHandle(), D3D12_CLEAR_FLAG_STENCIL, 0.0f, 0,
@@ -4383,15 +6211,17 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             const Transfer::Rectangle& stencil_clear_rectangle =
                 transfer_stencil_clear_rectangles[j];
             stencil_clear_rect_write_ptr->left =
-                LONG(stencil_clear_rectangle.x_pixels * draw_resolution_scale_x());
+                LONG(stencil_clear_rectangle.x_pixels *
+                     GetKeyScaleX(dest_rt_key));
             stencil_clear_rect_write_ptr->top =
-                LONG(stencil_clear_rectangle.y_pixels * draw_resolution_scale_y());
+                LONG(stencil_clear_rectangle.y_pixels *
+                     GetKeyScaleY(dest_rt_key));
             stencil_clear_rect_write_ptr->right =
                 LONG((stencil_clear_rectangle.x_pixels + stencil_clear_rectangle.width_pixels) *
-                     draw_resolution_scale_x());
+                     GetKeyScaleX(dest_rt_key));
             stencil_clear_rect_write_ptr->bottom =
                 LONG((stencil_clear_rectangle.y_pixels + stencil_clear_rectangle.height_pixels) *
-                     draw_resolution_scale_y());
+                     GetKeyScaleY(dest_rt_key));
             ++stencil_clear_rect_write_ptr;
           }
         }
@@ -4489,8 +6319,10 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
                 current_submission, transfer_rectangle_buffer_view.SizeInBytes, sizeof(float),
                 nullptr, nullptr, &transfer_rectangle_buffer_view.BufferLocation));
         if (!transfer_rectangle_write_ptr) {
+          record_update_failure("transfer_vertex_allocation");
           continue;
         }
+        uint64_t transfer_area = 0;
         for (auto it_merged = it_merged_first; it_merged <= it_merged_last; ++it_merged) {
           Transfer::Rectangle transfer_invocation_rectangles[Transfer::kMaxRectanglesWithCutout];
           uint32_t transfer_invocation_rectangle_count = it_merged->transfer.GetRectangles(
@@ -4499,6 +6331,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           assert_not_zero(transfer_invocation_rectangle_count);
           for (uint32_t j = 0; j < transfer_invocation_rectangle_count; ++j) {
             const Transfer::Rectangle& transfer_rectangle = transfer_invocation_rectangles[j];
+            transfer_area += uint64_t(transfer_rectangle.width_pixels) * transfer_rectangle.height_pixels;
             float transfer_rectangle_x0 = -1.0f + transfer_rectangle.x_pixels * pixels_to_ndc_x;
             float transfer_rectangle_y0 = 1.0f - transfer_rectangle.y_pixels * pixels_to_ndc_y;
             float transfer_rectangle_x1 =
@@ -4543,6 +6376,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         ID3D12PipelineState* const* transfer_pipelines =
             GetOrCreateTransferPipelines(transfer_shader_key);
         if (!transfer_pipelines) {
+          record_update_failure("transfer_pipeline");
           continue;
         }
         if (last_transfer_root_signature_index != transfer_root_signature_index) {
@@ -4694,6 +6528,45 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         }
 
         // Draw the transfer rectangles.
+        const GpuTimingCategory transfer_timing_category =
+            is_stencil_bit ? GpuTimingCategory::kTransferStencil
+                           : (dest_rt_key.is_depth ? GpuTimingCategory::kTransferDepth
+                                                   : GpuTimingCategory::kTransferColor);
+        D3D12CommandProcessor::GpuTimingScope transfer_draw_timing(command_processor_,
+                                                                   transfer_timing_category);
+        if (command_processor_.GpuTimingEnabled()) {
+          const uint32_t passes = is_stencil_bit ? 8 : 1;
+          const uint64_t samples = (transfer_area * GetKeyScaleX(dest_rt_key) *
+                                    GetKeyScaleY(dest_rt_key) * passes)
+                                   << uint32_t(dest_rt_key.msaa_samples);
+          const GpuTimingCounter draws_counter =
+              is_stencil_bit ? GpuTimingCounter::kTransferStencilDraws
+                             : (dest_rt_key.is_depth ? GpuTimingCounter::kTransferDepthDraws
+                                                     : GpuTimingCounter::kTransferColorDraws);
+          command_processor_.GpuTimingCount(draws_counter, passes);
+          command_processor_.GpuTimingCount(GpuTimingCounter(uint32_t(draws_counter) + 1), samples);
+          if (command_processor_.GpuTimingTransferLogFrame()) {
+            const RenderTargetKey source_log_key = source_d3d12_rt.key();
+            std::fprintf(stderr,
+                         "REX_GPU_TRANSFER frame=%llu dest_key=%08X dest_depth=%u dest_base=%u "
+                         "dest_pitch=%u dest_format=%u dest_msaa=%u dest_native=%u "
+                         "source_key=%08X source_depth=%u source_base=%u source_pitch=%u "
+                         "source_format=%u source_msaa=%u mode=%u host_depth=%u merged=%u "
+                         "rects=%u area=%llu passes=%u samples=%llu resolve_clear=%u\n",
+                         static_cast<unsigned long long>(command_processor_.GetCurrentFrame()),
+                         dest_rt_key.key, dest_rt_key.is_depth, dest_rt_key.base_tiles,
+                         dest_pitch_tiles, dest_rt_key.resource_format,
+                         uint32_t(dest_rt_key.msaa_samples), dest_rt_key.scale_native,
+                         source_log_key.key, source_log_key.is_depth, source_log_key.base_tiles,
+                         source_log_key.GetPitchTiles(), source_log_key.resource_format,
+                         uint32_t(source_log_key.msaa_samples), uint32_t(transfer_shader_key.mode),
+                         host_depth_source_d3d12_rt ? 1u : 0u,
+                         uint32_t(std::distance(it_merged_first, it_merged_last) + 1),
+                         transfer_rectangle_count, static_cast<unsigned long long>(transfer_area),
+                         passes, static_cast<unsigned long long>(samples),
+                         resolve_clear_needed ? 1u : 0u);
+          }
+        }
         command_processor_.SubmitBarriers();
         for (uint32_t j = 0; j <= uint32_t(is_stencil_bit) * 7; ++j) {
           if (is_stencil_bit) {
@@ -4705,6 +6578,33 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           }
           command_processor_.SetExternalPipeline(transfer_pipelines[j]);
           command_list.D3DDrawInstanced(transfer_vertex_count, 1, 0, 0);
+          // Observe each original invocation in this actually queued merged draw.
+          // Do not describe a requested transfer as executed after an allocation
+          // or pipeline failure, and do not add commands to obtain evidence.
+          if (update_capture) {
+            for (auto observed = it_merged_first; observed <= it_merged_last; ++observed) {
+              ++update_capture->commands;
+              if (!update_capture->Record()) continue;
+              const auto& c = *update_capture;
+              const auto& transfer = observed->transfer;
+              const auto* host_depth = static_cast<D3D12RenderTarget*>(transfer.host_depth_source);
+              std::fprintf(stderr,
+                  "REX_SCENE_UPDATE_COMMAND frame=%llu update=%llu next_draw=%llu slot=%u "
+                  "start=%u end=%u source=%016llX source_key=%08X dest=%016llX dest_key=%08X "
+                  "host_depth=%016llX mode=%u shader_key=%08X pass=%u passes=%u vertices=%u "
+                  "submission=%llu scope=queued_transfer_draw_not_gpu_completion\n",
+                  static_cast<unsigned long long>(c.frame), static_cast<unsigned long long>(c.update),
+                  static_cast<unsigned long long>(c.next_draw), i, transfer.start_tiles, transfer.end_tiles,
+                  static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(source_d3d12_rt.resource())),
+                  source_d3d12_rt.key().key,
+                  static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(dest_d3d12_rt.resource())),
+                  dest_rt_key.key,
+                  host_depth ? static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(host_depth->resource())) : 0,
+                  uint32_t(transfer_shader_key.mode), transfer_shader_key.key,
+                  j, is_stencil_bit ? 8u : 1u, transfer_vertex_count,
+                  static_cast<unsigned long long>(command_processor_.GetCurrentSubmission()));
+            }
+          }
         }
       }
     }
@@ -4712,6 +6612,36 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     // Perform the clear.
     if (resolve_clear_needed) {
       uint64_t clear_value = render_target_resolve_clear_values[i];
+      // Invoke only after the actual existing command is recorded. No new
+      // command, readback, wait or transfer is introduced by this observer.
+      const auto record_scene_clear_command = [&](const char* method, const float* values,
+                                                   uint32_t value_count) {
+        if (!scene_capture_context || render_target_count != 2 ||
+            !scene_clear_command_budget.Record(i)) return;
+        const auto& c = *scene_capture_context;
+        const auto desc = dest_d3d12_rt.resource()->GetDesc();
+        uint32_t words[4] = {};
+        if (values && value_count <= 4) std::memcpy(words, values, value_count * sizeof(uint32_t));
+        std::fprintf(stderr,
+            "REX_SCENE_CLEAR_COMMAND frame=%llu resolve=%llu last_draw=%llu slot=%u "
+            "method=%s resource=%p key=%08X depth=%u format=%u scale=%ux%u "
+            "host_width=%llu host_height=%u host_format=%u host_samples=%u "
+            "guest_rect=%u,%u,%u,%u host_rect=%ld,%ld,%ld,%ld "
+            "value=%016llX float_count=%u float_words=%08X,%08X,%08X,%08X "
+            "submission=%llu scope=queued_host_clear_not_gpu_completion\n",
+            static_cast<unsigned long long>(c.frame), static_cast<unsigned long long>(c.ordinal),
+            static_cast<unsigned long long>(c.last_draw), i, method,
+            static_cast<void*>(dest_d3d12_rt.resource()), dest_rt_key.key,
+            dest_rt_key.is_depth, dest_rt_key.resource_format,
+            GetKeyScaleX(dest_rt_key), GetKeyScaleY(dest_rt_key),
+            static_cast<unsigned long long>(desc.Width), desc.Height, uint32_t(desc.Format),
+            desc.SampleDesc.Count, resolve_clear_rectangle->x_pixels,
+            resolve_clear_rectangle->y_pixels, resolve_clear_rectangle->width_pixels,
+            resolve_clear_rectangle->height_pixels, clear_rect.left, clear_rect.top,
+            clear_rect.right, clear_rect.bottom, static_cast<unsigned long long>(clear_value),
+            value_count, words[0], words[1], words[2], words[3],
+            static_cast<unsigned long long>(command_processor_.GetCurrentSubmission()));
+      };
       if (dest_rt_key.is_depth) {
         uint32_t depth_guest_clear_value = (uint32_t(clear_value) >> 8) & 0xFFFFFF;
         float depth_host_clear_value = 0.0f;
@@ -4733,6 +6663,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
                                               D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
                                               depth_host_clear_value, UINT(clear_value) & 0xFF, 1,
                                               &clear_rect);
+        record_scene_clear_command("depth_stencil_clear", &depth_host_clear_value, 1);
       } else {
         float color_clear_value[4] = {};
         bool clear_via_drawing = false;
@@ -4834,6 +6765,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
               xenos::ColorRenderTargetFormat::k_32_32_FLOAT)][size_t(dest_rt_key.msaa_samples)]);
           command_processor_.SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
           command_list.D3DDrawInstanced(3, 1, 0, 0);
+          record_scene_clear_command("uint_draw", nullptr, 0);
         } else {
           command_processor_.SubmitBarriers();
           command_list.D3DClearRenderTargetView(
@@ -4841,9 +6773,43 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
                   ? dest_d3d12_rt.descriptor_load_separate().GetHandle()
                   : dest_d3d12_rt.descriptor_draw().GetHandle(),
               color_clear_value, 1, &clear_rect);
+          record_scene_clear_command("rtv_clear", color_clear_value, 4);
         }
       }
     }
+    if (capture_embedded_mixed_scale_dest_after_transfer) {
+      constexpr char kMixedScaleTransferDestPath[] =
+          "rex_mixed_scale_transfer_dest_after_fp16.bin";
+      EmbeddedColorTargetDiagnosticSummary dest_summary;
+      const bool captured = CaptureEmbeddedColorTarget(
+          &dest_d3d12_rt, "mixed_scale_transfer_dest_after",
+          kMixedScaleTransferDestPath, &dest_summary);
+      // AwaitAllQueueOperationsCompletion starts a fresh command list. Make
+      // the next draw re-establish its attachments rather than trusting stale
+      // command-list-local binding state.
+      are_current_command_list_render_targets_valid_ = false;
+      std::fprintf(
+          stderr,
+          "REX_EMBEDDED_MIXED_SCALE_TRANSFER_DEST result=%u path=%s "
+          "dest_key=0x%08X size=%ux%u samples=%u hash=0x%08X "
+          "unique_capped=%u\n",
+          captured ? 1u : 0u, kMixedScaleTransferDestPath,
+          dest_rt_key.key, dest_summary.width, dest_summary.height,
+          dest_summary.source_samples, dest_summary.fnv1a,
+          dest_summary.unique_pixel_values_capped);
+      std::fflush(stderr);
+    }
+  }
+  if (update_capture) update_capture->helper_completed = true;
+  if (scene_capture_context && resolve_clear_needed && render_target_count == 2) {
+    const auto& c = *scene_capture_context;
+    std::fprintf(stderr,
+        "REX_SCENE_CLEAR_END frame=%llu resolve=%llu last_draw=%llu commands=%u "
+        "target_bits=%X submission=%llu scope=queued_host_clear_not_gpu_completion\n",
+        static_cast<unsigned long long>(c.frame), static_cast<unsigned long long>(c.ordinal),
+        static_cast<unsigned long long>(c.last_draw), scene_clear_command_budget.count(),
+        scene_clear_command_budget.target_bits,
+        static_cast<unsigned long long>(command_processor_.GetCurrentSubmission()));
   }
 }
 
@@ -5231,8 +7197,10 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // fits in it, while 80x16 doesn't.
   a.OpDclThreadGroup(40, 16, 1);
 
-  uint32_t draw_resolution_scale_x = this->draw_resolution_scale_x();
-  uint32_t draw_resolution_scale_y = this->draw_resolution_scale_y();
+  uint32_t draw_resolution_scale_x =
+      key.native_layout ? 1 : this->draw_resolution_scale_x();
+  uint32_t draw_resolution_scale_y =
+      key.native_layout ? 1 : this->draw_resolution_scale_y();
 
   // For now, as the exact addressing in 64bpp render targets relatively to
   // 32bpp is unknown, treating 64bpp tiles as storing 40x16 samples rather than
@@ -5397,59 +7365,109 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
   // single-sampled source, LOD from r0.w.
   dxbc::Src source_address_src(dxbc::Src::R(0, 0b11000100));
   if (key.msaa_samples >= xenos::MsaaSamples::k2X) {
+    // r0.xy holds the canonical sample coordinates within the EDRAM layout.
+    // Convert them into the pixel and the sample of the multisampled view
+    // using the canonical layout formulas, at guest pixel granularity when the
+    // layout is scaled.
+    uint32_t layout_scale_x =
+        key.native_layout ? 1 : this->draw_resolution_scale_x();
+    uint32_t layout_scale_y =
+        key.native_layout ? 1 : this->draw_resolution_scale_y();
+    bool layout_scaled = layout_scale_x > 1 || layout_scale_y > 1;
+    if (layout_scaled) {
+      // r0.xy = guest canonical sample coordinates
+      // r1.xy = subpixel within the guest sample
+      a.OpUDiv(dxbc::Dest::R(0, 0b0011), dxbc::Dest::R(1, 0b0011),
+               dxbc::Src::R(0),
+               dxbc::Src::LU(layout_scale_x, layout_scale_y, 1, 1));
+    }
     if (key.msaa_samples >= xenos::MsaaSamples::k4X) {
-      // 4x MSAA source texture sample index - bit 0 for horizontal, bit 1 for
-      // vertical.
-      // Extract the horizontal sample index to r0.w.
-      // r0.x = X sample position within the source texture
-      // r0.y = Y sample position within the source texture
-      // r0.z = sample offset in the EDRAM
-      // r0.w = horizontal sample index within the source pixel
-      a.OpAnd(dxbc::Dest::R(0, 0b1000), dxbc::Src::R(0, dxbc::Src::kXXXX), dxbc::Src::LU(1));
-      // Insert the vertical sample index to r0.w.
-      // r0.x = X sample position within the source texture
-      // r0.y = Y sample position within the source texture
-      // r0.z = sample offset in the EDRAM
+      // The 4x sample index has bit 0 horizontal and bit 1 vertical, same as
+      // the canonical layout.
+      // r0.w = horizontal sample index = (u >> 1) & 1
+      a.OpUBFE(dxbc::Dest::R(0, 0b1000), dxbc::Src::LU(1), dxbc::Src::LU(1),
+               dxbc::Src::R(0, dxbc::Src::kXXXX));
+      // r1.z = vertical sample index = (v >> 1) & 1
+      a.OpUBFE(dxbc::Dest::R(1, 0b0100), dxbc::Src::LU(1), dxbc::Src::LU(1),
+               dxbc::Src::R(0, dxbc::Src::kYYYY));
       // r0.w = sample index within the source pixel
       a.OpBFI(dxbc::Dest::R(0, 0b1000), dxbc::Src::LU(1), dxbc::Src::LU(1),
-              dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::R(0, dxbc::Src::kWWWW));
-      // Convert sample to pixel coordinates in the source texture to r0.xy.
-      // r0.x = X pixel position within the source texture
-      // r0.y = Y pixel position within the source texture
-      // r0.z = sample offset in the EDRAM
-      // r0.w = sample index within the source pixel
-      a.OpUShR(dxbc::Dest::R(0, 0b0011), dxbc::Src::R(0), dxbc::Src::LU(1));
+              dxbc::Src::R(1, dxbc::Src::kZZZZ),
+              dxbc::Src::R(0, dxbc::Src::kWWWW));
+      // Guest pixel per axis = ((c >> 2) << 1) | (c & 1).
+      // r1.z = u >> 2
+      a.OpUShR(dxbc::Dest::R(1, 0b0100), dxbc::Src::R(0, dxbc::Src::kXXXX),
+               dxbc::Src::LU(2));
+      // r0.x = X guest pixel position
+      a.OpBFI(dxbc::Dest::R(0, 0b0001), dxbc::Src::LU(31), dxbc::Src::LU(1),
+              dxbc::Src::R(1, dxbc::Src::kZZZZ),
+              dxbc::Src::R(0, dxbc::Src::kXXXX));
+      // r1.z = v >> 2
+      a.OpUShR(dxbc::Dest::R(1, 0b0100), dxbc::Src::R(0, dxbc::Src::kYYYY),
+               dxbc::Src::LU(2));
+      // r0.y = Y guest pixel position
+      a.OpBFI(dxbc::Dest::R(0, 0b0010), dxbc::Src::LU(31), dxbc::Src::LU(1),
+              dxbc::Src::R(1, dxbc::Src::kZZZZ),
+              dxbc::Src::R(0, dxbc::Src::kYYYY));
     } else {
       // 2x MSAA source texture sample index.
       // Extract the vertical sample index to r0.w.
       // r0.x = X pixel position within the source texture
       // r0.y = Y sample position within the source texture
       // r0.z = sample offset in the EDRAM
-      // r0.w = vertical sample index within the destination pixel
-      a.OpAnd(dxbc::Dest::R(0, 0b1000), dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::LU(1));
+      // r0.w = guest vertical sample index = (u >> 1) & 1
+      a.OpUBFE(dxbc::Dest::R(0, 0b1000), dxbc::Src::LU(1), dxbc::Src::LU(1),
+               dxbc::Src::R(0, dxbc::Src::kXXXX));
+      // Guest pixel X = (u & ~2) | (v & 2).
+      // r1.z = v & 2
+      a.OpAnd(dxbc::Dest::R(1, 0b0100), dxbc::Src::R(0, dxbc::Src::kYYYY),
+              dxbc::Src::LU(2));
+      // r0.x = (u & ~2)
+      a.OpAnd(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX),
+              dxbc::Src::LU(~uint32_t(2)));
+      // r0.x = X guest pixel position
+      a.OpOr(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX),
+             dxbc::Src::R(1, dxbc::Src::kZZZZ));
+      // Guest pixel Y = ((v & ~3) >> 1) | (v & 1).
+      // r1.z = v & 1
+      a.OpAnd(dxbc::Dest::R(1, 0b0100), dxbc::Src::R(0, dxbc::Src::kYYYY),
+              dxbc::Src::LU(1));
+      // r0.y = v & ~3
+      a.OpAnd(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY),
+              dxbc::Src::LU(~uint32_t(3)));
+      // r0.y = (v & ~3) >> 1
+      a.OpUShR(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY),
+               dxbc::Src::LU(1));
+      // r0.y = Y guest pixel position
+      a.OpOr(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY),
+             dxbc::Src::R(1, dxbc::Src::kZZZZ));
       // Convert the 2x MSAA sample index from the guest to Direct3D 10.1+.
-      // r0.x = X pixel position within the source texture
-      // r0.y = Y sample position within the source texture
-      // r0.z = sample offset in the EDRAM
       // r0.w = sample index within the source pixel
       a.OpMovC(dxbc::Dest::R(0, 0b1000), dxbc::Src::R(0, dxbc::Src::kWWWW),
-               dxbc::Src::LU(draw_util::GetD3D10SampleIndexForGuest2xMSAA(1, msaa_2x_supported_)),
-               dxbc::Src::LU(draw_util::GetD3D10SampleIndexForGuest2xMSAA(0, msaa_2x_supported_)));
-      // Convert sample Y to pixel Y in the source texture to r0.y.
-      // r0.x = X pixel position within the source texture
-      // r0.y = Y pixel position within the source texture
-      // r0.z = sample offset in the EDRAM
-      // r0.w = sample index within the source pixel
-      a.OpUShR(dxbc::Dest::R(0, 0b0010), dxbc::Src::R(0, dxbc::Src::kYYYY), dxbc::Src::LU(1));
+               dxbc::Src::LU(draw_util::GetD3D10SampleIndexForGuest2xMSAA(
+                   1, msaa_2x_supported_)),
+               dxbc::Src::LU(draw_util::GetD3D10SampleIndexForGuest2xMSAA(
+                   0, msaa_2x_supported_)));
     }
+    if (!key.source_scale_native && layout_scaled) {
+      // Scaled source in the scaled layout. Restore the subpixel position.
+      // r0.xy = XY pixel position within the source texture
+      a.OpUMAd(dxbc::Dest::R(0, 0b0011), dxbc::Src::R(0),
+               dxbc::Src::LU(layout_scale_x, layout_scale_y, 1, 1),
+               dxbc::Src::R(1));
+    }
+    // With a native source and a scaled layout, the guest pixel position comes
+    // directly from the source texture position, and all the scaled sample
+    // slots covering one guest sample receive its value.
     // Load the source to r1.
     // r0.x = X pixel position within the source texture if stencil is needed
     // r0.y = Y pixel position within the source texture if stencil is needed
     // r0.z = sample offset in the EDRAM
     // r0.w = sample index within the source pixel if stencil is needed
     // r1 = source texel value
-    a.OpLdMS(dxbc::Dest::R(1, (1 << source_component_count) - 1), source_address_src, 0b0011,
-             dxbc::Src::T(0, 0), dxbc::Src::R(0, dxbc::Src::kWWWW));
+    a.OpLdMS(dxbc::Dest::R(1, (1 << source_component_count) - 1),
+             source_address_src, 0b0011, dxbc::Src::T(0, 0),
+             dxbc::Src::R(0, dxbc::Src::kWWWW));
     if (key.is_depth) {
       // Load the source stencil to r1.y.
       // r0.x = free
@@ -5458,10 +7476,17 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
       // r0.w = free
       // r1.x = source depth value
       // r1.y = source stencil value
-      a.OpLdMS(dxbc::Dest::R(1, 0b0010), source_address_src, 0b0011, dxbc::Src::T(1, 1),
-               dxbc::Src::R(0, dxbc::Src::kWWWW));
+      a.OpLdMS(dxbc::Dest::R(1, 0b0010), source_address_src, 0b0011,
+               dxbc::Src::T(1, 1), dxbc::Src::R(0, dxbc::Src::kWWWW));
     }
   } else {
+    if (key.source_scale_native && !key.native_layout &&
+        IsDrawResolutionScaled()) {
+      a.OpUDiv(dxbc::Dest::R(0, 0b0011), dxbc::Dest::Null(),
+               dxbc::Src::R(0),
+               dxbc::Src::LU(this->draw_resolution_scale_x(),
+                             this->draw_resolution_scale_y(), 1, 1));
+    }
     // Write the LOD index (0) to the register with texture coordinates for
     // loading from the single-sampled source texture.
     // r0.x = X pixel position within the source texture
@@ -5721,6 +7746,9 @@ bool D3D12RenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInfo
     dump_pipeline_key.msaa_samples = render_target->key().msaa_samples;
     dump_pipeline_key.resource_format = render_target->key().resource_format;
     dump_pipeline_key.is_depth = render_target->key().is_depth;
+    dump_pipeline_key.source_scale_native =
+        render_target->key().scale_native;
+    dump_pipeline_key.native_layout = 0;
     if (!GetOrCreateDumpPipeline(dump_pipeline_key)) {
       return false;
     }
@@ -5739,7 +7767,9 @@ bool D3D12RenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInfo
 }
 
 bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used,
-                                               uint32_t dump_rows, uint32_t dump_pitch) {
+                                               uint32_t dump_rows,
+                                               uint32_t dump_pitch,
+                                               bool native_layout) {
   assert_true(GetPath() == Path::kHostRenderTargets);
 
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
@@ -5783,10 +7813,13 @@ bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump
       current_temporary_descriptors_cpu_.push_back(d3d12_rt.descriptor_srv_stencil().GetHandle());
     }
     any_sources_32bpp_64bpp[size_t(rt_key.Is64bpp())] = true;
+    assert_true(!native_layout || rt_key.scale_native);
     DumpPipelineKey pipeline_key;
     pipeline_key.msaa_samples = rt_key.msaa_samples;
     pipeline_key.resource_format = rt_key.resource_format;
     pipeline_key.is_depth = rt_key.is_depth;
+    pipeline_key.source_scale_native = rt_key.scale_native;
+    pipeline_key.native_layout = uint32_t(native_layout);
     dump_invocations_.emplace_back(rectangle, pipeline_key);
   }
   // 32bpp and 64bpp.
@@ -5945,9 +7978,14 @@ bool D3D12RenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dump
       command_processor_.SubmitBarriers();
       // Processing 40 x 16 x scale samples per dispatch (a 32bpp tile in two
       // dispatches at 1x1 scale, 64bpp in one dispatch).
-      command_list.D3DDispatch((dispatch.width_tiles * draw_resolution_scale_x())
+      command_list.D3DDispatch((dispatch.width_tiles *
+                                (native_layout ? 1
+                                               : draw_resolution_scale_x()))
                                    << uint32_t(!format_is_64bpp),
-                               dispatch.height_tiles * draw_resolution_scale_y(), 1);
+                               dispatch.height_tiles *
+                                   (native_layout ? 1
+                                                  : draw_resolution_scale_y()),
+                               1);
     }
     MarkEdramBufferModified();
   }

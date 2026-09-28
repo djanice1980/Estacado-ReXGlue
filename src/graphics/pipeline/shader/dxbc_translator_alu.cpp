@@ -583,6 +583,43 @@ void DxbcShaderTranslator::ProcessVectorAluOperation(
       a_.OpMov(dxbc::Dest::R(system_temp_result_), dxbc::Src::LF(0.0f));
   }
 
+  // The fetch-level diagnostic may be overwritten by a later loop iteration.
+  // At the exact shader's final `mul r4.xyz, r0.xyz, r4.xyz`, retain both
+  // inputs in private translator temporaries. StoreResult consumes them only
+  // if that iteration actually executes the guest color export, so later
+  // non-exporting iterations cannot overwrite the visible diagnostic.
+  const uint32_t scene_diagnostic =
+      GetDxbcShaderModification().pixel.texture_sample_diagnostic;
+  const bool is_embedded_scene_final_rgb_multiply =
+      current_shader().ucode_data_hash() == UINT64_C(0xBE763931E2AB7D56) &&
+      scene_diagnostic >= 5 && scene_diagnostic <= 7 &&
+      instr.vector_opcode == AluVectorOpcode::kMul &&
+      instr.vector_and_constant_result.storage_target ==
+          InstructionStorageTarget::kRegister &&
+      instr.vector_and_constant_result.storage_index == 4 &&
+      instr.vector_and_constant_result.GetUsedWriteMask() == 0b0111 &&
+      operand_count == 2 &&
+      instr.vector_operands[0].storage_source ==
+          InstructionStorageSource::kRegister &&
+      instr.vector_operands[0].storage_index == 0 &&
+      instr.vector_operands[1].storage_source ==
+          InstructionStorageSource::kRegister &&
+      instr.vector_operands[1].storage_index == 4;
+  if (is_embedded_scene_final_rgb_multiply) {
+    assert_true(system_temps_embedded_scene_final_multiply_operands_[0] !=
+                UINT32_MAX);
+    assert_true(system_temps_embedded_scene_final_multiply_operands_[1] !=
+                UINT32_MAX);
+    a_.OpMov(dxbc::Dest::R(
+                 system_temps_embedded_scene_final_multiply_operands_[0],
+                 0b0111),
+             operands[0]);
+    a_.OpMov(dxbc::Dest::R(
+                 system_temps_embedded_scene_final_multiply_operands_[1],
+                 0b0111),
+             operands[1]);
+  }
+
   PopSystemTemp(operand_temps);
 }
 

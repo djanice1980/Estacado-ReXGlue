@@ -167,8 +167,22 @@ inline uint8_t tzcnt(int64_t v) {
 // Search the value from least significant bit (LSB) to the most significant bit
 // (MSB) for a set bit (1).
 // Returns false if no bits are set and the output index is invalid.
-bool bit_scan_forward(uint32_t v, uint32_t* out_first_set_index);
-bool bit_scan_forward(uint64_t v, uint32_t* out_first_set_index);
+// Inline: these sit in per-draw loops, and callers in other modules would
+// otherwise pay a cross-DLL call per set bit.
+inline bool bit_scan_forward(uint32_t v, uint32_t* out_first_set_index) {
+  if (!v) {
+    return false;
+  }
+  *out_first_set_index = static_cast<uint32_t>(std::countr_zero(v));
+  return true;
+}
+inline bool bit_scan_forward(uint64_t v, uint32_t* out_first_set_index) {
+  if (!v) {
+    return false;
+  }
+  *out_first_set_index = static_cast<uint32_t>(std::countr_zero(v));
+  return true;
+}
 inline bool bit_scan_forward(int32_t v, uint32_t* out_first_set_index) {
   return bit_scan_forward(static_cast<uint32_t>(v), out_first_set_index);
 }

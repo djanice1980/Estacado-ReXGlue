@@ -97,6 +97,22 @@ class PipelineCache {
     return reinterpret_cast<const Pipeline*>(handle)->state.load(std::memory_order_acquire);
   }
 
+  struct TelemetrySnapshot {
+    uint64_t current_reuses = 0;
+    uint64_t cache_hits = 0;
+    uint64_t cache_misses = 0;
+    uint64_t async_queued = 0;
+    uint64_t sync_created = 0;
+    uint64_t async_completed = 0;
+    uint64_t async_failed = 0;
+    uint64_t queue_depth = 0;
+    uint64_t threads_busy = 0;
+  };
+
+  // Cumulative, low-cost counters. The command processor samples these once
+  // per embedded frame and computes deltas, avoiding per-pipeline text output.
+  TelemetrySnapshot GetTelemetrySnapshot();
+
  private:
   REXPACKEDSTRUCT(ShaderStoredHeader, {
     uint64_t ucode_data_hash;
@@ -206,6 +222,12 @@ class PipelineCache {
     uint32_t depth_write : 1;                         // 18
     uint32_t stencil_enable : 1;                      // 19
     uint32_t stencil_read_mask : 8;                   // 27
+    // Native draw selected by draw_resolution_scale_threshold. This affects
+    // the host slope-scaled depth-bias multiplier and therefore PSO identity.
+    uint32_t resolution_scale_native : 1;             // 28
+    // The explicit D24FS8 shader-depth conversion compatibility option affects
+    // depth-only PSO identity.
+    uint32_t depth_float24_convert_in_pixel_shader : 1;  // 29
 
     uint32_t stencil_write_mask : 8;                   // 8
     xenos::StencilOp stencil_front_fail_op : 3;        // 11
@@ -219,7 +241,7 @@ class PipelineCache {
 
     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
 
-    static constexpr uint32_t kVersion = 0x20210425;
+    static constexpr uint32_t kVersion = 0x20260902;
   });
 
   REXPACKEDSTRUCT(PipelineStoredDescription, {
@@ -419,6 +441,16 @@ class PipelineCache {
   // creation_request_cond_ when set.
   size_t creation_threads_shutdown_from_ = SIZE_MAX;
   std::vector<std::unique_ptr<rex::thread::Thread>> creation_threads_;
+
+  // ConfigurePipeline runs on the command processor thread. Completion may be
+  // reported by worker threads, so only those counters need atomics.
+  uint64_t telemetry_current_reuses_ = 0;
+  uint64_t telemetry_cache_hits_ = 0;
+  uint64_t telemetry_cache_misses_ = 0;
+  uint64_t telemetry_async_queued_ = 0;
+  uint64_t telemetry_sync_created_ = 0;
+  std::atomic<uint64_t> telemetry_async_completed_{0};
+  std::atomic<uint64_t> telemetry_async_failed_{0};
 };
 
 }  // namespace rex::graphics::d3d12

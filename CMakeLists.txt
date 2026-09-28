@@ -99,16 +99,32 @@ if(NOT WIN32)
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
 
-# Global compile options
-add_compile_options(
-    -fno-strict-aliasing
-    -ffp-model=strict
-    $<$<CONFIG:DEBUG>:-g>
-    $<$<CONFIG:DEBUG>:-O0>
-    $<$<CONFIG:RELEASE>:-O3>
-    $<$<CONFIG:RELEASE>:-DNDEBUG>
-    -fno-char8_t
-)
+# Global compile options. Windows is built with clang-cl, so pass Clang-only
+# options through /clang: and keep exception handling explicit for third-party
+# C++ targets rather than relying on a pre-existing CMake cache.
+if(MSVC)
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:CXX>:/EHsc>
+        /clang:-fno-strict-aliasing
+        /clang:-ffp-model=strict
+        $<$<COMPILE_LANGUAGE:CXX>:/clang:-fno-char8_t>
+        $<$<CONFIG:DEBUG>:/Zi>
+        $<$<CONFIG:DEBUG>:/Od>
+        $<$<CONFIG:RELEASE>:/O2>
+        $<$<CONFIG:RELEASE>:/Ob2>
+        $<$<CONFIG:RELEASE>:/DNDEBUG>
+    )
+else()
+    add_compile_options(
+        -fno-strict-aliasing
+        -ffp-model=strict
+        $<$<CONFIG:DEBUG>:-g>
+        $<$<CONFIG:DEBUG>:-O0>
+        $<$<CONFIG:RELEASE>:-O3>
+        $<$<CONFIG:RELEASE>:-DNDEBUG>
+        -fno-char8_t
+    )
+endif()
 
 # Platform detection (supports AMD64 and ARM64)
 if(WIN32)
@@ -162,19 +178,23 @@ endif()
 set(REXGLUE_FLOOR_VERSION
     "${REXGLUE_DERIVED_MAJOR}.${REXGLUE_DERIVED_MINOR}.${REXGLUE_DERIVED_PATCH}")
 
-# Generate version header -- must run after REX_PLATFORM is set
-# Timestamp is set at configure time -- intentionally not updated on every rebuild
-string(TIMESTAMP REXGLUE_BUILD_TIMESTAMP "%Y%m%d_%H%M")
+# Generate version header -- must run after REX_PLATFORM is set. Build identity
+# is source-derived only so a clean reconfigure of the same revision is
+# reproducible; package manifests retain the wall-clock packaging time.
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/include/rex/version.h.in
     ${CMAKE_CURRENT_BINARY_DIR}/include/rex/version.h
     @ONLY
 )
 
-# Output directories (multi-config appends /<Config>/ automatically)
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${REXGLUE_ROOT}/out/${REX_PLATFORM}")
+# Output directories (multi-config appends /<Config>/ automatically). A second
+# build tree (e.g. a profile-guided training build) sets REXGLUE_OUTPUT_DIR so
+# it never overwrites the canonical outputs.
+set(REXGLUE_OUTPUT_DIR "${REXGLUE_ROOT}/out/${REX_PLATFORM}" CACHE PATH
+    "Directory for built binaries and libraries")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${REXGLUE_OUTPUT_DIR}")
 
 # Sanitizer support for debugging memory corruption and undefined behavior
 if(REXGLUE_ENABLE_SANITIZERS)

@@ -1,3 +1,4 @@
+#include <rex/graphics/pc_constant_writer.h>
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -10,10 +11,21 @@
  */
 
 #include <algorithm>
+#include <cstdarg>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <string>
 #include <string_view>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <intrin.h>
+#endif
 
 #include <fmt/format.h>
 
@@ -22,6 +34,8 @@
 #include <rex/perf/counter.h>
 #include <rex/chrono/clock.h>
 #include <rex/graphics/command_processor.h>
+#include <rex/graphics/cp_interrupt_timing.h>
+#include <rex/graphics/cp_interrupt_wakeup.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/texture/info.h>
@@ -36,10 +50,29 @@
 #include <rex/system/user_module.h>
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+REXCVAR_DEFINE_BOOL(embedded_cp_cadence_diagnostics, false, "GPU/Diagnostics",
+                   "Bounded inter-swap command availability, PM4 wait and marker timing; no timing changes");
+REXCVAR_DEFINE_BOOL(embedded_swap_interval_diagnostics, false, "GPU/Diagnostics",
+                   "Bounded distribution of real completed guest-swap intervals; no presentation changes");
+REXCVAR_DEFINE_INT32(embedded_swap_long_frame_us, 0, "GPU/Diagnostics",
+                     "With embedded_swap_interval_diagnostics: swap intervals at or above this many "
+                     "microseconds form the long-frame group and are recorded with the frame before "
+                     "them (0 = two 60 Hz refreshes, no per-frame records)")
+    .range(0, 1000000);
+// Default ON since V285: the accepted V283 player configuration always ran
+// with it (launch flag -InterruptWakeup); without it the CP polls
+// WAIT_REG_MEM with Sleep and the street runs at about half the frame rate.
+REXCVAR_DEFINE_BOOL(embedded_interrupt_wait_wakeup, true, "GPU/Experiments",
+                   "Advisory callback completion wakes embedded memory polling; comparisons and timeout remain authoritative");
 
-REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
-                    "Refresh page-valid state from GPU-written memory at frame end. "
-                    "Disable for minor CPU overhead reduction, but may break memory coherency.")
+// Default OFF since V349: every CPU write reaches the page state (guest stores
+// through the host's tracker, plugin host writes through
+// SharedMemory::MarkHostWrite), so the reset only re-uploaded unchanged pages:
+// ~15 MB and ~600 copies per frame at the street, 8-12% of the frame rate.
+// The coherency audit (measurement builds) found no missed write with it off.
+REXCVAR_DEFINE_BOOL(clear_memory_page_state, false, "GPU",
+                    "Reset CPU-uploaded page state at every frame end, re-uploading the working "
+                    "set (a coherency fallback; costs GPU and command-processor time).")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
@@ -74,17 +107,91 @@ REXCVAR_DEFINE_INT32(query_occlusion_fake_sample_count, 1000, "GPU",
     .range(1, 100000)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
-                    "Compile shaders and create pipelines asynchronously in background "
-                    "threads. This reduces stutter but may cause brief visual artifacts while "
-                    "pipelines are being prepared.")
+// Off (default): shaders are translated when a draw first needs them and new
+// pipelines are created by the creation threads while the rest of the
+// submission is recorded; the submission waits for them, so no draw is ever
+// skipped (a short hitch the first time a pipeline is needed).
+REXCVAR_DEFINE_BOOL(async_shader_compilation, false, "GPU",
+                    "Also translate shaders in background threads and skip draws until "
+                    "their pipelines are ready. This reduces stutter but draws frames with "
+                    "missing passes (brief visual artifacts) while pipelines are prepared.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// Lean indirect-buffer loop (see CommandProcessor::ExecuteIndirectBufferLean).
+// Read per indirect buffer, so it can be switched live for A/B checks.
+REXCVAR_DEFINE_BOOL(gpu_lean_indirect_buffers, false, "GPU",
+                    "Execute indirect buffers without per-packet diagnostic bookkeeping");
 
 namespace rex::graphics {
 
 using namespace rex::graphics::xenos;
 
 namespace {
+
+void TraceEmbeddedCommandProcessor(const char* format, ...) {
+  std::FILE* file = std::fopen("logs/m6c_rex_wait_trace.internal.log", "a");
+  if (!file) {
+    return;
+  }
+  va_list args;
+  va_start(args, format);
+  std::vfprintf(file, format, args);
+  va_end(args);
+  std::fputc('\n', file);
+  std::fclose(file);
+}
+
+// Long frames captured in one swap-interval window, each with the frame
+// before it, written through a single open of the trace. Tick fields are
+// host ticks converted to microseconds; busy_us is the CP thread's cycle
+// time (-1 when unavailable). remaining_us = interval - idle - wait - swap.
+void TraceSwapLongFrames(const SwapIntervalDiagnostic& intervals, uint64_t frequency,
+                         uint64_t tsc_hz) {
+  std::FILE* file = std::fopen("logs/m6c_rex_wait_trace.internal.log", "a");
+  if (!file) {
+    return;
+  }
+  const auto us = [frequency](uint64_t ticks) -> unsigned long long {
+    return frequency ? static_cast<unsigned long long>(ticks * 1000000 / frequency) : 0;
+  };
+  const auto busy = [tsc_hz](const SwapIntervalDiagnostic::FrameRecord& r) -> long long {
+    return r.thread_cycles_valid && tsc_hz
+               ? static_cast<long long>(double(r.thread_cycles) * 1e6 / double(tsc_hz))
+               : -1;
+  };
+  const auto remaining = [&us](const SwapIntervalDiagnostic::FrameRecord& r) {
+    const unsigned long long accounted =
+        us(r.idle_ticks) + us(r.wait_ticks) + us(r.issue_swap_ticks);
+    return r.interval_us > accounted ? r.interval_us - accounted : 0ull;
+  };
+  for (uint32_t i = 0; i < intervals.long_frame_count; ++i) {
+    const auto& p = intervals.long_frames[i].previous;
+    const auto& f = intervals.long_frames[i].frame;
+    std::fprintf(
+        file,
+        "REX_SWAP_LONG_FRAME version=2 swap=%llu tick=%llu interval_us=%llu idle_us=%llu "
+        "wait_us=%llu waits=%llu issue_swap_us=%llu fence_wait_us=%llu full_syncs=%llu "
+        "remaining_us=%llu busy_us=%lld draws=%llu type0_words=%llu upload_bytes=%llu "
+        "upload_ranges=%llu texture_creates=%llu texture_create_us=%llu prev_swap=%llu "
+        "prev_interval_us=%llu prev_idle_us=%llu "
+        "prev_wait_us=%llu prev_issue_swap_us=%llu prev_fence_wait_us=%llu "
+        "prev_remaining_us=%llu prev_busy_us=%lld prev_draws=%llu prev_upload_bytes=%llu\n",
+        static_cast<unsigned long long>(f.swap), static_cast<unsigned long long>(f.end_tick),
+        static_cast<unsigned long long>(f.interval_us), us(f.idle_ticks), us(f.wait_ticks),
+        static_cast<unsigned long long>(f.waits), us(f.issue_swap_ticks),
+        us(f.fence_wait_ticks), static_cast<unsigned long long>(f.full_syncs), remaining(f),
+        busy(f), static_cast<unsigned long long>(f.draws),
+        static_cast<unsigned long long>(f.type0_words),
+        static_cast<unsigned long long>(f.upload_bytes),
+        static_cast<unsigned long long>(f.upload_ranges),
+        static_cast<unsigned long long>(f.texture_creations), us(f.texture_create_ticks),
+        static_cast<unsigned long long>(p.swap), static_cast<unsigned long long>(p.interval_us),
+        us(p.idle_ticks), us(p.wait_ticks), us(p.issue_swap_ticks), us(p.fence_wait_ticks),
+        remaining(p), busy(p), static_cast<unsigned long long>(p.draws),
+        static_cast<unsigned long long>(p.upload_bytes));
+  }
+  std::fclose(file);
+}
 
 ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
   if (value == "fast") {
@@ -98,6 +205,32 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
   }
   return ReadbackResolveMode::kDisabled;
 }
+
+// rex::cvar::HasNonDefaultValue takes the registry mutex, builds a std::string
+// key on the heap and does a hash lookup, while the readback settings are read
+// per resolve and per memexport draw. Its answer depends only on the flag's
+// value, so it is cached on the calling (command processor) thread and asked
+// again whenever the value the caller passes changes and at least once per
+// guest frame: a live change of the setting still applies within a frame.
+// thread_local keeps the command processor's object layout unchanged.
+struct NonDefaultValueCache {
+  const char* name = nullptr;
+  uint64_t frame = UINT64_MAX;
+  uint32_t key = 0;
+  bool non_default = false;
+
+  bool Get(const char* flag_name, uint64_t current_frame, uint32_t current_key) {
+    if (flag_name != name || current_frame != frame || current_key != key) {
+      non_default = rex::cvar::HasNonDefaultValue(flag_name);
+      name = flag_name;
+      frame = current_frame;
+      key = current_key;
+    }
+    return non_default;
+  }
+};
+thread_local NonDefaultValueCache readback_resolve_non_default;
+thread_local NonDefaultValueCache readback_memexport_legacy_non_default;
 
 }  // namespace
 
@@ -137,13 +270,20 @@ bool CommandProcessor::Initialize() {
   }
 
   worker_running_ = true;
-  worker_thread_ = system::object_ref<system::XHostThread>(
-      new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
-        WorkerThreadMain();
-        return 0;
-      }));
-  worker_thread_->set_name("GPU Commands");
-  worker_thread_->Create();
+  if (kernel_state_) {
+    worker_thread_ = system::object_ref<system::XHostThread>(
+        new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
+          WorkerThreadMain();
+          return 0;
+        }));
+    worker_thread_->set_name("GPU Commands");
+    worker_thread_->Create();
+  } else {
+    embedded_worker_thread_ = std::thread([this]() {
+      embedded_worker_thread_id_ = std::this_thread::get_id();
+      WorkerThreadMain();
+    });
+  }
 
   return true;
 }
@@ -153,8 +293,14 @@ void CommandProcessor::Shutdown() {
 
   worker_running_ = false;
   write_ptr_index_event_->Set();
-  worker_thread_->Wait(0, 0, 0, nullptr);
-  worker_thread_.reset();
+  if (worker_thread_) {
+    worker_thread_->Wait(0, 0, 0, nullptr);
+    worker_thread_.reset();
+  }
+  if (embedded_worker_thread_.joinable()) {
+    embedded_worker_thread_.join();
+  }
+  embedded_worker_thread_id_ = {};
 }
 
 void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
@@ -210,6 +356,8 @@ void CommandProcessor::RestoreRegisters(uint32_t first_register, const uint32_t*
     register_count =
         std::min(uint32_t(RegisterFile::kRegisterCount) - first_register, register_count);
   }
+  if (kGpuDiagnostics) command_execution_.Invalidate();
+  InvalidateRegisterProvenance();
   if (execute_callbacks) {
     for (uint32_t i = 0; i < register_count; ++i) {
       WriteRegister(first_register + i, register_values[i]);
@@ -232,7 +380,10 @@ void CommandProcessor::RestoreGammaRamp(const reg::DC_LUT_30_COLOR* new_gamma_ra
 }
 
 void CommandProcessor::CallInThread(std::function<void()> fn) {
-  if (pending_fns_.empty() && system::XThread::IsInThread(worker_thread_.get())) {
+  const bool is_worker = worker_thread_
+                             ? system::XThread::IsInThread(worker_thread_.get())
+                             : std::this_thread::get_id() == embedded_worker_thread_id_;
+  if (pending_fns_.empty() && is_worker) {
     fn();
   } else {
     pending_fns_.push(std::move(fn));
@@ -246,8 +397,11 @@ void CommandProcessor::InvalidateGpuMemory() {}
 ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
     bool legacy_readback_resolve_enabled) const {
   ReadbackResolveMode shared_mode = ParseReadbackResolveMode(REXCVAR_GET(readback_resolve));
-  bool shared_mode_overrides_legacy = shared_mode != ReadbackResolveMode::kDisabled ||
-                                      rex::cvar::HasNonDefaultValue("readback_resolve");
+  bool shared_mode_overrides_legacy =
+      shared_mode != ReadbackResolveMode::kDisabled ||
+      readback_resolve_non_default.Get("readback_resolve",
+                                       guest_frame_count_.load(std::memory_order_relaxed),
+                                       uint32_t(shared_mode));
   if (shared_mode_overrides_legacy) {
     return shared_mode;
   }
@@ -256,8 +410,12 @@ ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
 }
 
 bool CommandProcessor::IsReadbackMemexportEnabled(bool legacy_backend_flag) const {
+  // Backends pass the current value of the flag named by
+  // legacy_readback_memexport_cvar_name_, so a change refreshes the cache.
   if (legacy_readback_memexport_cvar_name_ &&
-      rex::cvar::HasNonDefaultValue(legacy_readback_memexport_cvar_name_)) {
+      readback_memexport_legacy_non_default.Get(
+          legacy_readback_memexport_cvar_name_,
+          guest_frame_count_.load(std::memory_order_relaxed), legacy_backend_flag)) {
     return legacy_backend_flag;
   }
   return REXCVAR_GET(readback_memexport);
@@ -276,6 +434,10 @@ void CommandProcessor::WorkerThreadMain() {
     rex::FatalError("Unable to setup command processor internal state");
     return;
   }
+  // Publish backend cache construction to embedded CPU-side memory
+  // notifications. Initialize() intentionally returns as soon as the worker
+  // is started, before SetupContext has completed on this thread.
+  worker_context_ready_.store(true, std::memory_order_release);
 
   while (worker_running_) {
     while (!pending_fns_.empty()) {
@@ -288,6 +450,10 @@ void CommandProcessor::WorkerThreadMain() {
     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
       // We've run out of commands to execute.
+      const bool interval_idle_active = kGpuDiagnostics && swap_intervals_.active;
+      const uint64_t observed_idle_begin =
+          ((kGpuDiagnostics && cp_cadence_.active) || interval_idle_active)
+          ? rex::chrono::Clock::QueryHostTickCount() : 0;
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
       PrepareForWait();
@@ -306,6 +472,12 @@ void CommandProcessor::WorkerThreadMain() {
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
       ReturnFromWait();
+      if ((kGpuDiagnostics && cp_cadence_.active) || interval_idle_active) {
+        const uint64_t idle_ticks =
+            rex::chrono::Clock::QueryHostTickCount() - observed_idle_begin;
+        if (cp_cadence_.active) cp_cadence_.idle_ticks += idle_ticks;
+        if (interval_idle_active) swap_intervals_.AddIdle(idle_ticks);
+      }
       if (!worker_running_ || !pending_fns_.empty()) {
         continue;
       }
@@ -318,14 +490,17 @@ void CommandProcessor::WorkerThreadMain() {
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
     //     that many indices.
     if (read_ptr_writeback_ptr_) {
-      memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
-                                       read_ptr_index_);
+      {
+        auto host_write = memory_->GuardPhysicalWrite(read_ptr_writeback_ptr_, 4);
+        memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_), read_ptr_index_);
+      }
     }
 
     // FIXME: We're supposed to process the WAIT_UNTIL register at this point,
     // but no games seem to actually use it.
   }
 
+  worker_context_ready_.store(false, std::memory_order_release);
   ShutdownContext();
 }
 
@@ -368,6 +543,13 @@ bool CommandProcessor::Save(::rex::stream::ByteStream* stream) {
 
 bool CommandProcessor::Restore(::rex::stream::ByteStream* stream) {
   assert_true(paused_);
+  if (track_ring_publications_) {
+    std::lock_guard lock(ring_publication_mutex_);
+    // Restored pending commands have no newly observed CPU publication.
+    ring_publications_.Disable();
+  }
+  if (kGpuDiagnostics) command_execution_.Invalidate();
+  InvalidateRegisterProvenance();
 
   primary_buffer_ptr_ = stream->Read<uint32_t>();
   primary_buffer_size_ = stream->Read<uint32_t>();
@@ -383,12 +565,63 @@ bool CommandProcessor::SetupContext() {
   return true;
 }
 
+void CommandProcessor::MarkRegisterWriteHandler(uint32_t first, uint32_t last) {
+  for (uint32_t i = first; i <= last && i < RegisterFile::kRegisterCount; ++i) {
+    register_write_handler_[i] = 1;
+  }
+}
+
+void CommandProcessor::EnableRegisterWriteFastPath() {
+  // Registers with side effects in CommandProcessor::WriteRegister itself.
+  MarkRegisterWriteHandler(XE_GPU_REG_SCRATCH_REG0, XE_GPU_REG_SCRATCH_REG7);
+  MarkRegisterWriteHandler(XE_GPU_REG_COHER_STATUS_HOST, XE_GPU_REG_COHER_STATUS_HOST);
+  MarkRegisterWriteHandler(XE_GPU_REG_DC_LUT_RW_INDEX, XE_GPU_REG_DC_LUT_RW_INDEX);
+  MarkRegisterWriteHandler(XE_GPU_REG_DC_LUT_SEQ_COLOR, XE_GPU_REG_DC_LUT_SEQ_COLOR);
+  MarkRegisterWriteHandler(XE_GPU_REG_DC_LUT_PWL_DATA, XE_GPU_REG_DC_LUT_PWL_DATA);
+  MarkRegisterWriteHandler(XE_GPU_REG_DC_LUT_30_COLOR, XE_GPU_REG_DC_LUT_30_COLOR);
+  register_write_fast_path_ = true;
+}
+
+void CommandProcessor::ReportEmbeddedNanConstantSource(
+    uint32_t packet, uintptr_t packet_host_address, uintptr_t data_host_address,
+    uint32_t base_index, uint32_t count, uint32_t write_one_reg, uint32_t target_index,
+    uint32_t reg_data) {
+  static uint32_t embedded_nan_constant_source_count = 0;
+  if (embedded_nan_constant_source_count >= 64) {
+    return;
+  }
+  ++embedded_nan_constant_source_count;
+  const uintptr_t physical_base = reinterpret_cast<uintptr_t>(memory_->physical_membase());
+  const uintptr_t physical_end = physical_base + 0x20000000u;
+  const uint32_t packet_physical =
+      packet_host_address >= physical_base && packet_host_address < physical_end
+          ? uint32_t(packet_host_address - physical_base)
+          : UINT32_MAX;
+  const uint32_t data_physical =
+      data_host_address >= physical_base && data_host_address < physical_end
+          ? uint32_t(data_host_address - physical_base)
+          : UINT32_MAX;
+  std::fprintf(stderr,
+               "REX_EMBEDDED_NAN_CONSTANT_SOURCE ordinal=%u packet=type0 "
+               "header=0x%08X packet_physical=0x%08X data_physical=0x%08X "
+               "base=0x%04X count=%u write_one=%u target=0x%04X value=0x%08X\n",
+               embedded_nan_constant_source_count, packet, packet_physical,
+               data_physical, base_index, count, write_one_reg, target_index, reg_data);
+  std::fflush(stderr);
+}
+
 void CommandProcessor::ShutdownContext() {}
 
 void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
+  if (kGpuDiagnostics) command_execution_.Invalidate();
+  InvalidateRegisterProvenance();
   read_ptr_index_ = 0;
   primary_buffer_ptr_ = ptr;
   primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
+  if (track_ring_publications_) {
+    std::lock_guard lock(ring_publication_mutex_);
+    ring_publications_.Reset(primary_buffer_size_ / sizeof(uint32_t));
+  }
 }
 
 void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) {
@@ -402,7 +635,15 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
 }
 
 void CommandProcessor::UpdateWritePointer(uint32_t value) {
-  write_ptr_index_ = value;
+  if (track_ring_publications_) {
+    std::lock_guard lock(ring_publication_mutex_);
+    ring_publications_.Publish(value);
+    // Serialize the real publication with its metadata, including callers on
+    // different CPU threads. The existing event remains advisory.
+    write_ptr_index_ = value;
+  } else {
+    write_ptr_index_ = value;
+  }
   write_ptr_index_event_->Set();
 }
 
@@ -429,9 +670,13 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
+#ifndef NDEBUG
+  // Debug-only: the register table lookup runs for every register write
+  // (hundreds of thousands per frame) just to feed this debug message.
   if (!regs.GetRegisterInfo(index)) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
+#endif
 
   // Scratch register writeback.
   if (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) {
@@ -440,7 +685,11 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       // Enabled - write to address.
       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
-      memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
+      SettleGuestVisibleWork();
+      {
+        auto host_write = memory_->GuardPhysicalWrite(mem_addr, 4);
+        memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
+      }
     }
   } else {
     switch (index) {
@@ -689,13 +938,17 @@ void CommandProcessor::PrepareForWait() {
 void CommandProcessor::ReturnFromWait() {}
 
 uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index) {
+#if REX_GPU_DIAGNOSTICS
+  pc_command_execution::State::Scope execution_scope(command_execution_);
+#endif
   SCOPE_profile_cpu_f("gpu");
 
   // If we have a pending trace stream open it now. That way we ensure we get
   // all commands.
   if (!trace_writer_.is_open() && trace_state_ == TraceState::kStreaming) {
-    uint32_t title_id =
-        kernel_state_->GetExecutableModule() ? kernel_state_->GetExecutableModule()->title_id() : 0;
+    uint32_t title_id = kernel_state_ && kernel_state_->GetExecutableModule()
+                            ? kernel_state_->GetExecutableModule()->title_id()
+                            : 0;
     auto file_name = fmt::format("{:08X}_stream.xtr", title_id);
     auto path = trace_stream_path_ / file_name;
     trace_writer_.Open(path, title_id);
@@ -712,6 +965,15 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
 
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
+#if REX_GPU_DIAGNOSTICS
+  // Ring publication tracking (measurement builds) matches root packets.
+  struct PrimaryReaderScope {
+    memory::RingBuffer*& slot;
+    memory::RingBuffer* saved;
+    ~PrimaryReaderScope() { slot = saved; }
+  } primary_reader_scope{executing_primary_reader_, executing_primary_reader_};
+  executing_primary_reader_ = &reader;
+#endif
   reader.set_read_offset(read_index * sizeof(uint32_t));
   reader.set_write_offset(write_index * sizeof(uint32_t));
   do {
@@ -730,7 +992,116 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   return write_index;
 }
 
+bool CommandProcessor::CanUseLeanIndirectBuffers() const {
+  return REXCVAR_GET(gpu_lean_indirect_buffers) && !track_ring_publications_ &&
+         !(kGpuDiagnostics && cp_cadence_.active) && !trace_writer_.is_open();
+}
+
+void CommandProcessor::ExecuteIndirectBufferLean(uint32_t ptr, uint32_t count) {
+  auto* words = memory_->TranslatePhysical<uint32_t*>(ptr);
+  if (!words) return;
+  RegisterFile& regs = *register_file_;
+  uint32_t pos = 0;
+  while (pos < count) {
+    const uint32_t packet = rex::byte_swap(words[pos]);
+    if (packet == 0) {
+      ++pos;
+      continue;
+    }
+    const uint32_t packet_type = packet >> 30;
+    if (packet_type == 0) {
+      const uint32_t register_count = ((packet >> 16) & 0x3FFF) + 1;
+      if (register_count > count - pos - 1) {
+        REXGPU_ERROR("ExecutePacketType0 overflow (read count {:08X}, packet count {:08X})",
+                     (count - pos - 1) * sizeof(uint32_t), register_count * sizeof(uint32_t));
+        assert_always();
+        return;
+      }
+      if (kGpuDiagnostics) swap_intervals_.AddType0(register_count);
+      const uint32_t base_index = packet & 0x7FFF;
+      const bool write_one_reg = (packet >> 15) & 0x1;
+      uint32_t* data = words + pos + 1;
+      const uint64_t last_index = uint64_t(base_index) + register_count - 1;
+      // The same bulk writer the ring path uses for these ranges
+      // (WriteRegisterRangeFromRing is WriteRegistersFromMem per span).
+      const bool float_range = register_count >= 4 &&
+                               base_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+                               last_index <= XE_GPU_REG_SHADER_CONSTANT_511_W;
+      const bool binding_range =
+          register_write_fast_path_ &&
+          ((base_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+            last_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) ||
+           (base_index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+            last_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31));
+      if (!write_one_reg && (float_range || binding_range)) {
+        WriteRegistersFromMem(base_index, data, register_count);
+      } else {
+        for (uint32_t m = 0; m < register_count; ++m) {
+          const uint32_t reg_data = rex::byte_swap(data[m]);
+          const uint32_t target_index = write_one_reg ? base_index : base_index + m;
+          if (register_write_fast_path_ && target_index < RegisterFile::kRegisterCount &&
+              !register_write_handler_[target_index]) {
+            // Volatile for the WAIT_REG_MEM loop, as on the ring path.
+            const_cast<volatile uint32_t&>(regs.values[target_index]) = reg_data;
+            continue;
+          }
+          if (kGpuDiagnostics && !kernel_state_ &&
+              target_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+              target_index < XE_GPU_REG_SHADER_CONSTANT_000_X + 11 * 4 &&
+              (reg_data & 0x7F800000u) == 0x7F800000u && (reg_data & 0x007FFFFFu)) {
+            ReportEmbeddedNanConstantSource(packet, reinterpret_cast<uintptr_t>(words + pos),
+                                            reinterpret_cast<uintptr_t>(data + m), base_index,
+                                            register_count, write_one_reg, target_index, reg_data);
+          }
+          WriteRegisterFromPacket(target_index, reg_data, UINT32_MAX, UINT32_MAX, nullptr);
+        }
+      }
+      pos += 1 + register_count;
+      continue;
+    }
+    // Types 1-3 keep their handlers; positions are computed here because a
+    // reader that ends exactly at the buffer end wraps its offset to 0.
+    uint32_t packet_words = 1;
+    if (packet_type == 1) {
+      packet_words = 3;
+    } else if (packet_type == 3) {
+      packet_words = 1 + ((packet >> 16) & 0x3FFF) + 1;
+    }
+    if (packet_words > count - pos) {
+      REXGPU_ERROR("**** INDIRECT RINGBUFFER: packet overflows the buffer.");
+      assert_always();
+      return;
+    }
+    memory::RingBuffer reader(reinterpret_cast<uint8_t*>(words), size_t(count) * sizeof(uint32_t));
+    reader.set_write_offset(size_t(count) * sizeof(uint32_t));
+    reader.set_read_offset(size_t(pos) * sizeof(uint32_t));
+    bool executed;
+    if (packet_type == 3 &&
+        !(kGpuDiagnostics && swap_intervals_.active &&
+          ((packet >> 8) & 0x7F) == PM4_EVENT_WRITE_ZPD)) {
+      reader.AdvanceRead(sizeof(uint32_t));
+      executed = ExecutePacketType3(&reader, packet);
+    } else {
+      // Type 1/2 and a timed ZPD event take the ordinary dispatcher.
+      executed = ExecutePacket(&reader);
+    }
+    if (!executed) {
+      REXGPU_ERROR("**** INDIRECT RINGBUFFER: Failed to execute packet.");
+      assert_always();
+      return;
+    }
+    pos += packet_words;
+  }
+}
+
 void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
+  if (CanUseLeanIndirectBuffers()) {
+    ExecuteIndirectBufferLean(ptr, count);
+    return;
+  }
+#if REX_GPU_DIAGNOSTICS
+  pc_command_execution::State::Scope execution_scope(command_execution_);
+#endif
   SCOPE_profile_cpu_f("gpu");
 
   trace_writer_.WriteIndirectBufferStart(ptr, count * sizeof(uint32_t));
@@ -751,6 +1122,9 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
 }
 
 void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
+#if REX_GPU_DIAGNOSTICS
+  pc_command_execution::State::Scope execution_scope(command_execution_);
+#endif
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
   reader.set_write_offset(count * sizeof(uint32_t));
@@ -764,7 +1138,17 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
 }
 
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+  if (kGpuDiagnostics) command_execution_.BeginPacket();
+  const uint32_t packet_read_index = reader->read_offset() / sizeof(uint32_t);
+  const uint32_t available_words = reader->read_count() / sizeof(uint32_t);
   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
+  if (track_ring_publications_ && reader == executing_primary_reader_) {
+    std::lock_guard lock(ring_publication_mutex_);
+    const uint32_t words = pc_ring_publication::PacketWords(packet);
+    if (words > available_words) ring_publications_.Disable();
+    command_execution_.SetRootPublication(
+        ring_publications_.Consume(packet_read_index, words));
+  }
   const uint32_t packet_type = packet >> 30;
   if (packet == 0) {
     trace_writer_.WritePacketStart(uint32_t(reader->read_ptr() - 4), 1);
@@ -775,6 +1159,69 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
   if (packet == 0xCDCDCDCD) {
     REXGPU_WARN("GPU packet is CDCDCDCD - probably read uninitialized memory!");
   }
+
+  // Ordinary packets (no sparse CP window, no interval ZPD timing) dispatch
+  // without constructing the timing scope below. Player builds always do:
+  // the scope and its large stack frame compile out.
+  if (!kGpuDiagnostics ||
+      (!cp_cadence_.active &&
+       !(swap_intervals_.active && packet_type == 3 &&
+         ((packet >> 8) & 0x7F) == PM4_EVENT_WRITE_ZPD))) {
+    switch (packet_type) {
+      case 0x00:
+        return ExecutePacketType0(reader, packet);
+      case 0x01:
+        return ExecutePacketType1(reader, packet);
+      case 0x02:
+        return ExecutePacketType2(reader, packet);
+      case 0x03:
+        return ExecutePacketType3(reader, packet);
+      default:
+        assert_unhandled_case(packet_type);
+        return false;
+    }
+  }
+
+  // No packet timing on ordinary launches. The selected sparse window measures
+  // only handlers not already attributed as WAIT, draw, swap or nested indirect
+  // work. The scope covers early returns without logging per packet.
+  uint32_t packet_work_category = 4;
+  uint32_t packet_work_opcode = 128;
+  if (cp_cadence_.active) {
+    if (packet_type < 3) {
+      packet_work_category = packet_type;
+    } else {
+      const uint32_t opcode = (packet >> 8) & 0x7F;
+      if (opcode != PM4_WAIT_REG_MEM && opcode != PM4_XE_SWAP &&
+          opcode != PM4_INDIRECT_BUFFER && opcode != PM4_INDIRECT_BUFFER_PFD &&
+          opcode != PM4_DRAW_INDX && opcode != PM4_DRAW_INDX_2) {
+        packet_work_category = 3;
+        packet_work_opcode = opcode;
+      }
+    }
+  }
+  const bool interval_zpd = swap_intervals_.active && packet_type == 3 &&
+      ((packet >> 8) & 0x7F) == PM4_EVENT_WRITE_ZPD;
+  struct SparsePacketWorkScope {
+    CpCadenceDiagnostic* diagnostic;
+    SwapIntervalDiagnostic* interval_diagnostic;
+    uint32_t category;
+    uint32_t opcode;
+    uint64_t begin_tick;
+    ~SparsePacketWorkScope() {
+      if (diagnostic || interval_diagnostic) {
+        const uint64_t ticks = rex::chrono::Clock::QueryHostTickCount() - begin_tick;
+        if (diagnostic) diagnostic->PacketWorkTime(category, ticks, opcode);
+        if (interval_diagnostic) interval_diagnostic->AddZpd(ticks);
+      }
+    }
+  } sparse_packet_work_scope{
+      packet_work_category < 4 ? &cp_cadence_ : nullptr,
+      interval_zpd ? &swap_intervals_ : nullptr,
+      packet_work_category,
+      packet_work_opcode,
+      (packet_work_category < 4 || interval_zpd)
+          ? rex::chrono::Clock::QueryHostTickCount() : 0};
 
   switch (packet_type) {
     case 0x00:
@@ -802,15 +1249,122 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
                  reader->read_count(), count * sizeof(uint32_t));
     return false;
   }
+  if (kGpuDiagnostics) swap_intervals_.AddType0(count);
 
-  trace_writer_.WritePacketStart(uint32_t(reader->read_ptr() - 4), 1 + count);
+  const uintptr_t packet_host_address = reader->read_ptr() - 4;
+  trace_writer_.WritePacketStart(uint32_t(packet_host_address), 1 + count);
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
+  // The D3D12 bulk writer already preserves shader-constant binding
+  // invalidation and handles wrapped ring reads. Use it only for sequential
+  // float constants when no per-word provenance is required. Repeated-register
+  // packets and all other register ranges retain the ordinary write path.
+  if (!track_ring_publications_ && !write_one_reg && count >= 4 &&
+      base_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+      uint64_t(base_index) + count - 1 <= XE_GPU_REG_SHADER_CONSTANT_511_W) {
+    if (kGpuDiagnostics && cp_cadence_.active) {
+      ++cp_cadence_.type0_bulk_packets;
+      cp_cadence_.type0_bulk_words += count;
+    }
+    WriteRegisterRangeFromRing(reader, base_index, count);
+    trace_writer_.WritePacketEnd();
+    return true;
+  }
+  if (!track_ring_publications_ && register_write_fast_path_) {
+    const uint64_t last_index = uint64_t(base_index) + count - 1;
+    if (!write_one_reg &&
+        ((base_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+          last_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) ||
+         (base_index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
+          last_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31))) {
+      // The backend's range writer applies the same binding, texture and
+      // vertex-buffer invalidation as the per-register path, once per range.
+      WriteRegisterRangeFromRing(reader, base_index, count);
+      trace_writer_.WritePacketEnd();
+      return true;
+    }
+    RegisterFile& regs = *register_file_;
+    for (uint32_t m = 0; m < count; ++m) {
+      const uintptr_t data_host_address = reader->read_ptr();
+      const uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
+      const uint32_t target_index = write_one_reg ? base_index : base_index + m;
+      if (target_index < RegisterFile::kRegisterCount && !register_write_handler_[target_index]) {
+        // No side effects anywhere: the store WriteRegister would make.
+        // Volatile for the WAIT_REG_MEM loop.
+        const_cast<volatile uint32_t&>(regs.values[target_index]) = reg_data;
+        continue;
+      }
+      if (kGpuDiagnostics && !kernel_state_ && target_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+          target_index < XE_GPU_REG_SHADER_CONSTANT_000_X + 11 * 4 &&
+          (reg_data & 0x7F800000u) == 0x7F800000u && (reg_data & 0x007FFFFFu)) {
+        ReportEmbeddedNanConstantSource(packet, packet_host_address, data_host_address,
+                                        base_index, count, write_one_reg, target_index,
+                                        reg_data);
+      }
+      WriteRegisterFromPacket(target_index, reg_data, UINT32_MAX, UINT32_MAX, nullptr);
+    }
+    trace_writer_.WritePacketEnd();
+    return true;
+  }
+  const bool track_provenance = track_ring_publications_;
+  std::unique_ptr<uint32_t[]> nested_owned_words;
+  uint32_t* owned_words = nullptr;
+  bool release_reusable_owned_words = false;
+  if (track_provenance) {
+    if (!type0_owned_words_in_use_) {
+      if (!type0_owned_words_) {
+        type0_owned_words_ = std::make_unique<uint32_t[]>(1024);
+      }
+      type0_owned_words_in_use_ = true;
+      release_reusable_owned_words = true;
+      owned_words = type0_owned_words_.get();
+    } else {
+      // Preserve the original stack copy's isolation if a tracked packet ever
+      // re-enters this handler before its outer words have been consumed.
+      nested_owned_words = std::make_unique<uint32_t[]>(1024);
+      owned_words = nested_owned_words.get();
+    }
+  }
+  struct ReusableOwnedWordsRelease {
+    bool* in_use;
+    ~ReusableOwnedWordsRelease() { if (in_use) *in_use = false; }
+  } reusable_owned_words_release{
+      release_reusable_owned_words ? &type0_owned_words_in_use_ : nullptr};
+  pc_owned_camera_packet::Source owned_source;
+  const uintptr_t source_base = track_provenance
+      ? reinterpret_cast<uintptr_t>(memory_->physical_membase()) : 0;
+  const uint32_t packet_physical = track_provenance
+      ? pc_constant_writer::PhysicalWord(packet_host_address, source_base, 0x20000000u)
+      : UINT32_MAX;
+  // Reject wrapped readers: a contiguous physical range alone does not prove
+  // that the reader's next payload words occupy that range. The host callback
+  // copies payload AND provenance under one memory guard, then releases it.
+  const bool owned = track_provenance && pc_owned_camera_packet::CopyContiguous(owned_camera_packet_callbacks_,
+      packet_physical, packet, count, reader->read_offset(), reader->capacity(),
+      owned_words, &owned_source);
   for (uint32_t m = 0; m < count; m++) {
-    uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
+    const uintptr_t data_host_address = reader->read_ptr();
+    uint32_t reg_data;
+    if (owned) {
+      reg_data = owned_words[m];
+      reader->AdvanceRead(sizeof(uint32_t));
+    } else {
+      reg_data = reader->ReadAndSwap<uint32_t>();
+    }
     uint32_t target_index = write_one_reg ? base_index : base_index + m;
-    WriteRegister(target_index, reg_data);
+    if (kGpuDiagnostics && !kernel_state_ && target_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
+        target_index < XE_GPU_REG_SHADER_CONSTANT_000_X + 11 * 4 &&
+        (reg_data & 0x7F800000u) == 0x7F800000u && (reg_data & 0x007FFFFFu)) {
+      ReportEmbeddedNanConstantSource(packet, packet_host_address, data_host_address, base_index,
+                                      count, write_one_reg, target_index, reg_data);
+    }
+    WriteRegisterFromPacket(target_index, reg_data,
+        packet_physical,
+        track_provenance
+            ? pc_constant_writer::PhysicalWord(data_host_address, source_base, 0x20000000u)
+            : UINT32_MAX,
+        owned ? &owned_source : nullptr);
   }
 
   trace_writer_.WritePacketEnd();
@@ -1016,7 +1570,9 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       }
     } else if (trace_state_ == TraceState::kSingleFrame) {
       // New trace request - we only start tracing at the beginning of a frame.
-      uint32_t title_id = kernel_state_->GetExecutableModule()->title_id();
+      uint32_t title_id = kernel_state_ && kernel_state_->GetExecutableModule()
+                              ? kernel_state_->GetExecutableModule()->title_id()
+                              : 0;
       auto file_name = fmt::format("{:08X}_{}.xtr", title_id, counter_ - 1);
       auto path = trace_frame_path_ / file_name;
       trace_writer_.Open(path, title_id);
@@ -1026,6 +1582,16 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
 
   assert_true(reader->read_offset() ==
               (data_start_offset + (count * sizeof(uint32_t))) % reader->capacity());
+  if (!result && !kernel_state_) {
+    // The embedded host doesn't initialize ReXGlue's logging frontend. Keep
+    // packet rejection visible at the C ABI boundary instead of allowing the
+    // primary-ring read pointer to make a failed packet look successful.
+    std::fprintf(stderr,
+                 "REX_EMBEDDED_PACKET_FAILURE opcode=0x%02X count=%u "
+                 "data_offset=0x%08X\n",
+                 opcode, count, data_start_offset);
+    std::fflush(stderr);
+  }
   return result;
 }
 
@@ -1054,6 +1620,18 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
 
   // generate interrupt from the command stream
   uint32_t cpu_mask = reader->ReadAndSwap<uint32_t>();
+  SettleGuestVisibleWork();
+  static uint64_t embedded_interrupt_ordinal = 0;
+  const uint64_t interrupt_ordinal = ++embedded_interrupt_ordinal;
+  if (kGpuDiagnostics && (interrupt_ordinal <= 16 || !(interrupt_ordinal & 4095))) {
+    std::fprintf(stderr,
+                 "REX_PM4_INTERRUPT ordinal=%llu cpu_mask=0x%08X count=%u\n",
+                 static_cast<unsigned long long>(interrupt_ordinal), cpu_mask, count);
+    std::fflush(stderr);
+    TraceEmbeddedCommandProcessor(
+        "REX_PM4_INTERRUPT ordinal=%llu cpu_mask=0x%08X count=%u",
+        static_cast<unsigned long long>(interrupt_ordinal), cpu_mask, count);
+  }
   for (int n = 0; n < 6; n++) {
     if (cpu_mask & (1 << n)) {
       if (graphics_system_) {
@@ -1064,23 +1642,262 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
   return true;
 }
 
+void CommandProcessor::LogSwapIntervalWindow(uint64_t frequency, bool closed_by_marker) {
+  std::string bins;
+  bins.reserve(390);
+  for (uint32_t i = 0; i <= SwapIntervalDiagnostic::kOverflowBin; ++i) {
+    if (i) bins += ',';
+    bins += std::to_string(swap_intervals_.histogram_ms[i]);
+  }
+  uint64_t tsc_hz = 0;
+#if defined(_WIN32)
+  // Thread cycle times advance at the invariant TSC rate; calibrate it against
+  // the host tick over the whole observed lifetime.
+  const uint64_t now_tick = rex::chrono::Clock::QueryHostTickCount();
+  const uint64_t now_tsc = __rdtsc();
+  if (swap_diag_start_tick_ && now_tick > swap_diag_start_tick_ &&
+      now_tsc > swap_diag_start_tsc_) {
+    tsc_hz = uint64_t(double(now_tsc - swap_diag_start_tsc_) * double(frequency) /
+                      double(now_tick - swap_diag_start_tick_));
+  }
+#endif
+  TraceEmbeddedCommandProcessor(
+      "REX_SWAP_INTERVAL_WINDOW first_swap=%llu last_swap=%llu count=%llu "
+      "first_tick=%llu last_tick=%llu frequency=%llu sum_us=%llu "
+      "min_us=%llu max_us=%llu over_16667_us=%llu over_33334_us=%llu "
+      "max_doubled_run=%llu marker_closed=%u tsc_hz=%llu histogram_ms=%s",
+      static_cast<unsigned long long>(swap_intervals_.first_swap),
+      static_cast<unsigned long long>(swap_intervals_.last_swap),
+      static_cast<unsigned long long>(swap_intervals_.count),
+      static_cast<unsigned long long>(swap_intervals_.first_tick),
+      static_cast<unsigned long long>(swap_intervals_.last_tick),
+      static_cast<unsigned long long>(frequency),
+      static_cast<unsigned long long>(swap_intervals_.sum_us),
+      static_cast<unsigned long long>(swap_intervals_.min_us),
+      static_cast<unsigned long long>(swap_intervals_.max_us),
+      static_cast<unsigned long long>(swap_intervals_.over_16667_us),
+      static_cast<unsigned long long>(swap_intervals_.over_33334_us),
+      static_cast<unsigned long long>(swap_intervals_.max_doubled_run),
+      closed_by_marker ? 1u : 0u, static_cast<unsigned long long>(tsc_hz),
+      bins.c_str());
+  if (const std::string backend = SwapIntervalBackendStats(); !backend.empty()) {
+    TraceEmbeddedCommandProcessor("%s last_swap=%llu", backend.c_str(),
+                                  static_cast<unsigned long long>(swap_intervals_.last_swap));
+  }
+  for (uint32_t group_index = 0; group_index < 2; ++group_index) {
+    const auto& group = group_index ? swap_intervals_.doubled : swap_intervals_.one_refresh;
+    TraceEmbeddedCommandProcessor(
+        "REX_SWAP_WORK_GROUP version=5 last_swap=%llu group=%u count=%llu "
+        "elapsed_ticks=%llu idle_ticks=%llu wait_ticks=%llu "
+        "issue_swap_ticks=%llu remaining_ticks=%llu waits=%llu "
+        "accounting_invalid=%llu thread_cpu_100ns=%llu "
+        "thread_cpu_samples=%llu thread_cycles=%llu thread_cycle_samples=%llu "
+        "draws=%llu type0_packets=%llu "
+        "type0_words=%llu zpd_calls=%llu zpd_ticks=%llu "
+        "sampled_draws=%llu draw_pre_texture_ticks=%llu "
+        "draw_pre_binding_ticks=%llu draw_post_binding_ticks=%llu "
+        "draw_binding_ticks=%llu frequency=%llu",
+        static_cast<unsigned long long>(swap_intervals_.last_swap), group_index,
+        static_cast<unsigned long long>(group.count),
+        static_cast<unsigned long long>(group.elapsed_ticks),
+        static_cast<unsigned long long>(group.idle_ticks),
+        static_cast<unsigned long long>(group.wait_ticks),
+        static_cast<unsigned long long>(group.issue_swap_ticks),
+        static_cast<unsigned long long>(group.remaining_ticks),
+        static_cast<unsigned long long>(group.waits),
+        static_cast<unsigned long long>(group.accounting_invalid),
+        static_cast<unsigned long long>(group.thread_cpu_100ns),
+        static_cast<unsigned long long>(group.thread_cpu_samples),
+        static_cast<unsigned long long>(group.thread_cycles),
+        static_cast<unsigned long long>(group.thread_cycle_samples),
+        static_cast<unsigned long long>(group.draws),
+        static_cast<unsigned long long>(group.type0_packets),
+        static_cast<unsigned long long>(group.type0_words),
+        static_cast<unsigned long long>(group.zpd_calls),
+        static_cast<unsigned long long>(group.zpd_ticks),
+        static_cast<unsigned long long>(group.sampled_draws),
+        static_cast<unsigned long long>(group.sampled_draw_ticks[0]),
+        static_cast<unsigned long long>(group.sampled_draw_ticks[1]),
+        static_cast<unsigned long long>(group.sampled_draw_ticks[2]),
+        static_cast<unsigned long long>(group.sampled_binding_ticks),
+        static_cast<unsigned long long>(frequency));
+    // Seven mutually exclusive portions of the sampled pre-texture draw
+    // path. Counts may differ because early returns stop at their last
+    // reached boundary; ticks are raw host ticks, not rounded microseconds.
+    TraceEmbeddedCommandProcessor(
+        "REX_SWAP_DRAW_PRE_TEXTURE version=1 last_swap=%llu group=%u "
+        "pre_primitive=%llu,%llu primitive=%llu,%llu "
+        "pre_target=%llu,%llu target=%llu,%llu "
+        "pre_pipeline=%llu,%llu pipeline=%llu,%llu "
+        "texture=%llu,%llu frequency=%llu",
+        static_cast<unsigned long long>(swap_intervals_.last_swap), group_index,
+        static_cast<unsigned long long>(group.sampled_pre_texture_part_counts[0]),
+        static_cast<unsigned long long>(group.sampled_pre_texture_part_ticks[0]),
+        static_cast<unsigned long long>(group.sampled_pre_texture_part_counts[1]),
+        static_cast<unsigned long long>(group.sampled_pre_texture_part_ticks[1]),
+        static_cast<unsigned long long>(group.sampled_pre_texture_part_counts[2]),
+        static_cast<unsigned long long>(group.sampled_pre_texture_part_ticks[2]),
+        static_cast<unsigned long long>(group.sampled_pre_texture_part_counts[3]),
+        static_cast<unsigned long long>(group.sampled_pre_texture_part_ticks[3]),
+        static_cast<unsigned long long>(group.sampled_pre_texture_part_counts[4]),
+        static_cast<unsigned long long>(group.sampled_pre_texture_part_ticks[4]),
+        static_cast<unsigned long long>(group.sampled_pre_texture_part_counts[5]),
+        static_cast<unsigned long long>(group.sampled_pre_texture_part_ticks[5]),
+        static_cast<unsigned long long>(group.sampled_pre_texture_part_counts[6]),
+        static_cast<unsigned long long>(group.sampled_pre_texture_part_ticks[6]),
+        static_cast<unsigned long long>(frequency));
+    TraceEmbeddedCommandProcessor(
+        "REX_SWAP_WORK_EXTRA version=1 last_swap=%llu group=%u upload_bytes=%llu "
+        "upload_ranges=%llu max_frame_upload_bytes=%llu "
+        "render_target_update_reuses=%llu",
+        static_cast<unsigned long long>(swap_intervals_.last_swap), group_index,
+        static_cast<unsigned long long>(group.upload_bytes),
+        static_cast<unsigned long long>(group.upload_ranges),
+        static_cast<unsigned long long>(group.max_frame_upload_bytes),
+        static_cast<unsigned long long>(group.render_target_update_reuses));
+  }
+  const auto& zpd = swap_intervals_.zpd;
+  TraceEmbeddedCommandProcessor(
+      "REX_SWAP_ZPD version=1 last_swap=%llu ended=%llu published=%llu "
+      "max_depth=%llu lag0=%llu lag1=%llu lag2=%llu lag3p=%llu "
+      "slot_awaits=%llu write_awaits=%llu index_awaits=%llu "
+      "blocking_awaits=%llu pending=%llu",
+      static_cast<unsigned long long>(swap_intervals_.last_swap),
+      static_cast<unsigned long long>(zpd.ended),
+      static_cast<unsigned long long>(zpd.published),
+      static_cast<unsigned long long>(zpd.max_depth),
+      static_cast<unsigned long long>(zpd.lag_swaps[0]),
+      static_cast<unsigned long long>(zpd.lag_swaps[1]),
+      static_cast<unsigned long long>(zpd.lag_swaps[2]),
+      static_cast<unsigned long long>(zpd.lag_swaps[3]),
+      static_cast<unsigned long long>(zpd.slot_awaits),
+      static_cast<unsigned long long>(zpd.write_awaits),
+      static_cast<unsigned long long>(zpd.index_awaits),
+      static_cast<unsigned long long>(zpd.blocking_awaits),
+      static_cast<unsigned long long>(swap_intervals_.zpd_pending_now));
+  TraceEmbeddedCommandProcessor(
+      "REX_SWAP_WORK_FENCE version=2 last_swap=%llu long_threshold_us=%llu "
+      "fence_wait_ticks=%llu,%llu full_syncs=%llu,%llu texture_creates=%llu,%llu "
+      "texture_create_ticks=%llu,%llu long_frames=%u long_frames_dropped=%llu",
+      static_cast<unsigned long long>(swap_intervals_.last_swap),
+      static_cast<unsigned long long>(swap_intervals_.long_interval_us),
+      static_cast<unsigned long long>(swap_intervals_.one_refresh.fence_wait_ticks),
+      static_cast<unsigned long long>(swap_intervals_.doubled.fence_wait_ticks),
+      static_cast<unsigned long long>(swap_intervals_.one_refresh.full_syncs),
+      static_cast<unsigned long long>(swap_intervals_.doubled.full_syncs),
+      static_cast<unsigned long long>(swap_intervals_.one_refresh.texture_creations),
+      static_cast<unsigned long long>(swap_intervals_.doubled.texture_creations),
+      static_cast<unsigned long long>(swap_intervals_.one_refresh.texture_create_ticks),
+      static_cast<unsigned long long>(swap_intervals_.doubled.texture_create_ticks),
+      swap_intervals_.long_frame_count,
+      static_cast<unsigned long long>(swap_intervals_.long_frames_dropped));
+  if (swap_intervals_.long_frame_count) {
+    TraceSwapLongFrames(swap_intervals_, frequency, tsc_hz);
+  }
+  swap_intervals_.ResetWindow();
+}
+
 bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet,
                                                   uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
+  SettleGuestVisibleWork();
 
-#ifdef REXGLUE_ENABLE_PERF_COUNTERS
   {
-    static uint64_t last_frame_tick = 0;
-    uint64_t now = rex::chrono::Clock::QueryHostTickCount();
-    if (last_frame_tick) {
-      uint64_t freq = rex::chrono::Clock::QueryHostTickFrequency();
-      int64_t dt_us = static_cast<int64_t>((now - last_frame_tick) * 1000000 / freq);
-      PROFILE_FRAME_TIME_US(dt_us);
-      PROFILE_FPS(freq / (now - last_frame_tick));
+    const bool interval_enabled = kGpuDiagnostics &&
+        !kernel_state_ && REXCVAR_GET(embedded_swap_interval_diagnostics);
+    uint64_t thread_cpu_100ns = 0;
+    bool thread_cpu_valid = false;
+    uint64_t thread_cycles = 0;
+    bool thread_cycles_valid = false;
+#if defined(_WIN32)
+    if (interval_enabled) {
+      FILETIME created{}, exited{}, kernel{}, user{};
+      if (::GetThreadTimes(::GetCurrentThread(), &created, &exited, &kernel, &user)) {
+        const auto ticks = [](const FILETIME& value) {
+          return (uint64_t(value.dwHighDateTime) << 32) | value.dwLowDateTime;
+        };
+        thread_cpu_100ns = ticks(kernel) + ticks(user);
+        thread_cpu_valid = true;
+      }
+      ULONG64 cycles = 0;
+      if (::QueryThreadCycleTime(::GetCurrentThread(), &cycles)) {
+        thread_cycles = cycles;
+        thread_cycles_valid = true;
+      }
     }
-    last_frame_tick = now;
-  }
 #endif
+    const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+    const uint64_t frequency = rex::chrono::Clock::QueryHostTickFrequency();
+#if defined(_WIN32)
+    if (interval_enabled) {
+      if (!swap_diag_start_tick_) {
+        swap_diag_start_tick_ = now;
+        swap_diag_start_tsc_ = __rdtsc();
+      }
+      // Isolated diagnostic sessions only: F9 marks a phase boundary (for
+      // example stationary -> camera turn -> walk) and closes the current
+      // window so each phase is aggregated separately.
+      const bool marker_down = (::GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+      if (marker_down && !swap_phase_marker_down_) {
+        ++swap_phase_markers_;
+        TraceEmbeddedCommandProcessor(
+            "REX_SWAP_PHASE_MARKER index=%u swap=%llu tick=%llu frequency=%llu",
+            swap_phase_markers_,
+            static_cast<unsigned long long>(
+                guest_frame_count_.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(now),
+            static_cast<unsigned long long>(frequency));
+        if (swap_intervals_.active && swap_intervals_.count && frequency) {
+          LogSwapIntervalWindow(frequency, true);
+        }
+      }
+      swap_phase_marker_down_ = marker_down;
+    }
+#endif
+    if (interval_enabled) {
+      const int32_t long_frame_us = REXCVAR_GET(embedded_swap_long_frame_us);
+      if (long_frame_us > 0 && !swap_long_frame_storage_) {
+        swap_long_frame_storage_ = std::make_unique<SwapIntervalDiagnostic::LongFrame[]>(
+            SwapIntervalDiagnostic::kLongFrameCapacity);
+        swap_intervals_.long_frames = swap_long_frame_storage_.get();
+        swap_intervals_.long_frame_capacity = SwapIntervalDiagnostic::kLongFrameCapacity;
+      }
+      swap_intervals_.capture_long_frames = long_frame_us > 0;
+      swap_intervals_.long_interval_us = long_frame_us > 0
+                                             ? uint64_t(long_frame_us)
+                                             : SwapIntervalDiagnostic::kDoubledIntervalUs;
+    }
+    if (guest_frame_last_tick_) {
+      const uint64_t elapsed_ticks = now - guest_frame_last_tick_;
+      const uint64_t frame_time_us =
+          frequency ? elapsed_ticks * 1000000 / frequency : 0;
+      guest_frame_time_us_.store(frame_time_us, std::memory_order_relaxed);
+      if (kGpuDiagnostics && frequency &&
+          swap_intervals_.Observe(interval_enabled,
+                                  guest_frame_count_.load(std::memory_order_relaxed) + 1,
+                                  guest_frame_last_tick_, now, frame_time_us,
+                                  thread_cpu_100ns, thread_cpu_valid,
+                                  thread_cycles, thread_cycles_valid)) {
+        LogSwapIntervalWindow(frequency, false);
+      }
+#ifdef REXGLUE_ENABLE_PERF_COUNTERS
+      const int64_t dt_us = static_cast<int64_t>(frame_time_us);
+      PROFILE_FRAME_TIME_US(dt_us);
+      PROFILE_FPS(elapsed_ticks ? frequency / elapsed_ticks : 0);
+#endif
+    }
+    if (interval_enabled && !swap_intervals_.active) {
+      swap_intervals_.SetThreadCpuBaseline(thread_cpu_100ns, thread_cpu_valid);
+      swap_intervals_.SetThreadCycleBaseline(thread_cycles, thread_cycles_valid);
+    }
+    guest_frame_last_tick_ = now;
+    const uint64_t current_swap = guest_frame_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (kGpuDiagnostics) {
+      swap_intervals_.active = interval_enabled &&
+          current_swap < 1 + SwapIntervalDiagnostic::kWindowSize *
+                             SwapIntervalDiagnostic::kMaxWindows;
+    }
+  }
   rex::perf::Profiler::Flip();
 
   // Xenia-specific VdSwap hook.
@@ -1096,7 +1913,169 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
+  const bool cadence_enabled = kGpuDiagnostics &&
+      !kernel_state_ && REXCVAR_GET(embedded_cp_cadence_diagnostics);
+  // counter_ is also advanced by VBlank and is not a swap ordinal.
+  const uint64_t cadence_swap_ordinal =
+      guest_frame_count_.load(std::memory_order_relaxed);
+  if (cadence_enabled && cadence_swap_ordinal == 1) {
+    TraceEmbeddedCommandProcessor(
+        "REX_CP_CADENCE_BEGIN version=1 max_intervals=128 selector=real_XE_SWAP "
+        "guest_timing_changed=0");
+  }
+  const bool interval_swap_active = kGpuDiagnostics && swap_intervals_.active;
+  const uint64_t observed_swap_begin =
+      ((kGpuDiagnostics && cp_cadence_.active) || interval_swap_active)
+      ? rex::chrono::Clock::QueryHostTickCount() : 0;
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  const uint64_t observed_swap_end =
+      ((kGpuDiagnostics && cp_cadence_.active) || interval_swap_active)
+      ? rex::chrono::Clock::QueryHostTickCount() : 0;
+  if (interval_swap_active) {
+    swap_intervals_.AddIssueSwap(observed_swap_end - observed_swap_begin);
+  }
+  if (kGpuDiagnostics && cp_cadence_.active) {
+    const uint64_t end = observed_swap_end;
+    const auto interrupt_batch = cp_interrupt_timing.Finish();
+    const uint64_t frequency = rex::chrono::Clock::QueryHostTickFrequency();
+    // Keep raw host ticks to avoid rounding and permit independent accounting.
+    // 'other' includes draws/resources, dispatch and host scheduling, NOT GPU time.
+    const uint64_t interval = observed_swap_begin - cp_cadence_.begin_tick;
+    const uint64_t accounted = cp_cadence_.idle_ticks + cp_cadence_.wait_ticks;
+    uint64_t submitted = 0, completed = 0;
+    const bool submission_valid = QueryCadenceSubmission(submitted, completed);
+    TraceEmbeddedCommandProcessor(
+        "REX_CP_CADENCE completed_swap=%llu frequency=%llu begin_tick=%llu "
+        "end_tick=%llu interval_ticks=%llu idle_ticks=%llu wait_ticks=%llu "
+        "other_ticks=%llu accounting_valid=%u issue_swap_ticks=%llu "
+        "waits=%llu max_wait_ticks=%llu wait_info=%08X wait_address=%08X "
+        "wait_ref=%08X wait_mask=%08X wait_poll=%08X markers=%llu "
+        "last_marker_tick=%llu last_marker_address=%08X last_marker_value=%08X "
+        "host_submission_valid=%u host_submitted=%llu host_completed=%llu",
+        static_cast<unsigned long long>(cadence_swap_ordinal),
+        static_cast<unsigned long long>(frequency),
+        static_cast<unsigned long long>(cp_cadence_.begin_tick),
+        static_cast<unsigned long long>(end),
+        static_cast<unsigned long long>(interval),
+        static_cast<unsigned long long>(cp_cadence_.idle_ticks),
+        static_cast<unsigned long long>(cp_cadence_.wait_ticks),
+        static_cast<unsigned long long>(interval >= accounted ? interval - accounted : 0),
+        interval >= accounted ? 1u : 0u,
+        static_cast<unsigned long long>(end - observed_swap_begin),
+        static_cast<unsigned long long>(cp_cadence_.waits),
+        static_cast<unsigned long long>(cp_cadence_.max_wait_ticks),
+        cp_cadence_.max_wait_info, cp_cadence_.max_wait_address,
+        cp_cadence_.max_wait_ref, cp_cadence_.max_wait_mask,
+        cp_cadence_.max_wait_poll,
+        static_cast<unsigned long long>(cp_cadence_.markers),
+        static_cast<unsigned long long>(cp_cadence_.marker_tick),
+        cp_cadence_.marker_address, cp_cadence_.marker_value,
+        submission_valid ? 1u : 0u,
+        static_cast<unsigned long long>(submitted),
+        static_cast<unsigned long long>(completed));
+    for (uint32_t i = 0; i < cp_cadence_.wait_group_count; ++i) {
+      const auto& g = cp_cadence_.wait_groups[i];
+      TraceEmbeddedCommandProcessor(
+          "REX_CP_WAIT_GROUP completed_swap=%llu group=%u info=%08X address=%08X "
+          "ref=%08X mask=%08X poll=%08X count=%llu ticks=%llu sleeps=%llu sleep_ticks=%llu",
+          static_cast<unsigned long long>(cadence_swap_ordinal), i,
+          g.info, g.address, g.ref, g.mask, g.poll,
+          static_cast<unsigned long long>(g.count),
+          static_cast<unsigned long long>(g.ticks),
+          static_cast<unsigned long long>(g.sleeps),
+          static_cast<unsigned long long>(g.sleep_ticks));
+    }
+    for (uint32_t i = 0; i < 3; ++i) {
+      const auto& s = cp_cadence_.draw_stages[i];
+      TraceEmbeddedCommandProcessor(
+          "REX_CP_DRAW_STAGE completed_swap=%llu stage=%u calls=%llu us=%llu max_us=%llu",
+          static_cast<unsigned long long>(cadence_swap_ordinal), i,
+          static_cast<unsigned long long>(s.calls),
+          static_cast<unsigned long long>(s.us),
+          static_cast<unsigned long long>(s.max_us));
+    }
+    TraceEmbeddedCommandProcessor(
+        "REX_CP_DRAW_WORK completed_swap=%llu calls=%llu ticks=%llu max_ticks=%llu",
+        static_cast<unsigned long long>(cadence_swap_ordinal),
+        static_cast<unsigned long long>(cp_cadence_.draw_work.calls),
+        static_cast<unsigned long long>(cp_cadence_.draw_work.ticks),
+        static_cast<unsigned long long>(cp_cadence_.draw_work.max_ticks));
+    for (uint32_t i = 0; i < 4; ++i) {
+      const auto& work = cp_cadence_.packet_work[i];
+      TraceEmbeddedCommandProcessor(
+          "REX_CP_PACKET_WORK completed_swap=%llu category=%u calls=%llu ticks=%llu max_ticks=%llu",
+          static_cast<unsigned long long>(cadence_swap_ordinal), i,
+          static_cast<unsigned long long>(work.calls),
+          static_cast<unsigned long long>(work.ticks),
+          static_cast<unsigned long long>(work.max_ticks));
+    }
+    TraceEmbeddedCommandProcessor(
+        "REX_CP_TYPE0_BULK completed_swap=%llu packets=%llu words=%llu",
+        static_cast<unsigned long long>(cadence_swap_ordinal),
+        static_cast<unsigned long long>(cp_cadence_.type0_bulk_packets),
+        static_cast<unsigned long long>(cp_cadence_.type0_bulk_words));
+    for (uint32_t opcode = 0; opcode < 128; ++opcode) {
+      const auto& work = cp_cadence_.type3_opcode_work[opcode];
+      if (!work.calls) continue;
+      TraceEmbeddedCommandProcessor(
+          "REX_CP_TYPE3_OPCODE_WORK completed_swap=%llu opcode=%02X calls=%llu ticks=%llu max_ticks=%llu",
+          static_cast<unsigned long long>(cadence_swap_ordinal), opcode,
+          static_cast<unsigned long long>(work.calls),
+          static_cast<unsigned long long>(work.ticks),
+          static_cast<unsigned long long>(work.max_ticks));
+    }
+    for (uint32_t stage = 0; stage < 5; ++stage) {
+      const auto& work = cp_cadence_.occlusion_work[stage];
+      TraceEmbeddedCommandProcessor(
+          "REX_CP_ZPD_WORK completed_swap=%llu stage=%u calls=%llu ticks=%llu max_ticks=%llu",
+          static_cast<unsigned long long>(cadence_swap_ordinal), stage,
+          static_cast<unsigned long long>(work.calls),
+          static_cast<unsigned long long>(work.ticks),
+          static_cast<unsigned long long>(work.max_ticks));
+    }
+    TraceEmbeddedCommandProcessor(
+        "REX_CP_ZPD_GPU completed_swap=%llu calls=%llu gpu_ticks=%llu max_gpu_ticks=%llu frequency=%llu",
+        static_cast<unsigned long long>(cadence_swap_ordinal),
+        static_cast<unsigned long long>(cp_cadence_.occlusion_gpu_work.calls),
+        static_cast<unsigned long long>(cp_cadence_.occlusion_gpu_work.ticks),
+        static_cast<unsigned long long>(cp_cadence_.occlusion_gpu_work.max_ticks),
+        static_cast<unsigned long long>(cp_cadence_.occlusion_gpu_frequency));
+    TraceEmbeddedCommandProcessor(
+        "REX_CP_ZPD_QUEUE completed_swap=%llu calls=%llu submit_to_begin_ms=%.4f max_submit_to_begin_ms=%.4f end_to_retire_ms=%.4f max_end_to_retire_ms=%.4f calibration_ms=%.4f",
+        static_cast<unsigned long long>(cadence_swap_ordinal),
+        static_cast<unsigned long long>(cp_cadence_.occlusion_gpu_queue_calls),
+        cp_cadence_.occlusion_submit_to_begin_ms,
+        cp_cadence_.occlusion_submit_to_begin_max_ms,
+        cp_cadence_.occlusion_end_to_retire_ms,
+        cp_cadence_.occlusion_end_to_retire_max_ms,
+        cp_cadence_.occlusion_calibration_ms);
+    TraceEmbeddedCommandProcessor(
+        "REX_CP_WAIT_OVERFLOW completed_swap=%llu count=%llu ticks=%llu sleeps=%llu sleep_ticks=%llu",
+        static_cast<unsigned long long>(cadence_swap_ordinal),
+        static_cast<unsigned long long>(cp_cadence_.overflow_waits),
+        static_cast<unsigned long long>(cp_cadence_.overflow_ticks),
+        static_cast<unsigned long long>(cp_cadence_.overflow_sleeps),
+        static_cast<unsigned long long>(cp_cadence_.overflow_sleep_ticks));
+    for (uint32_t i = 0; i < interrupt_batch.count; ++i) {
+      const auto& r = interrupt_batch.records[i];
+      TraceEmbeddedCommandProcessor(
+          "REX_CP_INTERRUPT_TIMING completed_swap=%llu kind=%u source=%u address=%08X "
+          "before=%08X after=%08X enqueue_tick=%llu dispatch_tick=%llu return_tick=%llu",
+          static_cast<unsigned long long>(cadence_swap_ordinal), r.kind, r.source,
+          r.address, r.before, r.after, static_cast<unsigned long long>(r.enqueue),
+          static_cast<unsigned long long>(r.dispatch), static_cast<unsigned long long>(r.returned));
+    }
+    TraceEmbeddedCommandProcessor("REX_CP_INTERRUPT_TIMING_END completed_swap=%llu count=%u overflow=%u",
+        static_cast<unsigned long long>(cadence_swap_ordinal), interrupt_batch.count, interrupt_batch.overflow);
+  }
+  const uint64_t next_ordinal = cadence_swap_ordinal;
+  const bool next_sample = cadence_enabled &&
+      CpCadenceDiagnostic::ShouldSample(next_ordinal);
+  if (kGpuDiagnostics) {
+    cp_cadence_.Begin(cadence_enabled, next_ordinal, next_sample
+        ? rex::chrono::Clock::QueryHostTickCount() : 0);
+  }
+  if (next_sample) cp_interrupt_timing.Begin(next_ordinal);
 
   ++counter_;
   return true;
@@ -1126,13 +2105,44 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   uint32_t wait = reader->ReadAndSwap<uint32_t>();
 
   bool is_memory = (wait_info & 0x10) != 0;
+  const bool interval_wait_active = kGpuDiagnostics && swap_intervals_.active;
+  const uint64_t observed_wait_begin =
+      ((kGpuDiagnostics && cp_cadence_.active) || interval_wait_active)
+      ? rex::chrono::Clock::QueryHostTickCount() : 0;
+  static uint64_t wait_sequence = 0;
+  const uint64_t sequence = ++wait_sequence;
+  const bool trace_wait = kGpuDiagnostics && sequence <= 64;
+  if (trace_wait) {
+    std::fprintf(stderr,
+                 "REX_WAIT_REG_MEM_BEGIN sequence=%" PRIu64
+                 " info=0x%08X address=0x%08X ref=0x%08X mask=0x%08X wait=0x%08X "
+                 "memory=%u endian=%u\n",
+                 sequence, wait_info, poll_reg_addr, ref, mask, wait, is_memory ? 1u : 0u,
+                 is_memory ? (poll_reg_addr & 3u) : 0u);
+    std::fflush(stderr);
+    TraceEmbeddedCommandProcessor(
+        "REX_WAIT_REG_MEM_BEGIN sequence=%" PRIu64
+        " info=0x%08X address=0x%08X ref=0x%08X mask=0x%08X wait=0x%08X memory=%u "
+        "endian=%u",
+        sequence, wait_info, poll_reg_addr, ref, mask, wait, is_memory ? 1u : 0u,
+        is_memory ? (poll_reg_addr & 3u) : 0u);
+  }
 
   bool matched = false;
+  bool first_observation = true;
+  uint64_t cadence_sleeps = 0, cadence_sleep_ticks = 0;
+  const bool interrupt_wakeup = !kernel_state_ && is_memory &&
+      REXCVAR_GET(embedded_interrupt_wait_wakeup);
   do {
+    // Register before observing memory: callback completion cannot be lost
+    // between a failed comparison and entering the host wait.
+    const uint64_t wake_generation = interrupt_wakeup ? cp_interrupt_wakeup.Snapshot() : 0;
     uint32_t value = 0;
+    uint32_t raw_value = 0;
     if (is_memory) {
-      value =
+      raw_value =
           *reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
+      value = raw_value;
       trace_writer_.WriteMemoryRead(CpuToGpu(poll_reg_addr & ~uint32_t(0x3)), sizeof(uint32_t));
       value = xenos::GpuSwap(value, static_cast<xenos::Endian>(poll_reg_addr & 0x3));
     } else {
@@ -1168,6 +2178,18 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         matched = true;
         break;
     }
+    if (trace_wait && (first_observation || matched)) {
+      std::fprintf(stderr,
+                   "REX_WAIT_REG_MEM_OBSERVE sequence=%" PRIu64
+                   " raw=0x%08X value=0x%08X matched=%u\n",
+                   sequence, raw_value, value, matched ? 1u : 0u);
+      std::fflush(stderr);
+      TraceEmbeddedCommandProcessor(
+          "REX_WAIT_REG_MEM_OBSERVE sequence=%" PRIu64
+          " raw=0x%08X value=0x%08X matched=%u",
+          sequence, raw_value, value, matched ? 1u : 0u);
+    }
+    first_observation = false;
     if (!matched) {
       // Wait.
       if (wait >= 0x100) {
@@ -1176,7 +2198,19 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
         } else {
-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+          // Nested in WAIT duration: measure only in an already-selected
+          // window. Never alter the wait policy or log inside the polling loop.
+          const uint64_t sleep_begin = (kGpuDiagnostics && cp_cadence_.active)
+              ? rex::chrono::Clock::QueryHostTickCount() : 0;
+          if (interrupt_wakeup) {
+            cp_interrupt_wakeup.Wait(wake_generation, std::chrono::milliseconds(wait / 0x100));
+          } else {
+            rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+          }
+          if (kGpuDiagnostics && cp_cadence_.active) {
+            ++cadence_sleeps;
+            cadence_sleep_ticks += rex::chrono::Clock::QueryHostTickCount() - sleep_begin;
+          }
         }
         rex::thread::SyncMemory();
         ReturnFromWait();
@@ -1190,6 +2224,18 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
+  if ((kGpuDiagnostics && cp_cadence_.active) || interval_wait_active) {
+    const uint64_t observed_tick = rex::chrono::Clock::QueryHostTickCount();
+    const uint64_t wait_ticks = observed_tick - observed_wait_begin;
+    if (cp_cadence_.active) {
+      cp_cadence_.Wait(wait_ticks, wait_info, poll_reg_addr, ref, mask, wait,
+                       cadence_sleeps, cadence_sleep_ticks);
+      if (is_memory) cp_interrupt_timing.Add(cp_interrupt_timing.Token(),
+          {2, wait_info, poll_reg_addr & ~uint32_t(3), ref, mask,
+           observed_wait_begin, 0, observed_tick});
+    }
+    if (interval_wait_active) swap_intervals_.AddWait(wait_ticks);
+  }
 
   return true;
 }
@@ -1233,7 +2279,11 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
   auto endianness = static_cast<xenos::Endian>(mem_addr & 0x3);
   mem_addr &= ~0x3;
   reg_val = GpuSwap(reg_val, endianness);
-  memory::store(memory_->TranslatePhysical(mem_addr), reg_val);
+  PrepareForPacketMemoryWrite(mem_addr, 4);
+  {
+    auto host_write = memory_->GuardPhysicalWrite(mem_addr, 4);
+    memory::store(memory_->TranslatePhysical(mem_addr), reg_val);
+  }
   trace_writer_.WriteMemoryWrite(CpuToGpu(mem_addr), 4);
 
   return true;
@@ -1242,13 +2292,19 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
 bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, uint32_t packet,
                                                     uint32_t count) {
   uint32_t write_addr = reader->ReadAndSwap<uint32_t>();
+  if (count > 1) {
+    PrepareForPacketMemoryWrite(write_addr & ~0x3, (count - 1) * sizeof(uint32_t));
+  }
   for (uint32_t i = 0; i < count - 1; i++) {
     uint32_t write_data = reader->ReadAndSwap<uint32_t>();
 
     auto endianness = static_cast<xenos::Endian>(write_addr & 0x3);
     auto addr = write_addr & ~0x3;
     write_data = GpuSwap(write_data, endianness);
-    memory::store(memory_->TranslatePhysical(addr), write_data);
+    {
+      auto host_write = memory_->GuardPhysicalWrite(addr, 4);
+      memory::store(memory_->TranslatePhysical(addr), write_data);
+    }
     trace_writer_.WriteMemoryWrite(CpuToGpu(addr), 4);
     write_addr += 4;
   }
@@ -1311,7 +2367,11 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
       auto endianness = static_cast<xenos::Endian>(write_reg_addr & 0x3);
       write_reg_addr &= ~0x3;
       write_data = GpuSwap(write_data, endianness);
-      memory::store(memory_->TranslatePhysical(write_reg_addr), write_data);
+      PrepareForPacketMemoryWrite(write_reg_addr, 4);
+      {
+        auto host_write = memory_->GuardPhysicalWrite(write_reg_addr, 4);
+        memory::store(memory_->TranslatePhysical(write_reg_addr), write_data);
+      }
       trace_writer_.WriteMemoryWrite(CpuToGpu(write_reg_addr), 4);
     } else {
       // Register.
@@ -1357,7 +2417,17 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
-  memory::store(memory_->TranslatePhysical(address), data_value);
+  PrepareForPacketMemoryWrite(address, 4);
+  {
+    auto host_write = memory_->GuardPhysicalWrite(address, 4);
+    memory::store(memory_->TranslatePhysical(address), data_value);
+  }
+  if (kGpuDiagnostics && cp_cadence_.active) {
+    ++cp_cadence_.markers;
+    cp_cadence_.marker_tick = rex::chrono::Clock::QueryHostTickCount();
+    cp_cadence_.marker_address = address;
+    cp_cadence_.marker_value = GpuSwap(data_value, endianness);
+  }
   trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
   return true;
 }
@@ -1385,8 +2455,12 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* re
       1,                                         // max z
   };
   assert_true(endianness == xenos::Endian::k8in16);
-  memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(address), extents,
-                                     rex::countof(extents));
+  PrepareForPacketMemoryWrite(address, sizeof(extents));
+  {
+    auto host_write = memory_->GuardPhysicalWrite(address, sizeof(extents));
+    memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(address), extents,
+        rex::countof(extents));
+  }
   trace_writer_.WriteMemoryWrite(CpuToGpu(address), sizeof(extents));
   return true;
 }
@@ -1410,6 +2484,9 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
     if (!pSampleCounts) {
       return true;
     }
+    SettleGuestVisibleWork();
+    auto host_write = memory_->GuardPhysicalWrite(
+        register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR], sizeof(xe_gpu_depth_sample_counts));
     // 0xFFFFFEED is written to this two locations by D3D only on D3DISSUE_END
     // and used to detect a finished query.
     bool is_end_via_z_pass =
@@ -1523,8 +2600,31 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
 
       bool major_mode_explicit =
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
+      if (kGpuDiagnostics) swap_intervals_.AddDraw();
       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
+      // Per-draw ordinal log: measurement builds. Player builds still report
+      // D3D12 draw failures with their stage (REX_EMBEDDED_DRAW_FAILURE).
+      if (kGpuDiagnostics && !kernel_state_) {
+        static uint64_t embedded_draw_ordinal = 0;
+        static uint64_t embedded_draw_failure_ordinal = 0;
+        const uint64_t ordinal = ++embedded_draw_ordinal;
+        const uint64_t failure_ordinal =
+            draw_succeeded ? 0 : ++embedded_draw_failure_ordinal;
+        if (failure_ordinal &&
+            (failure_ordinal <= 64 || !(failure_ordinal & 1023))) {
+          const auto rb_modecontrol = register_file_->Get<reg::RB_MODECONTROL>();
+          std::fprintf(
+              stderr,
+              "REX_EMBEDDED_DRAW ordinal=%llu result=%u indices=%u primitive=%u source=%u "
+              "indexed=%u edram_mode=%u\n",
+              static_cast<unsigned long long>(ordinal), draw_succeeded ? 1u : 0u,
+              vgt_draw_initiator.num_indices, uint32_t(vgt_draw_initiator.prim_type),
+              uint32_t(vgt_draw_initiator.source_select), is_indexed ? 1u : 0u,
+              uint32_t(rb_modecontrol.edram_mode));
+          std::fflush(stderr);
+        }
+      }
       if (!draw_succeeded) {
         auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
         auto vgt_hos_cntl = register_file_->Get<reg::VGT_HOS_CNTL>();

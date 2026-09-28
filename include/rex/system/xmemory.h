@@ -18,6 +18,7 @@
 #include <vector>
 
 #include <rex/memory/utils.h>
+#include <rex/memory/host_write_scope.h>
 #include <rex/ppc/context.h>  // PPCFunc type (minimal header)
 #include <rex/system/mmio_handler.h>
 #include <rex/thread/mutex.h>
@@ -330,6 +331,34 @@ class Memory {
   // mapping to the file system fails.
   bool Initialize();
 
+  // Adopts memory owned by a static-recompilation host. The caller retains
+  // ownership and must keep both mappings alive until this Memory is
+  // destroyed. No views, allocations, or MMIO exception handlers are created.
+  // Physical cache invalidation is delivered explicitly by the embedding host.
+  // host_writes guard host writes of CPU-side data (Guard*Write); the
+  // optional gpu_mirror_writes guard GPU results copied into guest memory
+  // (GuardGpuMirrorWrite).
+  bool InitializeExternal(uint8_t* virtual_membase, uint8_t* physical_membase,
+                          HostWriteCallbacks host_writes = {},
+                          HostWriteCallbacks gpu_mirror_writes = {});
+
+  HostWriteScope GuardPhysicalWrite(uint32_t address, uint32_t bytes) const {
+    return HostWriteScope(host_writes_, address & 0x1FFFFFFFu, bytes);
+  }
+  HostWriteScope GuardVirtualWrite(uint32_t address, uint32_t bytes) const {
+    const uint32_t physical = GetPhysicalAddress(address);
+    return HostWriteScope(physical == UINT32_MAX ? HostWriteCallbacks{} : host_writes_,
+                          physical, bytes);
+  }
+  // Memexport and resolve readbacks: the GPU copy of guest memory already
+  // holds this data (GPU-written pages), so these writes must not be treated
+  // as CPU writes that invalidate it.
+  HostWriteScope GuardGpuMirrorWrite(uint32_t address, uint32_t bytes) const {
+    return HostWriteScope(host_mirror_writes_, address & 0x1FFFFFFFu, bytes);
+  }
+
+  bool is_external() const { return external_backing_; }
+
   // Resets all memory to zero and resets all allocations.
   void Reset();
 
@@ -534,6 +563,9 @@ class Memory {
   uint32_t system_allocation_granularity_ = 0;
   uint8_t* virtual_membase_ = nullptr;
   uint8_t* physical_membase_ = nullptr;
+  HostWriteCallbacks host_writes_{}; // Immutable after external initialization.
+  HostWriteCallbacks host_mirror_writes_{};  // Likewise.
+  bool external_backing_ = false;
 
   struct FunctionTableEntry {
     uint32_t table_base;

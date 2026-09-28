@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <unordered_map>
@@ -164,6 +165,53 @@ class RenderTargetCache {
     return draw_resolution_scale_x() > 1 || draw_resolution_scale_y() > 1;
   }
 
+  // Whether surfaces with this pitch render at native guest resolution under
+  // the configured scale threshold. The comparison uses the tile-aligned
+  // width, so it is a pure function of render-target key fields.
+  bool IsScaleNativeForPitch(uint32_t pitch_tiles_at_32bpp,
+                             xenos::MsaaSamples msaa_samples) const;
+  // Effective scale class selected by the last Update. This may intentionally
+  // differ from the pitch threshold when a compatible scaled depth owner must
+  // be retained through a stencil-only alias.
+  bool IsDrawScaleNative() const { return current_draw_scale_native_; }
+  // Whether the last Update reused the previous identical update instead of
+  // recomputing it (diagnostic accounting only).
+  bool LastUpdateReused() const { return last_update_reused_; }
+  // Set by the command processor before Update: whether the host draw can
+  // leave covered samples unwritten (pixel kill, alpha test, alpha to
+  // coverage). Conservative (true) unless the backend states otherwise.
+  void SetDrawMayDiscardSamples(bool may_discard) { draw_may_discard_samples_ = may_discard; }
+  // Depth transfer ranges the last Update dropped because the draw overwrites
+  // every depth and stencil sample they would have filled (diagnostics).
+  uint32_t LastUpdateSkippedDepthTransfers() const { return last_update_skipped_depth_transfers_; }
+  // Diagnostics of the last full-overwrite check (which test decided it).
+  struct DepthOverwriteCheck {
+    const char* result = "none";
+    float rect[4] = {};
+    uint32_t range_width = 0;
+    uint32_t range_height = 0;
+    int32_t scissor[4] = {};
+  };
+  const DepthOverwriteCheck& LastDepthOverwriteCheck() const { return last_depth_overwrite_check_; }
+  // Keys of the render targets the last update bound (depth, then colors; 0
+  // for none) - GPU timing pass attribution.
+  void LastUpdateRenderTargetKeys(uint32_t* keys_out) const {
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      const RenderTarget* render_target = GetPath() == Path::kHostRenderTargets
+                                              ? last_update_accumulated_render_targets_[i]
+                                              : nullptr;
+      keys_out[i] = render_target ? render_target->key().key : 0;
+    }
+  }
+  // Scale of the current draw. All per-draw state must use these so one draw
+  // never mixes native and globally scaled coordinate spaces.
+  uint32_t GetDrawScaleX() const {
+    return IsDrawScaleNative() ? 1 : draw_resolution_scale_x();
+  }
+  uint32_t GetDrawScaleY() const {
+    return IsDrawScaleNative() ? 1 : draw_resolution_scale_y();
+  }
+
   // Virtual (both the common code and the implementation may do something
   // here), don't call from destructors (does work not needed for shutdown
   // also).
@@ -172,7 +220,8 @@ class RenderTargetCache {
   virtual void BeginFrame();
 
   virtual bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
-                      uint32_t normalized_color_mask, const Shader& vertex_shader);
+                      uint32_t normalized_color_mask, const Shader& vertex_shader,
+                      bool native_shader_grid = false);
 
   // Returns bits where 0 is whether a depth render target is currently bound on
   // the host and 1... are whether the same applies to color render targets, and
@@ -234,6 +283,9 @@ class RenderTargetCache {
       uint32_t is_depth : 1;                                      // 22
       // Ignoring the blending precision and sRGB.
       uint32_t resource_format : xenos::kRenderTargetFormatBits;  // 26
+      // Native and globally scaled views of the same guest EDRAM surface are
+      // distinct resources and can transfer ownership between each other.
+      uint32_t scale_native : 1;  // 27
     };
 
     RenderTargetKey() : key(0) { static_assert_size(*this, sizeof(key)); }
@@ -280,10 +332,18 @@ class RenderTargetCache {
     uint32_t GetWidth() const { return GetWidth(pitch_tiles_at_32bpp, msaa_samples); }
 
     std::string GetDebugName() const {
-      return fmt::format("RT @ {}t, <{}t>, {}xMSAA, {}", base_tiles, GetPitchTiles(),
-                         uint32_t(1) << uint32_t(msaa_samples), GetFormatName());
+      return fmt::format("RT @ {}t, <{}t>, {}xMSAA, {}{}", base_tiles,
+                         GetPitchTiles(), uint32_t(1) << uint32_t(msaa_samples),
+                         GetFormatName(), scale_native ? ", native" : "");
     }
   };
+
+  uint32_t GetKeyScaleX(RenderTargetKey key) const {
+    return key.scale_native ? 1 : draw_resolution_scale_x();
+  }
+  uint32_t GetKeyScaleY(RenderTargetKey key) const {
+    return key.scale_native ? 1 : draw_resolution_scale_y();
+  }
 
   class RenderTarget {
    public:
@@ -488,7 +548,13 @@ class RenderTargetCache {
   // false).
   virtual bool IsHostDepthEncodingDifferent(xenos::DepthRenderTargetFormat format) const = 0;
 
-  void ResetAccumulatedRenderTargets() { are_accumulated_render_targets_valid_ = false; }
+  void ResetAccumulatedRenderTargets() {
+    are_accumulated_render_targets_valid_ = false;
+    ++update_state_generation_;
+  }
+  // Forces the next Update through the full path (for example while an
+  // observer must see the complete ownership update of one draw).
+  void InvalidateUpdateMemo() { update_memo_.valid = false; }
   RenderTarget* const* last_update_accumulated_render_targets() const {
     assert_true(GetPath() == Path::kHostRenderTargets);
     return last_update_accumulated_render_targets_;
@@ -497,6 +563,14 @@ class RenderTargetCache {
     assert_true(GetPath() == Path::kHostRenderTargets);
     return last_update_transfers_;
   }
+
+  // Read-only diagnostic snapshot of bookkeeping, not transfer completion.
+  // Returns the full count; writes at most capacity records without allocation.
+  struct OwnershipSnapshot {
+    uint32_t start, end, key, host_depth_unorm, host_depth_float;
+    RenderTarget* render_target;
+  };
+  uint32_t CopyOwnershipSnapshot(OwnershipSnapshot* output, uint32_t capacity) const;
 
   HostDepthStoreRenderTargetConstant GetHostDepthStoreRenderTargetConstant(
       uint32_t pitch_tiles, bool msaa_2x_supported) const {
@@ -523,6 +597,10 @@ class RenderTargetCache {
   void GetResolveCopyRectanglesToDump(uint32_t base, uint32_t row_length, uint32_t rows,
                                       uint32_t pitch,
                                       std::vector<ResolveCopyDumpRectangle>& rectangles_out) const;
+  // True only when every render target owning the resolve source region is in
+  // the native scale class. Such resolves use the plain shared-memory layout.
+  bool IsResolveSourceNativeOnly(uint32_t base, uint32_t row_length,
+                                 uint32_t rows, uint32_t pitch) const;
   void GetResolveCopyDispatchesToDump(uint32_t base, uint32_t row_length, uint32_t rows,
                                       uint32_t pitch,
                                       std::vector<ResolveCopyDumpRectangle>& rectangles_out,
@@ -690,11 +768,56 @@ class RenderTargetCache {
   // last_update_accumulated_render_targets_ - it's not beneficial or even
   // incorrect to keep the previously bound render targets.
   bool are_accumulated_render_targets_valid_ = false;
+  // The effective scale class must be shared by render-target ownership,
+  // shader translation, viewport/scissor state and query normalization. It is
+  // published by Update after any safe ownership-based override.
+  bool current_draw_scale_native_ = false;
   // After an update (for simplicity, even an unsuccessful update invalidates
   // this), contains needed ownership transfer sources for each of the current
   // render targets. They are reordered so for one source, all transfers are
   // consecutive in the array.
   std::vector<Transfer> last_update_transfers_[1 + xenos::kMaxColorRenderTargets];
+
+  // Update is a deterministic function of the surface registers, its
+  // arguments, the estimated used height and this cache's own state
+  // (ownership, accumulated bindings, render target set). Every change of that
+  // state outside Update advances the generation. An Update with inputs equal
+  // to the last successful host-render-target update, no generation change and
+  // a used height within the one already owned would claim no range, need no
+  // transfer and bind the same render targets, so it is skipped.
+  uint64_t update_state_generation_ = 0;
+  struct UpdateMemoInputs {
+    uint32_t rb_surface_info;
+    uint32_t rb_depth_info;
+    uint32_t rb_color_info[xenos::kMaxColorRenderTargets];
+    uint32_t normalized_depth_control;
+    uint32_t normalized_color_mask;
+    uint32_t flags;
+    uint32_t scale_threshold;
+    uint32_t mrt_clamp;
+    bool operator==(const UpdateMemoInputs& other) const {
+      return std::memcmp(this, &other, sizeof(*this)) == 0;
+    }
+  };
+  struct UpdateMemo {
+    bool valid = false;
+    bool scale_native = false;
+    uint64_t generation = 0;
+    UpdateMemoInputs inputs{};
+    uint32_t pitch_tiles_at_32bpp = 0;
+    xenos::MsaaSamples msaa_samples = xenos::MsaaSamples::k1X;
+    uint32_t height_used = 0;
+  } update_memo_;
+  bool last_update_reused_ = false;
+
+  // Whether the current draw replaces every depth and stencil sample of the
+  // depth render target's claimed range (so transfers into it are dead).
+  bool DrawOverwritesDepthRange(reg::RB_DEPTHCONTROL normalized_depth_control,
+                                uint32_t pitch_tiles_at_32bpp, xenos::MsaaSamples msaa_samples,
+                                uint32_t length_tiles, const Shader& vertex_shader);
+  bool draw_may_discard_samples_ = true;
+  uint32_t last_update_skipped_depth_transfers_ = 0;
+  DepthOverwriteCheck last_depth_overwrite_check_;
 };
 
 }  // namespace rex::graphics

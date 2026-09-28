@@ -10,8 +10,12 @@
  */
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <memory>
 #include <utility>
 
@@ -20,9 +24,14 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
+#include <rex/ui/d3d12/d3d12_present_policy.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+#include <rex/ui/guest_frame_limiter.h>
+#include <rex/ui/present_statistics.h>
 #include <rex/ui/surface_win.h>
+
+#include <dwmapi.h>
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
 #include <ffx_api/dx12/ffx_api_dx12.h>
@@ -30,8 +39,40 @@
 #include <ffx_api/ffx_upscale.h>
 #endif
 
-REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
-                    "Allow variable refresh rate and tearing");
+REXCVAR_DEFINE_STRING(display_present_mode, "vsync", "Display",
+                      "Host presentation mode: vsync, immediate, or vrr")
+    .allowed({"vsync", "immediate", "vrr"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(display_max_frame_latency, 2, "Display",
+                     "Maximum number of frames queued by DXGI")
+    .range(1, 3);
+REXCVAR_DEFINE_UINT32(display_frame_limit, 0, "Display",
+                      "Frame rate limit in frames per second; 0 disables it. "
+                      "Paces guest frame production at the title frame boundary "
+                      "when the title reports one, otherwise host presentation")
+    .range(0, 240)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_UINT32(display_vsync_interval, 1, "Display",
+                      "VSync present interval: 1 = every refresh, 2 = every second "
+                      "refresh (for example 72 FPS on a 144 Hz display)")
+    .range(1, 4)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_UINT32(display_present_stall_threshold_ms, 75,
+                      "Advanced/Diagnostics",
+                      "Minimum DXGI Present call duration logged as a stall")
+    .range(34, 1000)
+    .debug_only();
+REXCVAR_DEFINE_BOOL(display_present_diagnostics, false, "Advanced/Diagnostics",
+                    "Record bounded DXGI Present stalls")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(display_present_statistics, false, "Advanced/Diagnostics",
+                    "Log swap-chain frame statistics (displayed images, refreshes, missed "
+                    "refreshes) every half second; test launches only")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(display_present_gpu_timing, false, "Advanced/Diagnostics",
+                    "Log the GPU time of painting the guest output to the window (scaling "
+                    "and upscaling effects, UI) every half second; test launches only")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::ui::d3d12 {
 
@@ -39,7 +80,6 @@ namespace rex::ui::d3d12 {
 namespace shaders {
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_bilinear_dither_ps.h"
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_bilinear_ps.h"
-#if defined(REX_HAS_FIDELITYFX_SDK)
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_cas_resample_dither_ps.h"
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_cas_resample_ps.h"
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_cas_sharpen_dither_ps.h"
@@ -47,7 +87,6 @@ namespace shaders {
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_fsr_easu_ps.h"
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_fsr_rcas_dither_ps.h"
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_fsr_rcas_ps.h"
-#endif
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_triangle_strip_rect_vs.h"
 }  // namespace shaders
 
@@ -350,7 +389,13 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
   if (paint_context_.swap_chain) {
     if (was_paintable && paint_context_.swap_chain_width == new_swap_chain_width &&
         paint_context_.swap_chain_height == new_swap_chain_height) {
-      is_vsync_implicit_out = false;
+      const HostPresentMode mode =
+          ParseHostPresentMode(REXCVAR_GET(display_present_mode))
+              .value_or(HostPresentMode::kVsync);
+      is_vsync_implicit_out =
+          ResolveHostPresentParameters(
+              mode, paint_context_.swap_chain_allows_tearing)
+              .sync_interval != 0;
       return SurfacePaintConnectResult::kSuccessUnchanged;
     }
     paint_context_.AwaitSwapChainUsageCompletion();
@@ -363,7 +408,7 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
     }
     bool swap_chain_resized = SUCCEEDED(paint_context_.swap_chain->ResizeBuffers(
         0, UINT(new_swap_chain_width), UINT(new_swap_chain_height), DXGI_FORMAT_UNKNOWN,
-        paint_context_.swap_chain_allows_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0));
+        ResolveHostSwapChainFlags(paint_context_.swap_chain_allows_tearing)));
     if (swap_chain_resized) {
       for (uint32_t i = 0; i < PaintContext::kSwapChainBufferCount; ++i) {
         if (FAILED(paint_context_.swap_chain->GetBuffer(
@@ -407,12 +452,11 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
             : DXGI_SCALING_STRETCH;
     swap_chain_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     swap_chain_desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-    swap_chain_desc.Flags = 0;
-    if (REXCVAR_GET(d3d12_allow_variable_refresh_rate_and_tearing) && dxgi_supports_tearing_) {
-      // Allow tearing in borderless fullscreen to support variable refresh
-      // rate.
-      swap_chain_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
-    }
+    // Creating a tearing-capable flip-model chain does not itself enable
+    // tearing. It permits hot switching between synchronized, immediate and
+    // VRR policies; only Present with DXGI_PRESENT_ALLOW_TEARING can tear.
+    // The latency flag is always retained so SetMaximumFrameLatency is valid.
+    swap_chain_desc.Flags = ResolveHostSwapChainFlags(dxgi_supports_tearing_);
     IDXGIFactory2* dxgi_factory = provider_.GetDXGIFactory();
     ID3D12CommandQueue* direct_queue = provider_.GetDirectQueue();
     Microsoft::WRL::ComPtr<IDXGISwapChain1> swap_chain_1;
@@ -450,6 +494,7 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
     paint_context_.swap_chain_height = new_swap_chain_height;
     paint_context_.swap_chain_allows_tearing =
         (swap_chain_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
+    paint_context_.swap_chain_maximum_frame_latency = 0;
     for (uint32_t i = 0; i < PaintContext::kSwapChainBufferCount; ++i) {
       if (FAILED(paint_context_.swap_chain->GetBuffer(
               i, IID_PPV_ARGS(&paint_context_.swap_chain_buffers[i])))) {
@@ -478,7 +523,23 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
         provider_.OffsetRTVDescriptor(rtv_heap_start, PaintContext::kRTVIndexSwapChainBuffer0 + i));
   }
 
-  is_vsync_implicit_out = false;
+  const HostPresentMode mode =
+      ParseHostPresentMode(REXCVAR_GET(display_present_mode))
+          .value_or(HostPresentMode::kVsync);
+  is_vsync_implicit_out =
+      ResolveHostPresentParameters(
+          mode, paint_context_.swap_chain_allows_tearing)
+          .sync_interval != 0;
+  const HostPresentParameters present_parameters =
+      ResolveHostPresentParameters(
+          mode, paint_context_.swap_chain_allows_tearing);
+  REXLOG_INFO(
+      "D3D12Presenter: host present mode={} sync_interval={} tearing_capable={} "
+      "vrr_active={} max_frame_latency={}",
+      REXCVAR_GET(display_present_mode), present_parameters.sync_interval,
+      paint_context_.swap_chain_allows_tearing,
+      present_parameters.variable_refresh_rate_active,
+      std::clamp(REXCVAR_GET(display_max_frame_latency), 1, 3));
   return SurfacePaintConnectResult::kSuccess;
 }
 
@@ -529,15 +590,20 @@ bool D3D12Presenter::RefreshGuestOutputImpl(
     }
   }
   D3D12GuestOutputRefreshContext context(is_8bpc_out_ref, guest_output_resource_ref.second.Get());
-  bool refresher_succeeded = refresher(context);
+  // The refresher submission is signaled in CompleteGuestOutputRefreshImpl,
+  // which Presenter calls after this (even on failure) once the refresher's
+  // command lists are in the queue.
+  return refresher(context);
+}
+
+void D3D12Presenter::CompleteGuestOutputRefreshImpl(uint32_t mailbox_index) {
   // Even if the refresher has returned false, it still might have submitted
   // some commands referencing the resource. It's better to put an excessive
   // signal and wait slightly longer, for nothing important, while shutting down
   // than to destroy the resource while it's still in use.
-  guest_output_resource_ref.first =
+  guest_output_resources_[mailbox_index].first =
       guest_output_resource_refresher_submission_tracker_.GetCurrentSubmission();
   guest_output_resource_refresher_submission_tracker_.NextSubmission();
-  return refresher_succeeded;
 }
 
 void D3D12Presenter::PaintContext::DestroySwapChain() {
@@ -550,8 +616,57 @@ void D3D12Presenter::PaintContext::DestroySwapChain() {
   }
   swap_chain.Reset();
   swap_chain_allows_tearing = false;
+  swap_chain_maximum_frame_latency = 0;
   swap_chain_height = 0;
   swap_chain_width = 0;
+}
+
+void D3D12Presenter::ReadPaintGpuTiming(size_t paint_slot) {
+  // Called once the slot's previous paint submission has completed.
+  if (!paint_context_.timing_written[paint_slot]) {
+    return;
+  }
+  paint_context_.timing_written[paint_slot] = false;
+  const size_t offset = paint_slot * 2 * sizeof(uint64_t);
+  D3D12_RANGE read_range = {offset, offset + 2 * sizeof(uint64_t)};
+  void* mapping = nullptr;
+  if (FAILED(paint_context_.timing_readback->Map(0, &read_range, &mapping))) {
+    return;
+  }
+  uint64_t timestamps[2];
+  std::memcpy(timestamps, static_cast<const uint8_t*>(mapping) + offset, sizeof(timestamps));
+  D3D12_RANGE written_range = {};
+  paint_context_.timing_readback->Unmap(0, &written_range);
+  if (timestamps[1] >= timestamps[0]) {
+    const uint64_t ticks = timestamps[1] - timestamps[0];
+    paint_context_.timing_ticks += ticks;
+    paint_context_.timing_max_ticks = std::max(paint_context_.timing_max_ticks, ticks);
+    ++paint_context_.timing_paints;
+    paint_context_.timing_effect_count = paint_context_.timing_effect_counts[paint_slot];
+  }
+  const uint64_t now_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count());
+  if (!paint_context_.timing_window_start_ms) {
+    paint_context_.timing_window_start_ms = now_ms;
+  } else if (now_ms - paint_context_.timing_window_start_ms >= 500 &&
+             paint_context_.timing_paints) {
+    const double us_per_tick = 1.0e6 / double(paint_context_.timing_frequency);
+    std::fprintf(stderr,
+                 "REX_PRESENT_GPU_TIMING paints=%u avg_us=%.1f max_us=%.1f effects=%u "
+                 "window=%ux%u\n",
+                 paint_context_.timing_paints,
+                 double(paint_context_.timing_ticks) * us_per_tick /
+                     double(paint_context_.timing_paints),
+                 double(paint_context_.timing_max_ticks) * us_per_tick,
+                 paint_context_.timing_effect_count, paint_context_.swap_chain_width,
+                 paint_context_.swap_chain_height);
+    std::fflush(stderr);
+    paint_context_.timing_ticks = 0;
+    paint_context_.timing_max_ticks = 0;
+    paint_context_.timing_paints = 0;
+    paint_context_.timing_window_start_ms = now_ms;
+  }
 }
 
 Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawers) {
@@ -563,11 +678,17 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     paint_context_.paint_submission_tracker.AwaitSubmissionCompletion(current_paint_submission -
                                                                       command_allocator_count);
   }
-  ID3D12CommandAllocator* command_allocator =
-      paint_context_.command_allocators[current_paint_submission % command_allocator_count].Get();
+  const size_t paint_slot = size_t(current_paint_submission % command_allocator_count);
+  ID3D12CommandAllocator* command_allocator = paint_context_.command_allocators[paint_slot].Get();
   command_allocator->Reset();
   ID3D12GraphicsCommandList* command_list = paint_context_.command_list.Get();
   command_list->Reset(command_allocator, nullptr);
+  if (paint_context_.timing_query_heap) {
+    ReadPaintGpuTiming(paint_slot);
+    command_list->EndQuery(paint_context_.timing_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                           UINT(paint_slot * 2));
+  }
+  uint32_t timing_effect_count = 0;
 
   ID3D12Device* device = provider_.GetDevice();
 
@@ -606,6 +727,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
         guest_output_properties, paint_context_.swap_chain_width, paint_context_.swap_chain_height,
         D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION, D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION,
         guest_output_paint_config);
+    timing_effect_count = uint32_t(guest_output_flow.effect_count);
 
     // Check if all guest output paint effects are supported by the
     // implementation.
@@ -948,19 +1070,16 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
           UINT effect_constants_size = 0;
           union {
             BilinearConstants bilinear;
-#if defined(REX_HAS_FIDELITYFX_SDK)
             CasSharpenConstants cas_sharpen;
             CasResampleConstants cas_resample;
             FsrEasuConstants fsr_easu;
             FsrRcasConstants fsr_rcas;
-#endif
           } effect_constants;
           switch (guest_output_paint_root_signature_index) {
             case kGuestOutputPaintRootSignatureIndexBilinear: {
               effect_constants_size = sizeof(effect_constants.bilinear);
               effect_constants.bilinear.Initialize(guest_output_flow, i);
             } break;
-#if defined(REX_HAS_FIDELITYFX_SDK)
             case kGuestOutputPaintRootSignatureIndexCasSharpen: {
               effect_constants_size = sizeof(effect_constants.cas_sharpen);
               effect_constants.cas_sharpen.Initialize(guest_output_flow, i,
@@ -979,7 +1098,6 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
               effect_constants_size = sizeof(effect_constants.fsr_rcas);
               effect_constants.fsr_rcas.Initialize(guest_output_flow, i, guest_output_paint_config);
             } break;
-#endif
             default:
               break;
           }
@@ -1139,6 +1257,17 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   barrier_rtv_to_present.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
   command_list->ResourceBarrier(1, &barrier_rtv_to_present);
 
+  if (paint_context_.timing_query_heap) {
+    command_list->EndQuery(paint_context_.timing_query_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                           UINT(paint_slot * 2 + 1));
+    command_list->ResolveQueryData(paint_context_.timing_query_heap.Get(),
+                                   D3D12_QUERY_TYPE_TIMESTAMP, UINT(paint_slot * 2), 2,
+                                   paint_context_.timing_readback.Get(),
+                                   UINT64(paint_slot * 2 * sizeof(uint64_t)));
+    paint_context_.timing_written[paint_slot] = true;
+    paint_context_.timing_effect_counts[paint_slot] = timing_effect_count;
+  }
+
   // Execute and present.
   command_list->Close();
   ID3D12CommandList* execute_command_list = command_list;
@@ -1147,17 +1276,103 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     ui_submission_tracker_.NextSubmission();
   }
   paint_context_.paint_submission_tracker.NextSubmission();
-  // Present as soon as possible, without waiting for vsync (the host refresh
-  // rate may be something like 144 Hz, which is not a multiple of the common
-  // 30 Hz or 60 Hz guest refresh rate), and allowing dropping outdated queued
-  // frames for lower latency. Also, if possible, allowing tearing to use
-  // variable refresh rate in borderless fullscreen (note that if DXGI
-  // fullscreen is ever used in, the allow tearing flag must not be passed in
-  // fullscreen, but DXGI fullscreen is largely unneeded with the flip
-  // presentation model used in Direct3D 12).
+  const uint32_t maximum_frame_latency =
+      uint32_t(std::clamp(REXCVAR_GET(display_max_frame_latency), 1, 3));
+  if (paint_context_.swap_chain_maximum_frame_latency !=
+      maximum_frame_latency) {
+    if (FAILED(paint_context_.swap_chain->SetMaximumFrameLatency(
+            maximum_frame_latency))) {
+      REXLOG_WARN(
+          "D3D12Presenter: Failed to set maximum frame latency to {}",
+          maximum_frame_latency);
+    } else {
+      paint_context_.swap_chain_maximum_frame_latency =
+          maximum_frame_latency;
+    }
+  }
+
+  const std::optional<HostPresentMode> configured_present_mode =
+      ParseHostPresentMode(REXCVAR_GET(display_present_mode));
+  // Test-only live override (developer frame-mode switch); -1 = configured.
+  const int32_t present_mode_override = HostPresentModeOverride();
+  const HostPresentMode present_mode =
+      present_mode_override >= 0
+          ? HostPresentMode(present_mode_override)
+          : configured_present_mode.value_or(HostPresentMode::kVsync);
+  HostPresentParameters present_parameters =
+      ResolveHostPresentParameters(
+          present_mode, paint_context_.swap_chain_allows_tearing);
+  if (present_parameters.sync_interval == 1) {
+    // Refresh-divisor pacing on fixed-refresh displays: each frame is shown
+    // for N whole refreshes (even pacing, no tearing).
+    const uint32_t interval_override = HostVsyncIntervalOverride();
+    present_parameters.sync_interval = UINT(std::clamp<uint32_t>(
+        interval_override ? interval_override : REXCVAR_GET(display_vsync_interval), 1u, 4u));
+  }
+  // Emit the effective host policy once. In particular, a requested VRR mode
+  // may legitimately become synchronized VSync when DXGI tearing support is
+  // unavailable. This is bounded startup evidence, not per-frame tracing.
+  static std::atomic<bool> host_present_policy_reported{false};
+  if (!host_present_policy_reported.exchange(true,
+                                             std::memory_order_relaxed)) {
+    std::fprintf(
+        stderr,
+        "REX_HOST_PRESENT_EFFECTIVE requested=%s sync_interval=%u "
+        "flags=0x%08X tearing_capable=%u vrr_active=%u "
+        "max_frame_latency=%u frame_limit=%u\n",
+        REXCVAR_GET(display_present_mode).c_str(),
+        present_parameters.sync_interval, present_parameters.flags,
+        paint_context_.swap_chain_allows_tearing ? 1u : 0u,
+        present_parameters.variable_refresh_rate_active ? 1u : 0u,
+        paint_context_.swap_chain_maximum_frame_latency,
+        REXCVAR_GET(display_frame_limit));
+    std::fflush(stderr);
+  }
+  // Legacy presentation-side cap. When the title reports guest frame
+  // boundaries, display_frame_limit paces frame production there instead
+  // (rex::ui::GuestFrameDeadline via the GPU plugin), so never pace twice.
+  host_frame_limiter_.Wait(GuestFrameLimiterActive() ? 0u
+                                                     : REXCVAR_GET(display_frame_limit));
+  const bool record_present_timing = REXCVAR_GET(display_present_diagnostics);
+  const auto present_start = record_present_timing
+      ? std::chrono::steady_clock::now()
+      : std::chrono::steady_clock::time_point{};
   HRESULT present_result = paint_context_.swap_chain->Present(
-      0, DXGI_PRESENT_RESTART |
-             (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
+      present_parameters.sync_interval, present_parameters.flags);
+  const uint64_t present_duration_us = record_present_timing
+      ? uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - present_start)
+                     .count())
+      : 0;
+  const uint64_t present_stall_threshold_us =
+      uint64_t(REXCVAR_GET(display_present_stall_threshold_ms)) * 1000;
+  if (record_present_timing &&
+      present_duration_us >= present_stall_threshold_us) {
+    std::fprintf(
+        stderr,
+        "REX_D3D12_PRESENT_STALL duration_us=%llu mode=%s sync_interval=%u "
+        "flags=0x%08X max_frame_latency=%u size=%ux%u\n",
+        static_cast<unsigned long long>(present_duration_us),
+        REXCVAR_GET(display_present_mode).c_str(),
+        present_parameters.sync_interval, present_parameters.flags,
+        paint_context_.swap_chain_maximum_frame_latency,
+        paint_context_.swap_chain_width, paint_context_.swap_chain_height);
+    std::fflush(stderr);
+  }
+  if (FAILED(present_result)) {
+    static std::atomic<uint64_t> present_failure_ordinal_counter{0};
+    const uint64_t present_ordinal =
+        present_failure_ordinal_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    std::fprintf(stderr,
+                 "REX_D3D12_PRESENT_FAILURE ordinal=%llu result=0x%08X size=%ux%u tearing=%u\n",
+                 static_cast<unsigned long long>(present_ordinal), uint32_t(present_result),
+                 paint_context_.swap_chain_width, paint_context_.swap_chain_height,
+                 paint_context_.swap_chain_allows_tearing ? 1u : 0u);
+    std::fflush(stderr);
+  }
+  if (REXCVAR_GET(display_present_statistics) && SUCCEEDED(present_result)) {
+    RecordPresentStatistics(present_parameters.sync_interval);
+  }
   // Even if presentation has failed, work might have been enqueued anyway
   // internally before the failure according to Jesse Natalie from the DirectX
   // Discord server.
@@ -1170,6 +1385,94 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     default:
       return SUCCEEDED(present_result) ? PaintResult::kPresented : PaintResult::kNotPresented;
   }
+}
+
+void D3D12Presenter::RecordPresentStatistics(uint32_t sync_interval) {
+  LARGE_INTEGER now;
+  QueryPerformanceCounter(&now);
+  static const int64_t frequency = [] {
+    LARGE_INTEGER value;
+    QueryPerformanceFrequency(&value);
+    return value.QuadPart;
+  }();
+  PresentStatisticsWindow& window = present_statistics_;
+  if (!window.begin_qpc) {
+    window.begin_qpc = uint64_t(now.QuadPart);
+  }
+  UINT last_present_count = 0;
+  paint_context_.swap_chain->GetLastPresentCount(&last_present_count);
+  DXGI_FRAME_STATISTICS statistics = {};
+  bool have_statistics = false;
+  // The media variant also reports whether the desktop compositor handled
+  // the image (composed) or it was flipped directly (overlay / independent).
+  Microsoft::WRL::ComPtr<IDXGISwapChainMedia> media;
+  if (SUCCEEDED(paint_context_.swap_chain->QueryInterface(IID_PPV_ARGS(&media)))) {
+    DXGI_FRAME_STATISTICS_MEDIA media_statistics = {};
+    if (SUCCEEDED(media->GetFrameStatisticsMedia(&media_statistics))) {
+      statistics.PresentCount = media_statistics.PresentCount;
+      statistics.PresentRefreshCount = media_statistics.PresentRefreshCount;
+      statistics.SyncRefreshCount = media_statistics.SyncRefreshCount;
+      statistics.SyncQPCTime = media_statistics.SyncQPCTime;
+      window.composition_mode = int32_t(media_statistics.CompositionMode);
+      have_statistics = true;
+    }
+  }
+  if (!have_statistics) {
+    have_statistics = SUCCEEDED(paint_context_.swap_chain->GetFrameStatistics(&statistics));
+  }
+  if (have_statistics) {
+    window.CountPresent(last_present_count > statistics.PresentCount
+                            ? last_present_count - statistics.PresentCount
+                            : 0);
+    window.Sample(statistics.PresentCount, statistics.PresentRefreshCount,
+                  statistics.SyncQPCTime.QuadPart, sync_interval);
+    window.SyncSample(statistics.PresentCount, statistics.PresentRefreshCount,
+                      statistics.SyncRefreshCount, statistics.SyncQPCTime.QuadPart);
+    DWM_TIMING_INFO dwm_timing = {};
+    dwm_timing.cbSize = sizeof(dwm_timing);
+    if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &dwm_timing))) {
+      window.DwmSample(statistics.PresentCount, uint64_t(dwm_timing.cRefresh),
+                       uint64_t(dwm_timing.qpcRefreshPeriod));
+    }
+  } else {
+    window.CountPresent(0);
+    window.Disjoint();
+  }
+  if (int64_t(now.QuadPart) - int64_t(window.begin_qpc) < frequency / 2) {
+    return;
+  }
+  char misses[PresentStatisticsWindow::kMaxMissRecords * 24 + 1] = {};
+  size_t used = 0;
+  for (uint32_t i = 0; i < window.miss_records && used + 24 < sizeof(misses); ++i) {
+    const int written = std::snprintf(misses + used, sizeof(misses) - used, "%s%lld:%u",
+                                      i ? "," : "",
+                                      static_cast<long long>(window.misses[i].sync_qpc),
+                                      window.misses[i].refreshes);
+    if (written <= 0) break;
+    used += size_t(written);
+  }
+  std::fprintf(stderr,
+               "REX_PRESENT_STATS version=2 qpc_begin=%llu qpc_end=%lld frequency=%lld "
+               "presents=%u samples=%u displayed=%u refreshes=%u missed=%u glitches=%u "
+               "max_refreshes_per_image=%u disjoint=%u max_queue=%u interval=%u "
+               "sync_refreshes=%u sync_displayed=%u sync_missed=%u sync_qpc_span=%lld "
+               "present_refresh_raw=%u,%u composition=%d dwm_refreshes=%llu "
+               "dwm_displayed=%u dwm_missed=%llu dwm_period_qpc=%llu misses=%s\n",
+               static_cast<unsigned long long>(window.begin_qpc),
+               static_cast<long long>(now.QuadPart), static_cast<long long>(frequency),
+               window.presents, window.samples, window.displayed, window.refreshes,
+               window.missed, window.glitches, window.max_refreshes_per_image,
+               window.disjoint, window.max_queue, sync_interval, window.SyncRefreshes(),
+               window.SyncDisplayed(), window.SyncMissed(sync_interval),
+               static_cast<long long>(window.last_sync_qpc - window.first_sync_qpc),
+               window.first_present_refresh_raw, window.last_present_refresh_raw,
+               window.composition_mode,
+               static_cast<unsigned long long>(window.DwmRefreshes()), window.DwmDisplayed(),
+               static_cast<unsigned long long>(window.DwmMissed(sync_interval)),
+               static_cast<unsigned long long>(window.dwm_refresh_period_qpc),
+               used ? misses : "-");
+  std::fflush(stderr);
+  window.Reset(uint64_t(now.QuadPart));
 }
 
 bool D3D12Presenter::InitializeSurfaceIndependent() {
@@ -1269,7 +1572,6 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
     *(guest_output_paint_root_signatures_[kGuestOutputPaintRootSignatureIndexBilinear]
           .ReleaseAndGetAddressOf()) = guest_output_paint_root_signature;
   }
-#if defined(REX_HAS_FIDELITYFX_SDK)
   // EASU (needs the sampler).
   guest_output_paint_root_parameter_effect_constants.Constants.Num32BitValues =
       sizeof(FsrEasuConstants) / sizeof(uint32_t);
@@ -1332,7 +1634,6 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
     *(guest_output_paint_root_signatures_[kGuestOutputPaintRootSignatureIndexCasResample]
           .ReleaseAndGetAddressOf()) = guest_output_paint_root_signature;
   }
-#endif  // defined(REX_HAS_FIDELITYFX_SDK)
 
   // Guest output painting pipelines.
   D3D12_GRAPHICS_PIPELINE_STATE_DESC guest_output_paint_pipeline_desc = {};
@@ -1363,7 +1664,6 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
         guest_output_paint_pipeline_desc.PS.BytecodeLength =
             sizeof(shaders::guest_output_bilinear_dither_ps);
         break;
-#if defined(REX_HAS_FIDELITYFX_SDK)
       case GuestOutputPaintEffect::kCasSharpen:
         guest_output_paint_pipeline_desc.PS.pShaderBytecode =
             shaders::guest_output_ffx_cas_sharpen_ps;
@@ -1404,7 +1704,6 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
         guest_output_paint_pipeline_desc.PS.BytecodeLength =
             sizeof(shaders::guest_output_ffx_fsr_rcas_dither_ps);
         break;
-#endif
       default:
         // Not supported by this implementation.
         continue;
@@ -1470,6 +1769,30 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
   }
   // Command lists are created in an open state.
   paint_context_.command_list->Close();
+
+  if (REXCVAR_GET(display_present_gpu_timing)) {
+    D3D12_QUERY_HEAP_DESC timing_query_heap_desc = {};
+    timing_query_heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    timing_query_heap_desc.Count = UINT(2 * paint_context_.command_allocators.size());
+    D3D12_RESOURCE_DESC timing_readback_desc;
+    util::FillBufferResourceDesc(timing_readback_desc,
+                                 UINT64(timing_query_heap_desc.Count) * sizeof(uint64_t),
+                                 D3D12_RESOURCE_FLAG_NONE);
+    UINT64 timing_frequency = 0;
+    if (SUCCEEDED(direct_queue->GetTimestampFrequency(&timing_frequency)) && timing_frequency &&
+        SUCCEEDED(device->CreateQueryHeap(&timing_query_heap_desc,
+                                          IID_PPV_ARGS(&paint_context_.timing_query_heap))) &&
+        SUCCEEDED(device->CreateCommittedResource(
+            &util::kHeapPropertiesReadback, provider_.GetHeapFlagCreateNotZeroed(),
+            &timing_readback_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&paint_context_.timing_readback)))) {
+      paint_context_.timing_frequency = timing_frequency;
+    } else {
+      paint_context_.timing_query_heap.Reset();
+      paint_context_.timing_readback.Reset();
+      REXLOG_WARN("D3D12Presenter: present GPU timing is unavailable");
+    }
+  }
 
   // RTV descriptor heap.
   D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc;

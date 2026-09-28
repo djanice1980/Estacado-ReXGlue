@@ -142,6 +142,8 @@ void DxbcShaderTranslator::Reset() {
 
   system_temp_count_current_ = 0;
   system_temp_count_max_ = 0;
+  system_temps_embedded_scene_final_multiply_operands_[0] = UINT32_MAX;
+  system_temps_embedded_scene_final_multiply_operands_[1] = UINT32_MAX;
 
   cf_exec_bool_constant_ = kCfExecBoolConstantNone;
   cf_exec_predicated_ = false;
@@ -658,14 +660,15 @@ void DxbcShaderTranslator::StartPixelShader() {
     in_position_used_ |= 0b0011;
     a_.OpRoundNI(dxbc::Dest::R(param_gen_temp, 0b0011), dxbc::Src::V1D(in_reg_ps_position_));
     uint32_t resolution_scaled_axes =
-        uint32_t(draw_resolution_scale_x_ > 1) | (uint32_t(draw_resolution_scale_y_ > 1) << 1);
+        uint32_t(GetCurrentDrawResolutionScaleX() > 1) |
+        (uint32_t(GetCurrentDrawResolutionScaleY() > 1) << 1);
     if (resolution_scaled_axes) {
       // Revert resolution scale - after truncating, so if the pixel position
       // is passed to tfetch (assuming the game doesn't round it by itself),
       // it will be sampled with higher resolution too.
       a_.OpMul(dxbc::Dest::R(param_gen_temp, resolution_scaled_axes), dxbc::Src::R(param_gen_temp),
-               dxbc::Src::LF(1.0f / draw_resolution_scale_x_, 1.0f / draw_resolution_scale_y_, 1.0f,
-                             1.0f));
+               dxbc::Src::LF(1.0f / GetCurrentDrawResolutionScaleX(),
+                             1.0f / GetCurrentDrawResolutionScaleY(), 1.0f, 1.0f));
     }
     if (shader_modification.pixel.param_gen_point) {
       // A point - always front-facing (the upper bit of X is 0), not a line
@@ -724,7 +727,8 @@ void DxbcShaderTranslator::StartPixelShader() {
     dxbc::Src memexport_enabled_src(
         dxbc::Src::R(system_temp_memexport_enabled_and_eM_written_, dxbc::Src::kXXXX));
     uint32_t resolution_scaled_axes =
-        uint32_t(draw_resolution_scale_x_ > 1) | (uint32_t(draw_resolution_scale_y_ > 1) << 1);
+        uint32_t(GetCurrentDrawResolutionScaleX() > 1) |
+        (uint32_t(GetCurrentDrawResolutionScaleY() > 1) << 1);
     if (resolution_scaled_axes) {
       uint32_t memexport_condition_temp = PushSystemTemp();
       // Only do memexport for one host pixel in a guest pixel - prefer the
@@ -737,10 +741,12 @@ void DxbcShaderTranslator::StartPixelShader() {
                 dxbc::Src::V1D(in_reg_ps_position_));
       a_.OpUDiv(dxbc::Dest::Null(), dxbc::Dest::R(memexport_condition_temp, resolution_scaled_axes),
                 dxbc::Src::R(memexport_condition_temp),
-                dxbc::Src::LU(draw_resolution_scale_x_, draw_resolution_scale_y_, 0, 0));
+                dxbc::Src::LU(GetCurrentDrawResolutionScaleX(),
+                              GetCurrentDrawResolutionScaleY(), 0, 0));
       a_.OpIEq(dxbc::Dest::R(memexport_condition_temp, resolution_scaled_axes),
                dxbc::Src::R(memexport_condition_temp),
-               dxbc::Src::LU(draw_resolution_scale_x_ >> 1, draw_resolution_scale_y_ >> 1, 0, 0));
+               dxbc::Src::LU(GetCurrentDrawResolutionScaleX() >> 1,
+                             GetCurrentDrawResolutionScaleY() >> 1, 0, 0));
       for (uint32_t i = 0; i < 2; ++i) {
         if (!(resolution_scaled_axes & (1 << i))) {
           continue;
@@ -856,6 +862,16 @@ void DxbcShaderTranslator::StartTranslation() {
       if (shader_writes_color_targets & (1 << i)) {
         system_temps_color_[i] = PushSystemTemp(0b1111);
       }
+    }
+    const uint32_t scene_diagnostic =
+        GetDxbcShaderModification().pixel.texture_sample_diagnostic;
+    if (current_shader().ucode_data_hash() ==
+            UINT64_C(0xBE763931E2AB7D56) &&
+        scene_diagnostic >= 5 && scene_diagnostic <= 7) {
+      system_temps_embedded_scene_final_multiply_operands_[0] =
+          PushSystemTemp(0b1111);
+      system_temps_embedded_scene_final_multiply_operands_[1] =
+          PushSystemTemp(0b1111);
     }
   }
 
@@ -1438,6 +1454,58 @@ void DxbcShaderTranslator::StoreResult(const InstructionResult& result, const dx
     case InstructionStorageTarget::kColor:
       assert_not_zero(used_write_mask);
       assert_true(current_shader().writes_color_target(result.storage_index));
+      // An exact-shader, opt-in diagnostic may have already written a selected
+      // texture fetch to color 0. Preserve that value instead of replacing it
+      // with the guest shader's final color. This is disabled in production
+      // modification 0 and does not change guest memory or shader inputs.
+      if (result.storage_index == 0 &&
+          current_shader().ucode_data_hash() ==
+              UINT64_C(0xBE763931E2AB7D56) &&
+          GetDxbcShaderModification().pixel.texture_sample_diagnostic != 0) {
+        const uint32_t scene_diagnostic =
+            GetDxbcShaderModification().pixel.texture_sample_diagnostic;
+        if (scene_diagnostic >= 5 && scene_diagnostic <= 7) {
+          assert_true(
+              system_temps_embedded_scene_final_multiply_operands_[0] !=
+              UINT32_MAX);
+          assert_true(
+              system_temps_embedded_scene_final_multiply_operands_[1] !=
+              UINT32_MAX);
+          const dxbc::Src operand_0 = dxbc::Src::R(
+              system_temps_embedded_scene_final_multiply_operands_[0]);
+          const dxbc::Src operand_1 = dxbc::Src::R(
+              system_temps_embedded_scene_final_multiply_operands_[1]);
+          if (scene_diagnostic == 5 || scene_diagnostic == 6) {
+            a_.OpMov(dxbc::Dest::R(system_temps_color_[0], 0b0111),
+                     scene_diagnostic == 5 ? operand_0 : operand_1);
+          } else {
+            // R=max(abs(r0.xyz)), G=max(abs(old r4.xyz)), and
+            // B=max(abs(the actually exported color.xyz)).
+            a_.OpMax(dxbc::Dest::R(system_temps_color_[0], 0b0001),
+                     operand_0.Select(0).Abs(), operand_0.Select(1).Abs());
+            a_.OpMax(
+                dxbc::Dest::R(system_temps_color_[0], 0b0001),
+                dxbc::Src::R(system_temps_color_[0], dxbc::Src::kXXXX),
+                operand_0.Select(2).Abs());
+            a_.OpMax(dxbc::Dest::R(system_temps_color_[0], 0b0010),
+                     operand_1.Select(0).Abs(), operand_1.Select(1).Abs());
+            a_.OpMax(
+                dxbc::Dest::R(system_temps_color_[0], 0b0010),
+                dxbc::Src::R(system_temps_color_[0], dxbc::Src::kYYYY),
+                operand_1.Select(2).Abs());
+            a_.OpMax(dxbc::Dest::R(system_temps_color_[0], 0b0100),
+                     src.SelectFromSwizzled(0).Abs(),
+                     src.SelectFromSwizzled(1).Abs());
+            a_.OpMax(
+                dxbc::Dest::R(system_temps_color_[0], 0b0100),
+                dxbc::Src::R(system_temps_color_[0], dxbc::Src::kZZZZ),
+                src.SelectFromSwizzled(2).Abs());
+          }
+          a_.OpMov(dxbc::Dest::R(system_temps_color_[0], 0b1000),
+                   dxbc::Src::LF(1.0f));
+        }
+        return;
+      }
       dest = dxbc::Dest::R(system_temps_color_[result.storage_index]);
       if (edram_rov_used_) {
         // For ROV output, mark that the color has been written to.
@@ -1913,6 +1981,9 @@ const DxbcShaderTranslator::ShaderRdefType
         // kFloat4Array6
         {nullptr, dxbc::RdefVariableClass::kVector, dxbc::RdefVariableType::kFloat, 1, 4, 6,
          ShaderRdefTypeIndex::kFloat4},
+        // kFloat4Array32
+        {nullptr, dxbc::RdefVariableClass::kVector, dxbc::RdefVariableType::kFloat, 1, 4, 32,
+         ShaderRdefTypeIndex::kFloat4},
         // kFloat4ConstantArray - float constants - size written dynamically.
         {nullptr, dxbc::RdefVariableClass::kVector, dxbc::RdefVariableType::kFloat, 1, 4, 0,
          ShaderRdefTypeIndex::kFloat4},
@@ -1982,6 +2053,7 @@ const DxbcShaderTranslator::SystemConstantRdef DxbcShaderTranslator::system_cons
     {"xe_edram_rt_blend_factors_ops", ShaderRdefTypeIndex::kUint4, sizeof(uint32_t) * 4},
 
     {"xe_edram_blend_constant", ShaderRdefTypeIndex::kFloat4, sizeof(float) * 4},
+    {"xe_native_texture_regions", ShaderRdefTypeIndex::kFloat4Array32, sizeof(float) * 4 * 32},
 };
 
 void DxbcShaderTranslator::WriteResourceDefinition() {

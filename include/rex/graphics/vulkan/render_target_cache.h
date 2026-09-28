@@ -116,7 +116,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   void RestoreEdramSnapshot(const void* snapshot);
 
   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
-              uint32_t normalized_color_mask, const Shader& vertex_shader) override;
+              uint32_t normalized_color_mask, const Shader& vertex_shader,
+              bool native_shader_grid = false) override;
   // Binding information for the last successful update.
   RenderPassKey last_update_render_pass_key() const { return last_update_render_pass_key_; }
   VkRenderPass last_update_render_pass() const { return last_update_render_pass_; }

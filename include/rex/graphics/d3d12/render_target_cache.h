@@ -18,14 +18,20 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <rex/assert.h>
 #include <rex/graphics/d3d12/shared_memory.h>
+#include <rex/graphics/d3d12/diagnostic_color_readback.h>
+#include <rex/graphics/d3d12/diagnostic_color_samples_readback.h>
 #include <rex/graphics/d3d12/texture_cache.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/embedded_camera_depth_clear_policy.h>
+#include <rex/graphics/embedded_scene_transfer_capture_policy.h>
+#include <rex/graphics/embedded_scene_alias_capture_policy.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
 #include <rex/graphics/trace_writer.h>
 #include <rex/graphics/util/draw.h>
@@ -61,10 +67,16 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   Path GetPath() const override { return path_; }
 
   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
-              uint32_t normalized_color_mask, const Shader& vertex_shader) override;
+              uint32_t normalized_color_mask, const Shader& vertex_shader,
+              bool native_shader_grid = false) override;
 
   void InvalidateCommandListRenderTargets() {
     are_current_command_list_render_targets_valid_ = false;
+  }
+
+  // Borrowed only across the synchronous Update call on the command processor.
+  void SetSceneUpdateCapture(embedded_scene_transfer_capture_policy::UpdateContext* context) {
+    scene_update_capture_ = context;
   }
 
   bool msaa_2x_supported() const { return msaa_2x_supported_; }
@@ -81,7 +93,39 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   // frame for calling.
   bool Resolve(const memory::Memory& memory, D3D12SharedMemory& shared_memory,
                D3D12TextureCache& texture_cache, uint32_t& written_address_out,
-               uint32_t& written_length_out);
+               uint32_t& written_length_out,
+               const char* embedded_capture_label = nullptr,
+               const char* embedded_capture_path = nullptr,
+               bool* written_scaled_out = nullptr,
+               const char* embedded_edram_capture_path = nullptr,
+               const char* embedded_scaled_capture_path = nullptr,
+               const embedded_scene_resolve_capture_policy::Context* scene_capture_context = nullptr);
+
+  // Captures the currently accumulated color target. This bounded embedded
+  // diagnostic distinguishes shader/host-RT output from later EDRAM packing,
+  // resolve conversion, and presentation without modifying guest state.
+  bool CaptureEmbeddedColorTarget(const char* diagnostic_label,
+                                  const char* dump_path = nullptr,
+                                  uint64_t maximum_fp16_bytes = 0);
+
+  // Safe between graphics binding and Draw: queue only; map/write after the
+  // submission fence completes. The synchronous helper above is NOT safe at
+  // that position because it closes the submission.
+  bool QueueEmbeddedColorTarget(const char* diagnostic_label,
+                                const char* dump_path,
+                                uint64_t maximum_fp16_bytes);
+
+  // Packs and reads back the currently accumulated D24FS8 scene depth target.
+  // This is an opt-in bounded diagnostic for comparing scaled depth/stencil
+  // parity before a guest draw; it doesn't alter guest memory or draw state.
+  bool CaptureEmbeddedSceneDepthTarget(const char* diagnostic_label,
+                                       const char* dump_path = nullptr);
+
+  // Selected-frame diagnostic only: sample every host MSAA sample in the first
+  // 384 rows, keeping each clear/alias epoch separate until fence completion.
+  // Call before guest pipeline binding or after the actual guest draw.
+  bool QueueCameraDepthClearReadback(uint64_t frame, uint64_t draw,
+                                     uint64_t clear_draw, bool after_alias);
 
   // Returns true if any downloads were submitted to the command processor.
   bool InitializeTraceSubmitDownloads();
@@ -103,7 +147,10 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   bool depth_float24_convert_in_pixel_shader() const {
     return depth_float24_convert_in_pixel_shader_;
   }
-
+  // Whether the explicit compatibility option requests guest float24 depth
+  // conversion for the current draw. Ownership transfer history is
+  // deliberately not used because a target may contain mixed sources.
+  bool current_draw_depth_float24_convert_in_pixel_shader() const;
   DXGI_FORMAT GetColorResourceDXGIFormat(xenos::ColorRenderTargetFormat format) const;
   DXGI_FORMAT GetColorDrawDXGIFormat(xenos::ColorRenderTargetFormat format) const;
   DXGI_FORMAT GetColorOwnershipTransferDXGIFormat(xenos::ColorRenderTargetFormat format,
@@ -198,6 +245,12 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       kResolveCopyShaders[size_t(draw_util::ResolveCopyShaderIndex::kCount)];
   ID3D12PipelineState* resolve_copy_pipelines_[size_t(draw_util::ResolveCopyShaderIndex::kCount)] =
       {};
+  // Unscaled variants used when every owner of a resolve source is in the
+  // native scale class. The scaled shaders use a different constant layout and
+  // destination address space, so this must be a separate pipeline set.
+  ID3D12RootSignature* resolve_copy_native_root_signature_ = nullptr;
+  ID3D12PipelineState* resolve_copy_native_pipelines_[size_t(
+      draw_util::ResolveCopyShaderIndex::kCount)] = {};
 
   // For traces.
   ID3D12Resource* edram_snapshot_download_buffer_ = nullptr;
@@ -239,6 +292,7 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       return descriptor_load_separate_;
     }
 
+    D3D12_RESOURCE_STATES resource_state() const { return resource_state_; }
     D3D12_RESOURCE_STATES SetResourceState(D3D12_RESOURCE_STATES new_state) {
       D3D12_RESOURCE_STATES old_state = resource_state_;
       resource_state_ = new_state;
@@ -255,7 +309,6 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     }
     uint32_t temporary_sort_index() const { return temporary_sort_index_; }
     void SetTemporarySortIndex(uint32_t index) { temporary_sort_index_ = index; }
-
    private:
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
     ui::d3d12::D3D12CpuDescriptorPool::Descriptor descriptor_draw_;
@@ -391,6 +444,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       // swapping of 40-sample columns as opposed to the host render target -
       // this is done only for the color source).
       uint32_t host_depth_source_is_copy : 1;
+      uint32_t dest_scale_native : 1;
+      uint32_t source_scale_native : 1;
 
       // Last bits because this affects the root signature - after sorting, only
       // change it as fewer times as possible. Depth buffers have an additional
@@ -484,6 +539,10 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       // Last bit because this affects the root signature - after sorting, only
       // change it at most once. Depth buffers have an additional stencil SRV.
       uint32_t is_depth : 1;
+      // A native source dumped to the scaled EDRAM layout must duplicate each
+      // guest pixel; native_layout instead emits the plain 1x EDRAM layout.
+      uint32_t source_scale_native : 1;
+      uint32_t native_layout : 1;
     };
 
     DumpPipelineKey() : key(0) { static_assert_size(*this, sizeof(key)); }
@@ -651,7 +710,34 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       uint32_t render_target_count, RenderTarget* const* render_targets,
       const std::vector<Transfer>* render_target_transfers,
       const uint64_t* render_target_resolve_clear_values = nullptr,
-      const Transfer::Rectangle* resolve_clear_rectangle = nullptr);
+      const Transfer::Rectangle* resolve_clear_rectangle = nullptr,
+      const embedded_scene_resolve_capture_policy::Context* scene_capture_context = nullptr,
+      embedded_scene_transfer_capture_policy::UpdateContext* update_capture = nullptr);
+
+  void RecordSceneUpdateTargets(RenderTarget* const* targets, const std::vector<Transfer>* transfers,
+                               embedded_scene_transfer_capture_policy::UpdateContext& context);
+  embedded_scene_transfer_capture_policy::UpdateContext* scene_update_capture_ = nullptr;
+
+  struct SceneAliasPair {
+    Microsoft::WRL::ComPtr<ID3D12Resource> color, alias;
+    uint64_t out_update = 0, out_draw = 0;
+    uint32_t start = 0, end = 0;
+    bool returned = false;
+  };
+  struct PendingSceneAliasReadback {
+    DiagnosticColorSamplesReadback copy;
+    uint64_t frame = 0, update = 0, draw = 0, submission = 0;
+    uint32_t pair = 0;
+    bool after = false;
+    std::string path;
+  };
+  embedded_scene_alias_capture_policy::Budget scene_alias_budget_;
+  std::array<SceneAliasPair, embedded_scene_alias_capture_policy::Budget::kMaximumPairs> scene_alias_pairs_;
+  std::deque<PendingSceneAliasReadback> pending_scene_alias_readbacks_;
+  void CaptureSceneAliasTransfers(RenderTarget* const* targets,
+                                  const std::vector<Transfer>* transfers, bool after);
+  bool QueueSceneAliasReadback(D3D12RenderTarget* target, uint32_t pair, bool after);
+  void CompleteSceneAliasReadbacks();
 
   // Accepts an array of (1 + xenos::kMaxColorRenderTargets) render targets,
   // first depth, then color.
@@ -659,14 +745,57 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
 
   ID3D12PipelineState* GetOrCreateDumpPipeline(DumpPipelineKey key);
   ID3D12PipelineState* GetOrCreateDirectResolvePipeline(DirectResolvePipelineKey key);
+  struct EmbeddedColorTargetDiagnosticSummary {
+    uint32_t fnv1a = 0;
+    uint32_t unique_pixel_values_capped = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t source_samples = 0;
+  };
+  struct PendingColorTargetReadback {
+    DiagnosticColorReadback copy;
+    uint64_t submission = 0;
+    std::string label;
+    std::string path;
+  };
+  std::deque<PendingColorTargetReadback> pending_color_target_readbacks_;
+  uint32_t queued_color_target_readback_count_ = 0;
+  struct PendingDepthSourceReadback {
+    Microsoft::WRL::ComPtr<ID3D12Resource> source, output, readback;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline;
+    uint64_t submission = 0, bytes = 0;
+    uint64_t camera_frame = 0, camera_draw = 0;
+    uint32_t width = 0, height = 0, samples = 0, ordinal = 0, destination = 0;
+    std::string path;
+  };
+  std::deque<PendingDepthSourceReadback> pending_depth_source_readbacks_;
+  std::vector<ID3D12Resource*> captured_depth_sources_;
+  embedded_camera_depth_clear_policy::ReadbackBudget camera_depth_readback_budget_;
+  bool QueueDepthSourceReadback(D3D12RenderTarget* source, uint32_t ordinal,
+                               uint32_t destination, uint64_t camera_frame = 0,
+                               uint64_t camera_draw = 0, bool after_alias = false);
+  void CompleteDepthSourceReadbacks();
+  void CompleteColorTargetReadbacks();
+  bool CaptureEmbeddedColorTarget(D3D12RenderTarget* render_target,
+                                  const char* diagnostic_label,
+                                  const char* dump_path,
+                                  EmbeddedColorTargetDiagnosticSummary* summary_out = nullptr);
+  bool CaptureEmbeddedResolveSource(const draw_util::ResolveInfo& resolve_info,
+                                    const char* diagnostic_label,
+                                    const char* dump_path);
+  bool CaptureEmbeddedEdramBuffer(const draw_util::ResolveInfo& resolve_info,
+                                  const char* diagnostic_label,
+                                  const char* dump_path);
   bool TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
                               draw_util::ResolveCopyShaderIndex copy_shader,
                               bool draw_resolution_scaled);
 
   // Writes contents of host render targets within rectangles from
-  // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
+  // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_. native_layout selects
+  // the plain 1x EDRAM layout for an all-native resolve source.
   bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
-                         uint32_t dump_pitch);
+                         uint32_t dump_pitch, bool native_layout = false);
 
   bool use_stencil_reference_output_ = false;
 
@@ -674,7 +803,6 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
 
   bool depth_float24_round_ = false;
   bool depth_float24_convert_in_pixel_shader_ = false;
-
   bool msaa_2x_supported_ = false;
 
   std::shared_ptr<ui::d3d12::D3D12CpuDescriptorPool> descriptor_pool_color_;

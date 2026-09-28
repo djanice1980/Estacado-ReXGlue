@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <cmath>
 #include <cstdint>
 
 #include <rex/assert.h>
@@ -24,7 +25,14 @@
 #include <rex/memory.h>
 #include <rex/ui/graphics_util.h>
 
-REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, false, "GPU",
+// On as in upstream Xenia (the ReXGlue v0.9.0 port had it off). Without the
+// vertex extent, unclipped screen-space draws with the default 8192 scissor
+// claim the EDRAM up to its end: The Darkness' tiled 4x MSAA lighting then
+// round-trips 1280x256 of depth, stencil (8 passes without shader stencil
+// output) and color between the depth buffer at tile 0 and the light buffer at
+// tile 1024 about 32 times per frame (V305: 56 -> 113 FPS at internal 2x on the
+// heaviest street view, neutral at 1x; images unchanged).
+REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, true, "GPU",
                     "Execute unclipped draw vertex shader on CPU");
 
 REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_with_scissor, false, "GPU",
@@ -62,6 +70,9 @@ namespace rex::graphics {
 void DrawExtentEstimator::PositionYExportSink::Export(ucode::ExportRegister export_register,
                                                       const float* value, uint32_t value_mask) {
   if (export_register == ucode::ExportRegister::kVSPosition) {
+    if (value_mask & 0b0001) {
+      position_x_ = value[0];
+    }
     if (value_mask & 0b0010) {
       position_y_ = value[1];
     }
@@ -258,6 +269,111 @@ uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
   return (uint32_t(std::max(int32_t(0), max_y_24p8)) +
           ((rb_surface_info.msaa_samples == xenos::MsaaSamples::k1X) ? 127 : 255)) >>
          8;
+}
+
+bool DrawExtentEstimator::EstimateRectangleBounds(const Shader& vertex_shader, float& min_x,
+                                                  float& min_y, float& max_x, float& max_y) {
+  const RegisterFile& regs = register_file_;
+
+  auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+  if (vgt_draw_initiator.prim_type != xenos::PrimitiveType::kRectangleList ||
+      vgt_draw_initiator.num_indices != 3 ||
+      vgt_draw_initiator.source_select != xenos::SourceSelect::kAutoIndex ||
+      !regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable) {
+    return false;
+  }
+  if (xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type) &&
+      regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select ==
+          xenos::VGTOutputPath::kTessellationEnable) {
+    return false;
+  }
+  if (vertex_shader.type() != xenos::ShaderType::kVertex || !vertex_shader.is_ucode_analyzed() ||
+      !ShaderInterpreter::CanInterpretShader(vertex_shader)) {
+    return false;
+  }
+
+  uint32_t index_offset = regs.Get<reg::VGT_INDX_OFFSET>().indx_offset;
+  uint32_t min_index = regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
+  uint32_t max_index = regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx;
+  auto pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
+  float scale_x =
+      pa_cl_vte_cntl.vport_x_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE) : 1.0f;
+  float offset_x =
+      pa_cl_vte_cntl.vport_x_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET) : 0.0f;
+  float scale_y =
+      pa_cl_vte_cntl.vport_y_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE) : 1.0f;
+  float offset_y =
+      pa_cl_vte_cntl.vport_y_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET) : 0.0f;
+  // Direct3D 9 pixel centers at integers: move them to +0.5 like the host.
+  if (regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero) {
+    offset_x += 0.5f;
+    offset_y += 0.5f;
+  }
+  if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
+    auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+    offset_x += float(pa_sc_window_offset.window_x_offset);
+    offset_y += float(pa_sc_window_offset.window_y_offset);
+  }
+
+  min_x = FLT_MAX;
+  min_y = FLT_MAX;
+  max_x = -FLT_MAX;
+  max_y = -FLT_MAX;
+  float xs[3], ys[3];
+  shader_interpreter_.SetShader(vertex_shader);
+  PositionYExportSink sink;
+  shader_interpreter_.SetExportSink(&sink);
+  bool valid = true;
+  for (uint32_t i = 0; valid && i < 3; ++i) {
+    uint32_t vertex_index = std::min(max_index, std::max(min_index, (i + index_offset) & 0xFFFFFF));
+    sink.Reset();
+    shader_interpreter_.temp_registers()[0] = float(vertex_index);
+    shader_interpreter_.Execute();
+    if ((sink.vertex_kill().has_value() && (sink.vertex_kill().value() & ~(UINT32_C(1) << 31))) ||
+        !sink.position_x().has_value() || !sink.position_y().has_value()) {
+      valid = false;
+      break;
+    }
+    float x = sink.position_x().value();
+    float y = sink.position_y().value();
+    if (!pa_cl_vte_cntl.vtx_xy_fmt) {
+      if (!sink.position_w().has_value() || !(sink.position_w().value() > 0.0f)) {
+        valid = false;
+        break;
+      }
+      x /= sink.position_w().value();
+      y /= sink.position_w().value();
+    }
+    x = x * scale_x + offset_x;
+    y = y * scale_y + offset_y;
+    if (!std::isfinite(x) || !std::isfinite(y)) {
+      valid = false;
+      break;
+    }
+    xs[i] = x;
+    ys[i] = y;
+    min_x = std::min(min_x, x);
+    min_y = std::min(min_y, y);
+    max_x = std::max(max_x, x);
+    max_y = std::max(max_y, y);
+  }
+  shader_interpreter_.SetExportSink(nullptr);
+  if (!valid) {
+    return false;
+  }
+  // The fourth corner completes a parallelogram: only three corners of a
+  // screen-aligned rectangle (two distinct x and two distinct y) make the
+  // bounds the covered area.
+  auto distinct = [](const float* v) {
+    return v[0] == v[1] ? (v[0] == v[2] ? 1 : 2) : ((v[2] == v[0] || v[2] == v[1]) ? 2 : 3);
+  };
+  for (uint32_t i = 0; i < 3; ++i) {
+    const uint32_t j = (i + 1) % 3;
+    if (xs[i] == xs[j] && ys[i] == ys[j]) {
+      return false;  // Degenerate: two corners coincide.
+    }
+  }
+  return distinct(xs) == 2 && distinct(ys) == 2;
 }
 
 uint32_t DrawExtentEstimator::EstimateMaxY(bool try_to_estimate_vertex_max_y,

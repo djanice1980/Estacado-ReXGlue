@@ -21,6 +21,12 @@
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/thread_state.h>
 #include <rex/system/xthread.h>
+#include <rex/thread.h>
+
+#include <array>
+#include <atomic>
+#include <cstdio>
+#include <cstring>
 
 extern "C" {
 #include "libavutil/log.h"
@@ -54,8 +60,72 @@ REXCVAR_DEFINE_BOOL(ffmpeg_verbose, false, "Audio", "Verbose FFmpeg output (debu
 
 namespace rex::audio {
 
+constexpr bool kEmbeddedHotPathDiagnosticsEnabled = false;
+
+namespace {
+
+constexpr uint32_t kXmaContextErrorDwordOffset = 2 * sizeof(uint32_t);
+constexpr uint32_t kXmaContextErrorStatusShift = 26;
+constexpr uint32_t kXmaContextErrorStatusMask = 0x1F;
+constexpr size_t kEmbeddedXmaContextCount = 320;
+
+struct EmbeddedXmaErrorTraceState {
+  std::array<std::atomic<uint8_t>, kEmbeddedXmaContextCount> last_status{};
+  std::array<std::atomic<uint64_t>, kEmbeddedXmaContextCount> observations{};
+};
+
+constexpr uint8_t DecodeEmbeddedXmaErrorStatus(uint32_t guest_error_dword) {
+  const uint32_t host_error_dword = rex::byte_swap(guest_error_dword);
+  return static_cast<uint8_t>((host_error_dword >> kXmaContextErrorStatusShift) &
+                              kXmaContextErrorStatusMask);
+}
+
+static_assert(DecodeEmbeddedXmaErrorStatus(0x00000010) == 4);
+static_assert(DecodeEmbeddedXmaErrorStatus(0x0000007C) == 31);
+
+uint8_t ReadEmbeddedXmaErrorStatus(memory::Memory* memory, uint32_t guest_ptr) {
+  // XMA_CONTEXT_DATA DWORD 2 is stored big-endian in guest memory. Reading
+  // only that word avoids copying and swapping all 64 bytes on every kick
+  // solely for an error diagnostic that is normally inactive.
+  uint32_t guest_error_dword = 0;
+  const uint8_t* context_ptr = memory->TranslateVirtual(guest_ptr);
+  std::memcpy(&guest_error_dword, context_ptr + kXmaContextErrorDwordOffset,
+              sizeof(guest_error_dword));
+  return DecodeEmbeddedXmaErrorStatus(guest_error_dword);
+}
+
+bool ShouldTraceEmbeddedXmaError(EmbeddedXmaErrorTraceState& trace_state, uint32_t context_id,
+                                 uint8_t error_status) {
+  auto& last_status = trace_state.last_status[context_id];
+  const uint8_t previous = last_status.load(std::memory_order_relaxed);
+  if (!error_status) {
+    if (previous) {
+      last_status.store(0, std::memory_order_relaxed);
+      trace_state.observations[context_id].store(0, std::memory_order_relaxed);
+    }
+    return false;
+  }
+
+  uint64_t observation = 0;
+  if (previous != error_status) {
+    last_status.store(error_status, std::memory_order_relaxed);
+    trace_state.observations[context_id].store(1, std::memory_order_relaxed);
+    observation = 1;
+  } else {
+    observation = trace_state.observations[context_id].fetch_add(1, std::memory_order_relaxed) + 1;
+  }
+
+  // Preserve immediate error visibility, then remain bounded if the guest
+  // repeatedly kicks a context while the same error persists.
+  return observation <= 4 || !(observation & (observation - 1));
+}
+
+}  // namespace
+
 XmaDecoder::XmaDecoder(runtime::FunctionDispatcher* function_dispatcher)
     : memory_(function_dispatcher->memory()), function_dispatcher_(function_dispatcher) {}
+
+XmaDecoder::XmaDecoder(memory::Memory* memory) : memory_(memory) {}
 
 XmaDecoder::~XmaDecoder() = default;
 
@@ -107,6 +177,7 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
   // register.
   context_data_first_ptr_ = memory()->SystemHeapAlloc(sizeof(XMA_CONTEXT_DATA) * kContextCount, 256,
                                                       memory::kSystemHeapPhysical);
+  owns_context_data_ = true;
   context_data_last_ptr_ = context_data_first_ptr_ + (sizeof(XMA_CONTEXT_DATA) * kContextCount - 1);
   register_file_[XmaRegister::ContextArrayAddress] =
       memory()->GetPhysicalAddress(context_data_first_ptr_);
@@ -134,6 +205,55 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
 
   worker_thread_->Create();
 
+  return X_STATUS_SUCCESS;
+}
+
+X_STATUS XmaDecoder::SetupExternal(uint32_t context_data_first_ptr) {
+  if (!context_data_first_ptr || (context_data_first_ptr & 0xFF) ||
+      context_data_first_ptr > UINT32_MAX - sizeof(XMA_CONTEXT_DATA) * kContextCount) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  av_log_set_callback(av_log_callback);
+  context_data_first_ptr_ = context_data_first_ptr;
+  context_data_last_ptr_ = context_data_first_ptr_ + sizeof(XMA_CONTEXT_DATA) * kContextCount - 1;
+  owns_context_data_ = false;
+  register_file_[XmaRegister::ContextArrayAddress] =
+      memory()->GetPhysicalAddress(context_data_first_ptr_);
+  if (register_file_[XmaRegister::ContextArrayAddress] == UINT32_MAX) {
+    context_data_first_ptr_ = 0;
+    context_data_last_ptr_ = 0;
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  {
+    auto host_write = memory()->GuardVirtualWrite(context_data_first_ptr_,
+        sizeof(XMA_CONTEXT_DATA) * kContextCount);
+    std::memset(memory()->TranslateVirtual(context_data_first_ptr_), 0,
+                sizeof(XMA_CONTEXT_DATA) * kContextCount);
+  }
+  for (size_t i = 0; i < kContextCount; ++i) {
+    const uint32_t guest_ptr = context_data_first_ptr_ + uint32_t(i * sizeof(XMA_CONTEXT_DATA));
+    if (contexts_[i].Setup(static_cast<uint32_t>(i), memory(), guest_ptr)) {
+      return X_STATUS_UNSUCCESSFUL;
+    }
+  }
+  register_file_[XmaRegister::NextContextIndex] = 1;
+  context_bitmap_.Resize(kContextCount);
+  worker_running_ = true;
+  work_event_ = rex::thread::Event::CreateAutoResetEvent(false);
+  if (!work_event_)
+    return X_STATUS_UNSUCCESSFUL;
+  external_worker_thread_ = std::thread([this]() {
+    rex::thread::set_current_thread_name("XMA Decoder");
+    std::fprintf(stderr, "REX_EMBEDDED_XMA_WORKER_START native_thread=%u\n",
+                 rex::thread::current_thread_system_id());
+    std::fflush(stderr);
+    WorkerThreadMain();
+    std::fprintf(stderr, "REX_EMBEDDED_XMA_WORKER_STOP native_thread=%u\n",
+                 rex::thread::current_thread_system_id());
+    std::fflush(stderr);
+  });
   return X_STATUS_SUCCESS;
 }
 
@@ -165,8 +285,13 @@ void XmaDecoder::WorkerThreadMain() {
 }
 
 void XmaDecoder::Shutdown() {
-  if (!worker_thread_) {
+  if (!worker_thread_ && !external_worker_thread_.joinable()) {
     return;
+  }
+
+  if (external_worker_thread_.joinable()) {
+    std::fprintf(stderr, "REX_EMBEDDED_XMA_SHUTDOWN_BEGIN\n");
+    std::fflush(stderr);
   }
 
   worker_running_ = false;
@@ -179,19 +304,27 @@ void XmaDecoder::Shutdown() {
     Resume();
   }
 
-  // Wait up to 2 seconds for worker thread to exit gracefully.
-  auto result = rex::thread::Wait(worker_thread_->thread(), false, std::chrono::milliseconds(2000));
-  if (result == rex::thread::WaitResult::kTimeout) {
-    REXAPU_WARN("XMA: Worker thread did not exit within 2s, abandoning");
+  if (external_worker_thread_.joinable()) {
+    external_worker_thread_.join();
+    std::fprintf(stderr, "REX_EMBEDDED_XMA_SHUTDOWN_COMPLETE\n");
+    std::fflush(stderr);
+  } else {
+    // Wait up to 2 seconds for the kernel-owned worker to exit gracefully.
+    auto result =
+        rex::thread::Wait(worker_thread_->thread(), false, std::chrono::milliseconds(2000));
+    if (result == rex::thread::WaitResult::kTimeout) {
+      REXAPU_WARN("XMA: Worker thread did not exit within 2s, abandoning");
+    }
+    worker_thread_.reset();
   }
-  worker_thread_.reset();
 
-  if (context_data_first_ptr_) {
+  if (context_data_first_ptr_ && owns_context_data_) {
     memory()->SystemHeapFree(context_data_first_ptr_);
   }
 
   context_data_first_ptr_ = 0;
   context_data_last_ptr_ = 0;
+  owns_context_data_ = false;
 }
 
 int XmaDecoder::GetContextId(uint32_t guest_ptr) {
@@ -271,8 +404,21 @@ uint32_t XmaDecoder::ReadRegister(uint32_t addr) {
 void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
   SCOPE_profile_cpu_f("apu");
 
+  const uint32_t guest_value = value;
   uint32_t r = (addr & 0xFFFF) / 4;
   value = rex::byte_swap(value);
+
+  if (!function_dispatcher_) {
+    static std::atomic<uint64_t> embedded_write_ordinal = 0;
+    const uint64_t ordinal = ++embedded_write_ordinal;
+    if (kEmbeddedHotPathDiagnosticsEnabled && (ordinal <= 64 || !(ordinal & (ordinal - 1)))) {
+      std::fprintf(stderr,
+                   "REX_EMBEDDED_XMA_MMIO_WRITE ordinal=%llu address=0x%08X register=0x%04X "
+                   "guest=0x%08X decoded=0x%08X\n",
+                   static_cast<unsigned long long>(ordinal), addr, r, guest_value, value);
+      std::fflush(stderr);
+    }
+  }
 
   assert_true(r < XmaRegisterFile::kRegisterCount);
   register_file_[r] = value;
@@ -286,10 +432,34 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
     // The context ID is a bit in the range of the entire context array.
     uint32_t base_context_id = (r - XmaRegister::Context0Kick) * 32;
     uint32_t kicked_value = value;
+    static std::atomic<uint64_t> embedded_kick_ordinal = 0;
+    static EmbeddedXmaErrorTraceState embedded_error_trace_state;
     for (int i = 0; value && i < 32; ++i, value >>= 1) {
       if (value & 1) {
         uint32_t context_id = base_context_id + i;
         auto& context = contexts_[context_id];
+        if (!function_dispatcher_) {
+          const uint64_t ordinal = ++embedded_kick_ordinal;
+          const uint8_t error_status = ReadEmbeddedXmaErrorStatus(memory(), context.guest_ptr());
+          if (ShouldTraceEmbeddedXmaError(embedded_error_trace_state, context_id, error_status)) {
+            const XMA_CONTEXT_DATA data(memory()->TranslateVirtual(context.guest_ptr()));
+            std::fprintf(stderr,
+                         "REX_EMBEDDED_XMA_KICK ordinal=%llu context=%u guest=0x%08X allocated=%u "
+                         "enabled=%u input0=0x%08X packets0=%u valid0=%u input1=0x%08X "
+                         "packets1=%u valid1=%u current=%u read_bits=%u output=0x%08X blocks=%u "
+                         "valid=%u read=%u write=%u rate=%u stereo=%u error=%u\n",
+                         static_cast<unsigned long long>(ordinal), context_id, context.guest_ptr(),
+                         context.is_allocated() ? 1u : 0u, context.is_enabled() ? 1u : 0u,
+                         data.input_buffer_0_ptr, data.input_buffer_0_packet_count,
+                         data.input_buffer_0_valid, data.input_buffer_1_ptr,
+                         data.input_buffer_1_packet_count, data.input_buffer_1_valid,
+                         data.current_buffer, data.input_buffer_read_offset, data.output_buffer_ptr,
+                         data.output_buffer_block_count, data.output_buffer_valid,
+                         data.output_buffer_read_offset, data.output_buffer_write_offset,
+                         data.sample_rate, data.is_stereo, data.error_status);
+            std::fflush(stderr);
+          }
+        }
         context.Enable();
       }
     }
@@ -299,7 +469,26 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
       if (kicked_value & 1) {
         uint32_t context_id = base_context_id + i;
         auto& context = contexts_[context_id];
-        if (context.Work()) {
+        const bool worked = context.Work();
+        if (!function_dispatcher_) {
+          const uint64_t ordinal = embedded_kick_ordinal.load();
+          const uint8_t error_status = ReadEmbeddedXmaErrorStatus(memory(), context.guest_ptr());
+          if (ShouldTraceEmbeddedXmaError(embedded_error_trace_state, context_id, error_status)) {
+            const XMA_CONTEXT_DATA data(memory()->TranslateVirtual(context.guest_ptr()));
+            std::fprintf(stderr,
+                         "REX_EMBEDDED_XMA_KICK_RESULT ordinal=%llu context=%u worked=%u "
+                         "enabled=%u valid0=%u valid1=%u current=%u read_bits=%u "
+                         "output_valid=%u output_read=%u output_write=%u error=%u\n",
+                         static_cast<unsigned long long>(ordinal), context_id, worked ? 1u : 0u,
+                         context.is_enabled() ? 1u : 0u, data.input_buffer_0_valid,
+                         data.input_buffer_1_valid, data.current_buffer,
+                         data.input_buffer_read_offset, data.output_buffer_valid,
+                         data.output_buffer_read_offset, data.output_buffer_write_offset,
+                         data.error_status);
+            std::fflush(stderr);
+          }
+        }
+        if (worked) {
           context.SignalWorkDone();
         }
       }

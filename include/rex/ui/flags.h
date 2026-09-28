@@ -29,7 +29,11 @@ REXCVAR_DECLARE(bool, host_present_from_non_ui_thread);
 REXCVAR_DECLARE(int32_t, window_width);
 REXCVAR_DECLARE(int32_t, window_height);
 REXCVAR_DECLARE(bool, fullscreen);
+REXCVAR_DECLARE(std::string, window_mode);
 REXCVAR_DECLARE(int32_t, monitor);
+// Host output/window resolution. Kept separate from the guest video mode so
+// borderless/native/custom output never silently changes Xbox layout or aspect.
+REXCVAR_DECLARE(std::string, output_resolution);
 
 // Display (guest video mode; defined in src/ui/window.cpp)
 REXCVAR_DECLARE(int32_t, video_mode_width);

@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <functional>
@@ -18,10 +19,17 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include <rex/graphics/register_file.h>
+#include <rex/graphics/cp_cadence_diagnostic.h>
+#include <rex/graphics/gpu_diagnostics.h>
+#include <rex/graphics/swap_interval_diagnostic.h>
+#include <rex/graphics/pc_command_execution.h>
+#include <rex/graphics/pc_ring_publication.h>
+#include <rex/graphics/pc_owned_camera_packet.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/trace_writer.h>
 #include <rex/graphics/xenos.h>
@@ -76,10 +84,21 @@ enum class GammaRampType {
 
 class CommandProcessor {
  public:
+  // Startup-only, before the host initializes the title command ring.
+  void SetOwnedCameraPacketCallbacks(pc_owned_camera_packet::Callbacks callbacks) {
+    owned_camera_packet_callbacks_ = callbacks;
+  }
+  struct GuestFrameStats {
+    uint64_t frame_time_us = 0;
+    uint64_t frame_count = 0;
+  };
+
   enum class SwapPostEffect {
     kNone,
     kFxaa,
     kFxaaExtreme,
+    // SMAA 1x (D3D12; other backends present without post-processing).
+    kSmaa,
   };
 
   CommandProcessor(GraphicsSystem* graphics_system, system::KernelState* kernel_state);
@@ -87,6 +106,20 @@ class CommandProcessor {
 
   uint32_t counter() const { return counter_; }
   void increment_counter() { counter_++; }
+  GuestFrameStats guest_frame_stats() const {
+    return {
+        guest_frame_time_us_.load(std::memory_order_relaxed),
+        guest_frame_count_.load(std::memory_order_relaxed),
+    };
+  }
+  // GPU busy time of the most recent completed guest frames in microseconds,
+  // oldest first, where the backend measures it (any thread). Returns the
+  // number copied; total_frames_out receives the number measured so far.
+  virtual size_t GetRecentGpuFrameBusyUs(uint32_t* out, size_t capacity,
+                                         uint64_t* total_frames_out = nullptr) const {
+    if (total_frames_out) *total_frames_out = 0;
+    return 0;
+  }
 
   Shader* active_vertex_shader() const { return active_vertex_shader_; }
   Shader* active_pixel_shader() const { return active_pixel_shader_; }
@@ -121,6 +154,12 @@ class CommandProcessor {
   virtual void EndTracing();
 
   virtual void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) = 0;
+  // A host write of CPU-side data made inside the embedded GPU plugin (any
+  // thread, after the write). Backends with a pending host-write tracker
+  // publish it before the data is next requested; otherwise immediately.
+  virtual void MarkHostWrite(uint32_t base_ptr, uint32_t length) {
+    TracePlaybackWroteMemory(base_ptr, length);
+  }
 
   void RestoreRegisters(uint32_t first_register, const uint32_t* register_values,
                         uint32_t register_count, bool execute_callbacks);
@@ -137,6 +176,9 @@ class CommandProcessor {
   void ExecutePacket(uint32_t ptr, uint32_t count);
 
   bool is_paused() const { return paused_; }
+  bool is_worker_context_ready() const {
+    return worker_context_ready_.load(std::memory_order_acquire);
+  }
   void Pause();
   void Resume();
 
@@ -157,6 +199,44 @@ class CommandProcessor {
   virtual void ShutdownContext() = 0;
 
   virtual void WriteRegister(uint32_t index, uint32_t value);
+  // Actual type0 consumption site; unknown sources never inherit a prior tag.
+  virtual void WriteRegisterFromPacket(uint32_t index, uint32_t value,
+                                      uint32_t packet, uint32_t data,
+                                      const pc_owned_camera_packet::Source* source = nullptr) {
+    WriteRegister(index, value);
+  }
+  virtual void InvalidateRegisterProvenance() {}
+#if REX_GPU_DIAGNOSTICS
+  pc_command_execution::State command_execution_;
+#else
+  // Player builds: the execution identity (read only by the measurement-only
+  // provenance experiment below) is never touched; static, so the object
+  // layout carries none of it.
+  static inline pc_command_execution::State command_execution_{};
+#endif
+  pc_owned_camera_packet::Callbacks owned_camera_packet_callbacks_{};
+  // Lazily allocated only for source tracking. Keeping the 4 KiB owned packet
+  // copy off the type-0 handler's stack avoids a stack probe on every normal
+  // register packet. Nested handlers use a separate temporary copy.
+  std::unique_ptr<uint32_t[]> type0_owned_words_;
+  bool type0_owned_words_in_use_ = false;
+  // Configured during setup, before title ring initialization. No normal-run
+  // publication tracking when the experimental owned history is disabled.
+#if REX_GPU_DIAGNOSTICS
+  bool track_ring_publications_ = false;
+  std::mutex ring_publication_mutex_;
+  pc_ring_publication::State ring_publications_;
+  memory::RingBuffer* executing_primary_reader_ = nullptr;
+#else
+  // Player builds: ring publication tracking (with the execution identity and
+  // register write provenance) is a measurement-only experiment. The flag is a
+  // constant, so every use under it compiles out; the static storage is never
+  // touched and the 16 KB ticket queue no longer sits between hot fields.
+  static constexpr bool track_ring_publications_ = false;
+  static inline std::mutex ring_publication_mutex_;
+  static inline pc_ring_publication::State ring_publications_{};
+  static inline memory::RingBuffer* executing_primary_reader_ = nullptr;
+#endif
   uint32_t ReadRegisterValue(uint32_t index) const;
   virtual void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers);
   virtual void WriteRegisterRangeFromRing(memory::RingBuffer* ring, uint32_t base,
@@ -182,10 +262,23 @@ class CommandProcessor {
   virtual void MakeCoherent();
   virtual void PrepareForWait();
   virtual void ReturnFromWait();
+  // Called before a packet writes guest memory from the command processor, so
+  // a backend can first complete deferred writes it owns in that range.
+  virtual void PrepareForPacketMemoryWrite(uint32_t address, uint32_t bytes) {}
+  // Before the command processor makes GPU progress guest-visible (memory
+  // and scratch writes, interrupts, swaps): backends finish deferred work the
+  // title may rely on (the D3D12 copy stage's pending upload copies).
+  virtual void SettleGuestVisibleWork() {}
 
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
   virtual void OnPrimaryBufferEnd() {}
   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
+  // Lean indirect-buffer loop (gpu_lean_indirect_buffers) for launches without
+  // tracing, provenance or cadence diagnostics: the same handlers in the same
+  // order as ExecutePacket, without its per-packet bookkeeping; register-write
+  // packets decode straight from the buffer (indirect buffers never wrap).
+  bool CanUseLeanIndirectBuffers() const;
+  void ExecuteIndirectBufferLean(uint32_t ptr, uint32_t count);
   bool ExecutePacket(memory::RingBuffer* reader);
   bool ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet);
   bool ExecutePacketType1(memory::RingBuffer* reader, uint32_t packet);
@@ -262,7 +355,10 @@ class CommandProcessor {
   std::filesystem::path trace_frame_path_;
 
   std::atomic<bool> worker_running_;
+  std::atomic<bool> worker_context_ready_{false};
   system::object_ref<system::XHostThread> worker_thread_;
+  std::thread embedded_worker_thread_;
+  std::thread::id embedded_worker_thread_id_{};
 
   std::queue<std::function<void()>> pending_fns_;
 
@@ -270,6 +366,51 @@ class CommandProcessor {
   std::vector<uint32_t> me_bin_;
 
   uint32_t counter_ = 0;
+  // Type-0 register writes that need the virtual WriteRegister path because
+  // the base class or the backend attaches side effects to them. With the
+  // fast path enabled by a backend, all other registers are plain stores.
+  void MarkRegisterWriteHandler(uint32_t first, uint32_t last);
+  void EnableRegisterWriteFastPath();
+  void ReportEmbeddedNanConstantSource(uint32_t packet, uintptr_t packet_host_address,
+                                       uintptr_t data_host_address, uint32_t base_index,
+                                       uint32_t count, uint32_t write_one_reg,
+                                       uint32_t target_index, uint32_t reg_data);
+  std::array<uint8_t, RegisterFile::kRegisterCount> register_write_handler_{};
+  bool register_write_fast_path_ = false;
+#if REX_GPU_DIAGNOSTICS
+  CpCadenceDiagnostic cp_cadence_;
+  SwapIntervalDiagnostic swap_intervals_;
+#else
+  // Player builds: the CP cadence and swap-interval observers are
+  // measurement-only (every use is under kGpuDiagnostics). Static storage that
+  // is never touched, so the object layout carries none of it.
+  static inline CpCadenceDiagnostic cp_cadence_{};
+  static inline SwapIntervalDiagnostic swap_intervals_{};
+#endif
+  // Logs and resets the current swap-interval window (diagnostic only).
+  void LogSwapIntervalWindow(uint64_t frequency, bool closed_by_marker);
+  // One backend line per swap-interval window (empty: none), e.g. the D3D12
+  // copy stage's settle counters; the backend resets its counters.
+  virtual std::string SwapIntervalBackendStats() { return {}; }
+  uint64_t swap_diag_start_tick_ = 0;
+  uint64_t swap_diag_start_tsc_ = 0;
+  uint32_t swap_phase_markers_ = 0;
+  bool swap_phase_marker_down_ = false;
+  // Long-frame capture storage (embedded_swap_long_frame_us), allocated on
+  // first use so ordinary launches keep the command processor layout compact.
+  std::unique_ptr<SwapIntervalDiagnostic::LongFrame[]> swap_long_frame_storage_;
+  // Observational snapshot only; unsupported backends report unavailable.
+  virtual bool QueryCadenceSubmission(uint64_t& submitted, uint64_t& completed) {
+    submitted = completed = 0;
+    return false;
+  }
+
+  // Updated once per real XE_SWAP packet. These two relaxed atomics are the
+  // complete hidden-overlay cost in optimized builds; high-frequency general
+  // perf counters remain compiled out of Release.
+  uint64_t guest_frame_last_tick_ = 0;
+  std::atomic<uint64_t> guest_frame_time_us_{0};
+  std::atomic<uint64_t> guest_frame_count_{0};
 
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;

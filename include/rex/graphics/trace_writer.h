@@ -36,8 +36,14 @@ class TraceWriter {
   void WritePrimaryBufferEnd();
   void WriteIndirectBufferStart(uint32_t base_ptr, uint32_t count);
   void WriteIndirectBufferEnd();
-  void WritePacketStart(uint32_t base_ptr, uint32_t count);
-  void WritePacketEnd();
+  // Packet dispatch owns this writer. Avoid out-of-line tracing calls for
+  // every packet when no trace is open; the recording bodies stay unchanged.
+  void WritePacketStart(uint32_t base_ptr, uint32_t count) {
+    if (file_) WritePacketStartOpen(base_ptr, count);
+  }
+  void WritePacketEnd() {
+    if (file_) WritePacketEndOpen();
+  }
   void WriteMemoryRead(uint32_t base_ptr, size_t length, const void* host_ptr = nullptr);
   void WriteMemoryReadCached(uint32_t base_ptr, size_t length);
   void WriteMemoryReadCachedNop(uint32_t base_ptr, size_t length);
@@ -51,6 +57,8 @@ class TraceWriter {
                       uint32_t gamma_ramp_rw_component);
 
  private:
+  void WritePacketStartOpen(uint32_t base_ptr, uint32_t count);
+  void WritePacketEndOpen();
   void WriteMemoryCommand(TraceCommandType type, uint32_t base_ptr, size_t length,
                           const void* host_ptr = nullptr);
 

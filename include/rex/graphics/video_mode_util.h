@@ -20,6 +20,25 @@
 
 namespace rex::graphics::video_mode_util {
 
+inline std::string NormalizeResolutionValue(std::string_view resolution_value) {
+  std::string normalized;
+  normalized.reserve(resolution_value.size());
+  for (char c : resolution_value) {
+    unsigned char c_unsigned = static_cast<unsigned char>(c);
+    if (std::isspace(c_unsigned) || c == '_' || c == '-') {
+      continue;
+    }
+    normalized.push_back(char(std::tolower(c_unsigned)));
+  }
+  return normalized;
+}
+
+inline bool IsNativeResolutionPreset(std::string_view resolution_value) {
+  const std::string normalized = NormalizeResolutionValue(resolution_value);
+  return normalized == "native" || normalized == "desktop" ||
+         normalized == "nativedesktop";
+}
+
 inline bool TryParsePositiveInt32(std::string_view value, int32_t& value_out) {
   if (value.empty()) {
     return false;
@@ -38,15 +57,8 @@ inline bool TryParsePositiveInt32(std::string_view value, int32_t& value_out) {
 
 inline bool TryParseResolutionPreset(std::string_view resolution_value, int32_t& width_out,
                                      int32_t& height_out) {
-  std::string normalized;
-  normalized.reserve(resolution_value.size());
-  for (char c : resolution_value) {
-    unsigned char c_unsigned = static_cast<unsigned char>(c);
-    if (std::isspace(c_unsigned) || c == '_' || c == '-') {
-      continue;
-    }
-    normalized.push_back(char(std::tolower(c_unsigned)));
-  }
+  constexpr int32_t kMaximumHostDimension = 8192;
+  std::string normalized = NormalizeResolutionValue(resolution_value);
   if (normalized.empty()) {
     return false;
   }
@@ -57,7 +69,9 @@ inline bool TryParseResolutionPreset(std::string_view resolution_value, int32_t&
     int32_t parsed_height = 0;
     if (!TryParsePositiveInt32(std::string_view(normalized).substr(0, x_position), parsed_width) ||
         !TryParsePositiveInt32(std::string_view(normalized).substr(x_position + 1),
-                               parsed_height)) {
+                               parsed_height) ||
+        parsed_width > kMaximumHostDimension ||
+        parsed_height > kMaximumHostDimension) {
       return false;
     }
     width_out = parsed_width;
@@ -117,6 +131,20 @@ inline bool TryGetResolutionPresetFromCVar(int32_t& width_out, int32_t& height_o
     return false;
   }
   return TryParseResolutionPreset(resolution_value, width_out, height_out);
+}
+
+inline bool TryGetOutputResolutionPresetFromCVar(int32_t& width_out,
+                                                 int32_t& height_out) {
+  if (!rex::cvar::HasNonDefaultValue("output_resolution")) {
+    return false;
+  }
+  const std::string& value = REXCVAR_GET(output_resolution);
+  return !value.empty() && TryParseResolutionPreset(value, width_out, height_out);
+}
+
+inline bool IsNativeOutputResolutionFromCVar() {
+  return rex::cvar::HasNonDefaultValue("output_resolution") &&
+         IsNativeResolutionPreset(REXCVAR_GET(output_resolution));
 }
 
 }  // namespace rex::graphics::video_mode_util

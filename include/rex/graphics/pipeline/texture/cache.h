@@ -19,6 +19,8 @@
 #include <vector>
 
 #include <rex/assert.h>
+#include <rex/graphics/pipeline/texture/scaled_resolve_util.h>
+#include <rex/graphics/pipeline/texture/native_resolve_regions.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/shared_memory.h>
@@ -80,12 +82,19 @@ class TextureCache {
   virtual void BeginSubmission(uint64_t new_submission_index);
   virtual void BeginFrame();
 
-  void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled);
+  void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled,
+                           uint32_t bytes_per_block_log2,
+                           bool resolution_scaled = true,
+                           const native_resolve::Write* exact_write = nullptr);
+  bool GetActiveNativeResolveRegion(uint32_t fetch_constant_index,
+                                     native_resolve::Rect& region_out,
+                                     bool for_sampling = false);
+  bool IsNativeResolveSamplingEnabled() const;
   // Ensures the memory backing the range in the scaled resolve address space is
   // allocated and returns whether it is.
   virtual bool EnsureScaledResolveMemoryCommitted(uint32_t /*start_unscaled*/,
-                                                  uint32_t /*length_unscaled*/,
-                                                  uint32_t /*length_scaled_alignment_log2*/ = 0) {
+                                                   uint32_t /*length_unscaled*/,
+                                                   uint32_t /*length_scaled_alignment_log2*/ = 0) {
     return false;
   }
 
@@ -460,6 +469,10 @@ class TextureCache {
     // Signed version of the texture if the data in the signed version is
     // different on the host.
     Texture* texture_signed;
+    // The fetch constant this binding was built from (gpu_texture_binding_memo):
+    // a rewrite with the same six words keeps the binding as it is.
+    uint32_t fetch_words[6];
+    bool fetch_known;
 
     TextureBinding() { Reset(); }
 
@@ -500,6 +513,16 @@ class TextureCache {
   // DXN is read as RG in 4D5307E6, but as RA in 415607E6.
   // TODO(Triang3l): Find out the correct contents of unused texture components.
   virtual uint32_t GetHostFormatSwizzle(TextureKey key) const = 0;
+
+  // Returns complete 4 KB pages in the requested range that don't currently
+  // have a resolution-scaled representation. The result is coalesced and is
+  // protected against concurrent page-state updates while it is collected.
+  void GetUnscaledResolvePageRanges(
+      uint32_t start_unscaled, uint32_t length_unscaled,
+      std::vector<std::pair<uint32_t, uint32_t>>& ranges_out);
+  scaled_resolve_util::PageLayoutSummary GetScaledResolvePageLayoutSummary(
+      uint32_t start_unscaled, uint32_t length_unscaled,
+      uint32_t expected_bytes_per_block_log2);
 
   virtual uint32_t GetMaxHostTextureWidthHeight(xenos::DataDimension dimension) const = 0;
   virtual uint32_t GetMaxHostTextureDepthOrArraySize(xenos::DataDimension dimension) const = 0;
@@ -560,6 +583,14 @@ class TextureCache {
                           size_t& pending_range_count_out);
   bool CommitPreparedTextureLoad(const PendingTextureLoad& pending_load);
 
+  // Bounded evidence for The Darkness's first visually incorrect texture. The
+  // physical address is dynamic, so identify it by the verified fetch shape.
+  // Remove this after the shared upload / invalidation divergence is resolved.
+  static bool IsPromptBackgroundDiagnosticTexture(const Texture& texture);
+  void RecordPromptBackgroundTextureLifecycle(
+      SharedMemory::TextureLifecycleDiagnosticEventType type, const Texture& texture,
+      bool load_base, bool load_mips, bool hash_source) const;
+
   void UpdateTexturesTotalHostMemoryUsage(uint64_t add, uint64_t subtract);
 
   // Shared memory callback for texture data invalidation.
@@ -569,6 +600,8 @@ class TextureCache {
   // Checks if there are any pages that contain scaled resolve data within the
   // range.
   bool IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled);
+  // The same with global_critical_region_ already held by the caller.
+  bool IsRangeScaledResolvedLocked(uint32_t start_unscaled, uint32_t length_unscaled) const;
   // Global shared memory invalidation callback for invalidating scaled resolved
   // texture data.
   static void ScaledResolveGlobalWatchCallbackThunk(
@@ -586,10 +619,16 @@ class TextureCache {
   static const LoadShaderInfo load_shader_info_[kLoadShaderCount];
 
   rex::thread::global_critical_region global_critical_region_;
+  native_resolve::RegionMap native_resolve_regions_;
   // Bit vector storing whether each 4 KB physical memory page contains scaled
   // resolve data. uint32_t rather than uint64_t because parts of it can be sent
   // to shaders.
   std::unique_ptr<uint32_t[]> scaled_resolve_pages_;
+  // For each scaled page, bytes-per-block-log2 + 1 describing the group layout
+  // used to populate it. Zero means the page has no authoritative scaled
+  // layout. A separate byte is intentional: layout reinterpretation is not
+  // valid for Xenia's resolution-scaled group addressing.
+  std::unique_ptr<uint8_t[]> scaled_resolve_page_layouts_;
   // Second level of the bit vector for faster rejection of non-scaled textures.
   // >> 12 for 4 KB pages, >> 5 for uint32_t level 1 bits, >> 6 for uint64_t
   // level 2 bits.

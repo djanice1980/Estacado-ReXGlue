@@ -111,7 +111,12 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // If anything in this is structure is changed in a way not compatible with
     // the previous layout, invalidate the pipeline storages by increasing this
     // version number (0xYYYYMMDD)!
-    static constexpr uint32_t kVersion = 0x20260226;
+    // Bumped for Xenos out-of-bounds vertex-fetch word clamping. Persistent
+    // shader caches created before this version must not reuse translations
+    // that could read unrelated guest memory beyond a fetch buffer.
+    // Native-region reconstruction adds a keyed pixel variant and appended
+    // system constants. Old persistent translations cannot implement it.
+    static constexpr uint32_t kVersion = 0x20260908;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -176,6 +181,24 @@ class DxbcShaderTranslator : public ShaderTranslator {
       uint32_t dynamic_addressable_register_count : 8;
       // Non-ROV - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 2;
+      // PsParamGen and pixel-shader memexport de-duplication must use guest
+      // coordinates for render targets intentionally kept at native resolution
+      // by draw_resolution_scale_threshold. Texture fetch scaling remains tied
+      // to the texture resource rather than to this draw classification.
+      uint32_t resolution_scale_native : 1;
+      // Opt-in shader-translation diagnostic. For the exact embedded scene
+      // shader selected by the D3D12 pipeline cache, exposes one sampled value
+      // through color target 0 so the existing bounded render-target readback
+      // can identify the first shader-visible divergence. Zero is production
+      // behavior; 1..4 select the title's tf4, tf1, tf0 and tf2 fetches,
+      // while 5 and 6 expose the two operands of the final RGB multiply and 7
+      // packs their absolute maxima plus the product maximum at the guest
+      // color-export boundary.
+      uint32_t texture_sample_diagnostic : 3;
+      // 0: ordinary sampling; 1..32: annotated native-grid filter fetch slot+1.
+      // Part of translation/PSO identity; never reuse an ordinary cached PS.
+      uint32_t native_filter_fetch : 6;
+      uint32_t native_region_sampling : 1;
     } pixel;
 
     explicit Modification(uint64_t modification_value = 0) : value(modification_value) {
@@ -388,6 +411,11 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // The constant blend factor for the respective modes.
     float edram_blend_constant[4];
 
+    // Appended so all existing vertex/geometry constant offsets stay intact.
+    // Guest-texel rectangle per fetch: minXY inclusive, maxXY exclusive.
+    // Zero means unknown/ordinary sampling. Checked per complete footprint.
+    float native_texture_regions[32][4];
+
    private:
     friend class DxbcShaderTranslator;
 
@@ -439,6 +467,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
       kEdramRTBlendFactorsOps,
 
       kEdramBlendConstant,
+
+      kNativeTextureRegions,
 
       kCount,
     };
@@ -936,6 +966,20 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // Guest pixel host width / height.
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
+  // Scale of the draw currently being translated. Only host-render-target
+  // pixel shaders may override the global scale with the native class.
+  uint32_t GetCurrentDrawResolutionScaleX() const {
+    return is_pixel_shader() &&
+                   GetDxbcShaderModification().pixel.resolution_scale_native
+               ? 1
+               : draw_resolution_scale_x_;
+  }
+  uint32_t GetCurrentDrawResolutionScaleY() const {
+    return is_pixel_shader() &&
+                   GetDxbcShaderModification().pixel.resolution_scale_native
+               ? 1
+               : draw_resolution_scale_y_;
+  }
 
   // Is currently writing the empty depth-only pixel shader, for
   // CompleteTranslation.
@@ -954,6 +998,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
     kFloat4Array4,
     // User clip planes.
     kFloat4Array6,
+    kFloat4Array32,
     // Float constants - size written dynamically.
     kFloat4ConstantArray,
     // Bool constants, texture signedness, front/back stencil, render target
@@ -1081,6 +1126,10 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // alpha test, alpha to coverage, exponent bias, gamma, and also for ROV
   // writing).
   uint32_t system_temps_color_[4];
+  // Opt-in exact-shader diagnostic only. The shader may execute its final RGB
+  // multiply in loop iterations that do not export color. Preserve the two
+  // operands here and consume them only at the guest color-export boundary.
+  uint32_t system_temps_embedded_scene_final_multiply_operands_[2];
 
   // Memory export temporary registers are allocated if the shader writes any
   // eM# (current_shader().memexport_eM_written() != 0).

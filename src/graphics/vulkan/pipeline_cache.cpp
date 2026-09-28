@@ -33,9 +33,11 @@
 #include <rex/memory.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/pipeline_storage_policy.h>
 #include <rex/graphics/pipeline_util.h>
 #include <rex/graphics/pipeline/shader/spirv_builder.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
+#include <rex/graphics/pipeline/shader/replacement_pack.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
@@ -889,6 +891,12 @@ VulkanShader* VulkanPipelineCache::LoadShader(xenos::ShaderType shader_type,
 VulkanShader* VulkanPipelineCache::LoadShader(xenos::ShaderType shader_type,
                                               const uint32_t* host_address, uint32_t dword_count,
                                               uint64_t data_hash) {
+  if (const ShaderReplacement* replacement =
+          FindConfiguredShaderReplacement(shader_type, data_hash, host_address, dword_count)) {
+    host_address = replacement->ucode.data();
+    dword_count = uint32_t(replacement->ucode.size());
+    data_hash = replacement->replacement_hash;
+  }
   auto it = shaders_.find(data_hash);
   if (it != shaders_.end()) {
     // Shader has been previously loaded.
@@ -3650,9 +3658,6 @@ void VulkanPipelineCache::StorageWriteThread() {
     bool write_pipeline = false;
     {
       std::unique_lock<std::mutex> lock(storage_write_request_lock_);
-      if (storage_write_thread_shutdown_) {
-        return;
-      }
       if (!storage_write_shader_queue_.empty()) {
         shader = storage_write_shader_queue_.front();
         storage_write_shader_queue_.pop_front();
@@ -3669,7 +3674,15 @@ void VulkanPipelineCache::StorageWriteThread() {
         storage_write_flush_pipelines_ = false;
         flush_pipelines = true;
       }
-      if (!shader && !write_pipeline) {
+      const bool writer_has_selected_work =
+          rex::graphics::pipeline_storage_policy::HasSelectedWork(
+              shader != nullptr, write_pipeline, flush_shaders,
+              flush_pipelines);
+      if (rex::graphics::pipeline_storage_policy::MayExitAfterDrain(
+              storage_write_thread_shutdown_, writer_has_selected_work)) {
+        return;
+      }
+      if (!writer_has_selected_work) {
         storage_write_request_cond_.wait(lock);
         continue;
       }
