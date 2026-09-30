@@ -57,14 +57,28 @@ ImGuiDrawer::FontSetupCallback HostSettingsFontSetup(ImFont** font);
 // Owned by raw pointer: the owner deletes it outside of drawing, or the
 // dialog closes itself (Resume) and reports that through `close` just before
 // deleting itself (ImGuiDialog::Close semantics).
+// A controller's state for the overlay, in XInput layout (wButtons bits,
+// left stick).
+struct OverlayGamepadState {
+  uint16_t buttons = 0;
+  int16_t thumb_lx = 0;
+  int16_t thumb_ly = 0;
+};
+
 class HostSettingsOverlayDialog : public ImGuiDialog {
  public:
   using LiveCallback = std::function<void(const settings::Setting&, const std::string&)>;
   using CloseCallback = std::function<void()>;
+  using QuitCallback = std::function<void()>;
+  using GamepadCallback = std::function<OverlayGamepadState()>;
 
+  // `quit` (optional) shows a "Quit game" button next to Resume. `gamepad`
+  // (optional) is read every frame: the d-pad and left stick move, A
+  // activates, B closes a list or, at the top level, the overlay.
   HostSettingsOverlayDialog(ImGuiDrawer* imgui_drawer, HostSettingsState& state, ImFont* font,
                             std::string toggle_key_name, LiveCallback live,
-                            CloseCallback close);
+                            CloseCallback close, QuitCallback quit = nullptr,
+                            GamepadCallback gamepad = nullptr);
   ~HostSettingsOverlayDialog() override;
 
   // A key editor waits for a key: Escape is then a binding, not "close".
@@ -76,12 +90,19 @@ class HostSettingsOverlayDialog : public ImGuiDialog {
 
  private:
   void Sync();
+  // Feeds the controller into Dear ImGui; returns true on a fresh B press.
+  bool FeedGamepad(ImGuiIO& io);
 
   HostSettingsState& state_;
   ImFont* font_ = nullptr;
   std::string toggle_key_name_;
   LiveCallback live_;
   CloseCallback close_;
+  QuitCallback quit_;
+  GamepadCallback gamepad_;
+  uint16_t gamepad_previous_ = 0;
+  uint16_t gamepad_suppressed_ = 0;
+  bool gamepad_primed_ = false;
   settings::PanelModel model_;
   settings::Schema schema_;
   std::string status_;

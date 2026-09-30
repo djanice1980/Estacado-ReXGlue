@@ -14,6 +14,7 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 
 namespace rex::ui {
@@ -59,13 +60,17 @@ ImGuiDrawer::FontSetupCallback HostSettingsFontSetup(ImFont** font) {
 HostSettingsOverlayDialog::HostSettingsOverlayDialog(ImGuiDrawer* imgui_drawer,
                                                      HostSettingsState& state, ImFont* font,
                                                      std::string toggle_key_name,
-                                                     LiveCallback live, CloseCallback close)
+                                                     LiveCallback live, CloseCallback close,
+                                                     QuitCallback quit,
+                                                     GamepadCallback gamepad)
     : ImGuiDialog(imgui_drawer),
       state_(state),
       font_(font),
       toggle_key_name_(std::move(toggle_key_name)),
       live_(std::move(live)),
-      close_(std::move(close)) {}
+      close_(std::move(close)),
+      quit_(std::move(quit)),
+      gamepad_(std::move(gamepad)) {}
 
 HostSettingsOverlayDialog::~HostSettingsOverlayDialog() = default;
 
@@ -119,8 +124,53 @@ void HostSettingsOverlayDialog::Sync() {
   }
 }
 
+bool HostSettingsOverlayDialog::FeedGamepad(ImGuiIO& io) {
+  // XInput wButtons bits.
+  constexpr uint16_t kDpadUp = 0x0001, kDpadDown = 0x0002, kDpadLeft = 0x0004,
+                     kDpadRight = 0x0008, kShoulderL = 0x0100, kShoulderR = 0x0200,
+                     kA = 0x1000, kB = 0x2000, kX = 0x4000, kY = 0x8000;
+  // Start and Back are left out: they are the open/close chord.
+  static constexpr struct {
+    uint16_t bit;
+    ImGuiKey key;
+  } kButtons[] = {
+      {kDpadUp, ImGuiKey_GamepadDpadUp},       {kDpadDown, ImGuiKey_GamepadDpadDown},
+      {kDpadLeft, ImGuiKey_GamepadDpadLeft},   {kDpadRight, ImGuiKey_GamepadDpadRight},
+      {kShoulderL, ImGuiKey_GamepadL1},        {kShoulderR, ImGuiKey_GamepadR1},
+      {kA, ImGuiKey_GamepadFaceDown},          {kB, ImGuiKey_GamepadFaceRight},
+      {kX, ImGuiKey_GamepadFaceLeft},          {kY, ImGuiKey_GamepadFaceUp},
+  };
+  const OverlayGamepadState pad = gamepad_();
+  io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+  io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+  // Buttons already held when the overlay opened (the chord, or A from the
+  // game) count only after they are released and pressed again.
+  if (!gamepad_primed_) {
+    gamepad_suppressed_ = pad.buttons;
+    gamepad_primed_ = true;
+  }
+  gamepad_suppressed_ &= pad.buttons;
+  const uint16_t buttons = pad.buttons & ~gamepad_suppressed_;
+  for (const auto& button : kButtons) io.AddKeyEvent(button.key, (buttons & button.bit) != 0);
+  // Left stick, with the XInput dead zone.
+  constexpr float kDeadZone = 7849.0f;
+  auto axis = [&](ImGuiKey negative, ImGuiKey positive, int16_t raw) {
+    const float value = float(raw);
+    const float magnitude = (std::abs(value) - kDeadZone) / (32767.0f - kDeadZone);
+    const float amount = std::clamp(magnitude, 0.0f, 1.0f);
+    io.AddKeyAnalogEvent(negative, value < -kDeadZone, value < 0.0f ? amount : 0.0f);
+    io.AddKeyAnalogEvent(positive, value > kDeadZone, value > 0.0f ? amount : 0.0f);
+  };
+  axis(ImGuiKey_GamepadLStickLeft, ImGuiKey_GamepadLStickRight, pad.thumb_lx);
+  axis(ImGuiKey_GamepadLStickDown, ImGuiKey_GamepadLStickUp, pad.thumb_ly);
+  const bool b_pressed = (buttons & kB) && !(gamepad_previous_ & kB);
+  gamepad_previous_ = buttons;
+  return b_pressed;
+}
+
 void HostSettingsOverlayDialog::OnDraw(ImGuiIO& io) {
   Sync();
+  const bool gamepad_back = gamepad_ && FeedGamepad(io);
   if (!styled_) {
     const float font_size = ImGui::GetStyle().FontSizeBase;
     settings::ApplyStyle(1.0f);
@@ -205,9 +255,23 @@ void HostSettingsOverlayDialog::OnDraw(ImGuiIO& io) {
     if (ImGui::Button(resume.c_str(), ImVec2(button, 0.0f))) Close();
     ImGui::PopStyleColor(2);
   };
+  const std::string quit = shown(tr("Quit game")) + "##quit";
+  const float buttons = quit_ ? button * 2.0f + ImGui::GetStyle().ItemSpacing.x : button;
+  auto quit_button = [&]() {
+    if (!quit_) return;
+    // The owner queues a window close request; the dialog closes with it.
+    if (ImGui::Button(quit.c_str(), ImVec2(button, 0.0f))) {
+      quit_();
+      Close();
+    }
+  };
   if (rtl) {
     // Mirrored: Resume on the left, the note right-aligned.
     resume_button();
+    if (quit_) {
+      ImGui::SameLine();
+      quit_button();
+    }
     ImGui::SameLine();
     const std::string note = shown(footer_text);
     const float available = ImGui::GetContentRegionAvail().x;
@@ -216,11 +280,20 @@ void HostSettingsOverlayDialog::OnDraw(ImGuiIO& io) {
     ImGui::TextDisabled("%s", note.c_str());
   } else {
     ImGui::TextDisabled("%s", footer_text.c_str());
-    ImGui::SameLine(ImGui::GetContentRegionMax().x - button);
+    ImGui::SameLine(ImGui::GetContentRegionMax().x - buttons);
+    if (quit_) {
+      quit_button();
+      ImGui::SameLine();
+    }
     resume_button();
   }
+  // B at the top level (no open list, no slider or text being edited, no key
+  // being captured) returns to the game; inside, Dear ImGui cancels.
+  const bool top_level = !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) &&
+                         !ImGui::IsAnyItemActive() && !CapturingKey();
   ImGui::End();
   if (font_) ImGui::PopFont();
+  if (gamepad_back && top_level) Close();
 }
 
 void HostSettingsOverlayDialog::OnClose() {

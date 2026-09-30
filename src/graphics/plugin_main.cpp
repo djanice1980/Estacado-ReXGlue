@@ -273,6 +273,14 @@ class EmbeddedSettingsOverlayListener final : public rex::ui::WindowInputListene
 
   void OnKeyDown(rex::ui::KeyEvent& event) override;
   void Reset();
+  // The controller chord (UI thread).
+  void Toggle() {
+    if (dialog_) {
+      Close();
+    } else {
+      Open();
+    }
+  }
 
  private:
   bool EnsureDrawer();
@@ -400,6 +408,10 @@ struct EmbeddedGpu {
   // In-game settings overlay (host schema, rex_gpu_embedded_settings_*).
   rex::ui::HostSettingsState settings_state;
   std::atomic<bool> settings_overlay_open{false};
+  // The controller as the overlay sees it (EmbeddedGamepadOverlayPoller):
+  // XInput buttons, and the left stick packed as (x << 16) | y.
+  std::atomic<uint32_t> overlay_pad_buttons{0};
+  std::atomic<uint32_t> overlay_pad_stick{0};
   // V380: the player closed the window (close button, Alt+F4). The runtime
   // polls this and stops the title cleanly; a watchdog hard-exits if that
   // never completes, so a closed game never keeps running without a window.
@@ -561,6 +573,22 @@ void EmbeddedSettingsOverlayListener::Open() {
         embedded_.settings_overlay_open.store(false, std::memory_order_release);
         std::fprintf(stderr, "REX_SETTINGS_OVERLAY open=0 via=resume\n");
         std::fflush(stderr);
+      },
+      [this]() {
+        // Quit game: the same close request as Alt+F4, so the runtime's close
+        // listener stops the title (RequestClose would destroy the window
+        // without asking it).
+        std::fprintf(stderr, "REX_SETTINGS_OVERLAY quit=1\n");
+        std::fflush(stderr);
+        static_cast<rex::ui::WindowSDL*>(window_)->PostCloseRequest();
+      },
+      [this]() {
+        const uint32_t stick = embedded_.overlay_pad_stick.load(std::memory_order_acquire);
+        rex::ui::OverlayGamepadState pad;
+        pad.buttons = uint16_t(embedded_.overlay_pad_buttons.load(std::memory_order_acquire));
+        pad.thumb_lx = int16_t(uint16_t(stick >> 16));
+        pad.thumb_ly = int16_t(uint16_t(stick & 0xFFFF));
+        return pad;
       });
   embedded_.settings_overlay_open.store(true, std::memory_order_release);
   std::fprintf(stderr, "REX_SETTINGS_OVERLAY open=1\n");
@@ -809,6 +837,90 @@ std::unique_ptr<rex::graphics::GraphicsSystem> CreateEmbeddedGraphicsSystem(
   return nullptr;
 }
 
+// Opens and closes the settings overlay from a controller: Back + Start
+// together (Create + Options on a DualSense through Steam Input, View + Menu
+// on an Xbox pad). Polls XInput itself, so it works whatever the title does
+// with the pad (the runtime hides the chord from the title), and publishes the
+// pad for the overlay's navigation. All connected controllers count.
+class EmbeddedGamepadOverlayPoller {
+ public:
+  EmbeddedGamepadOverlayPoller(EmbeddedGpu& embedded, rex::ui::WindowedAppContext& app_context,
+                               EmbeddedSettingsOverlayListener& listener)
+      : embedded_(embedded), app_context_(app_context), listener_(listener) {
+#if defined(_WIN32)
+    if (const HMODULE xinput = LoadLibraryW(L"xinput1_4.dll")) {
+      get_state_ = reinterpret_cast<GetStateFn>(GetProcAddress(xinput, "XInputGetState"));
+    }
+#endif
+    if (get_state_) thread_ = std::thread([this] { Run(); });
+  }
+  ~EmbeddedGamepadOverlayPoller() { Stop(); }
+
+  // Before the UI thread's listeners go away: nothing is posted afterwards,
+  // and a toggle already posted does nothing.
+  void Stop() {
+    accepting_->store(false, std::memory_order_release);
+    stop_.store(true, std::memory_order_release);
+    if (thread_.joinable()) thread_.join();
+  }
+
+ private:
+  struct PadState {
+    uint32_t packet;
+    uint16_t buttons;
+    uint8_t left_trigger, right_trigger;
+    int16_t lx, ly, rx, ry;
+  };
+  using GetStateFn = unsigned long(__stdcall*)(unsigned long, PadState*);
+  static constexpr uint16_t kBack = 0x0020, kStart = 0x0010;
+
+  void Run() {
+    uint16_t previous = 0;
+    unsigned idle_polls[4] = {};
+    while (!stop_.load(std::memory_order_acquire)) {
+      uint16_t buttons = 0;
+      int16_t lx = 0, ly = 0;
+      for (unsigned slot = 0; slot < 4; ++slot) {
+        // An empty slot is re-probed about once a second (XInput is slow to
+        // report missing controllers).
+        if (idle_polls[slot] && ++idle_polls[slot] < 120) continue;
+        PadState state{};
+        if (get_state_(slot, &state) != 0) {
+          idle_polls[slot] = 1;
+          continue;
+        }
+        idle_polls[slot] = 0;
+        buttons |= state.buttons;
+        if (std::abs(int(state.lx)) > std::abs(int(lx))) lx = state.lx;
+        if (std::abs(int(state.ly)) > std::abs(int(ly))) ly = state.ly;
+      }
+      embedded_.overlay_pad_buttons.store(buttons, std::memory_order_release);
+      embedded_.overlay_pad_stick.store((uint32_t(uint16_t(lx)) << 16) | uint16_t(ly),
+                                        std::memory_order_release);
+      const bool chord = (buttons & (kBack | kStart)) == (kBack | kStart);
+      const bool was_chord = (previous & (kBack | kStart)) == (kBack | kStart);
+      if (chord && !was_chord) {
+        std::fprintf(stderr, "REX_SETTINGS_OVERLAY toggle=gamepad\n");
+        std::fflush(stderr);
+        app_context_.CallInUIThreadDeferred(
+            [accepting = accepting_, listener = &listener_]() {
+              if (accepting->load(std::memory_order_acquire)) listener->Toggle();
+            });
+      }
+      previous = buttons;
+      std::this_thread::sleep_for(std::chrono::milliseconds(8));
+    }
+  }
+
+  EmbeddedGpu& embedded_;
+  rex::ui::WindowedAppContext& app_context_;
+  EmbeddedSettingsOverlayListener& listener_;
+  GetStateFn get_state_ = nullptr;
+  std::shared_ptr<std::atomic<bool>> accepting_ = std::make_shared<std::atomic<bool>>(true);
+  std::atomic<bool> stop_{false};
+  std::thread thread_;
+};
+
 // Veto the window close and let the runtime stop the title (it destroys the
 // window during its shutdown). Before V380 the window closed and the title
 // kept running without one, holding the single-instance lock.
@@ -841,6 +953,7 @@ bool StartEmbeddedPresentation(EmbeddedGpu& embedded, const char* backend) {
     std::unique_ptr<EmbeddedDebugOverlayListener> debug_overlay_listener;
     std::unique_ptr<EmbeddedDevFrameModeListener> dev_frame_mode_listener;
     std::unique_ptr<EmbeddedSettingsOverlayListener> settings_overlay_listener;
+    std::unique_ptr<EmbeddedGamepadOverlayPoller> gamepad_overlay_poller;
     std::unique_ptr<EmbeddedOverlayInputBlocker> overlay_input_blocker;
     EmbeddedCloseRequestListener close_request_listener(embedded);
     rex::X_STATUS status = static_cast<rex::X_STATUS>(0xC0000001L);
@@ -890,6 +1003,8 @@ bool StartEmbeddedPresentation(EmbeddedGpu& embedded, const char* backend) {
           embedded, window.get(), embedded.graphics.get());
       window->AddInputListener(settings_overlay_listener.get(),
                                std::numeric_limits<size_t>::max() - 3);
+      gamepad_overlay_poller = std::make_unique<EmbeddedGamepadOverlayPoller>(
+          embedded, app_context, *settings_overlay_listener);
       overlay_input_blocker = std::make_unique<EmbeddedOverlayInputBlocker>(embedded);
       window->AddInputListener(overlay_input_blocker.get(), 32);
       window->AddListener(&close_request_listener);
@@ -932,6 +1047,10 @@ bool StartEmbeddedPresentation(EmbeddedGpu& embedded, const char* backend) {
       std::fflush(stderr);
     }
 
+    if (gamepad_overlay_poller) {
+      gamepad_overlay_poller->Stop();
+      gamepad_overlay_poller.reset();
+    }
     embedded.native_window.store(nullptr, std::memory_order_release);
     if (window) {
       if (dev_frame_mode_listener) {

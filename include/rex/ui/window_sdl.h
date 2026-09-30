@@ -35,6 +35,10 @@ class WindowSDL final : public Window {
   // SDL window coordinates -> physical pixels (as HandleMouseEvent applies).
   float PixelDensity() const;
   bool SetRelativeMouseMode(bool enabled) override;
+  // Queues the same close request as the OS close button (Alt+F4), so the
+  // window listeners can veto it. Unlike RequestClose, nothing is destroyed
+  // here; safe from a draw callback and from any thread.
+  void PostCloseRequest();
 
   // Called by SDLWindowedAppContext on the UI thread.
   void HandleWindowEvent(SDL_Event& event);
