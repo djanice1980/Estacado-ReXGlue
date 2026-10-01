@@ -801,10 +801,18 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
   //           for simplicity).
   // 3D: X - width, Y - height, Z - depth, W - 0 if stacked 2D, 1 if 3D.
   uint32_t size_needed_components = 0b0000;
+  // A filter variant (any native-grid image filter rule matched) reconstructs
+  // every 2D fetch; the per-fetch region constant enables it at runtime only
+  // for the fetches of the matched rules.
+  const bool native_filter_variant = is_pixel_shader() &&
+      GetDxbcShaderModification().pixel.native_filter_fetch != 0;
   const bool native_filter_sampling =
-      is_pixel_shader() && instr.opcode == FetchOpcode::kTextureFetch &&
-      GetDxbcShaderModification().pixel.native_filter_fetch == tfetch_index + 1 &&
+      native_filter_variant && is_pixel_shader() && instr.opcode == FetchOpcode::kTextureFetch &&
       instr.dimension == xenos::FetchOpDimension::k2D &&
+      (instr.attributes.min_filter == xenos::TextureFilter::kUseFetchConst ||
+       instr.attributes.min_filter == xenos::TextureFilter::kLinear) &&
+      (instr.attributes.mag_filter == xenos::TextureFilter::kUseFetchConst ||
+       instr.attributes.mag_filter == xenos::TextureFilter::kLinear) &&
       render_target::native_shader_scale_policy::FilterInstructionSupported(
           !instr.attributes.unnormalized_coordinates, instr.attributes.offset_x,
           instr.attributes.offset_y, instr.attributes.use_register_lod,
@@ -1848,11 +1856,12 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
                            .Select(texture_bindless_descriptor_index & 3));
             }
             if (native_filter_sampling || native_region_sampling) {
-              // Native-lattice image filters may read an earlier 2x scene
-              // resolve. Bilinear filtering directly on the 2x grid shrinks
+              // Native-lattice image filters may read an earlier scaled scene
+              // resolve. Bilinear filtering directly on the scaled grid shrinks
               // the paired-tap footprint and leaves gaps in the convolution.
-              // Four host bilinear reads at native texel centers implement
-              // an exact 2x2 box reduction followed by native bilinear weights.
+              // Host bilinear reads (scale_x * scale_y of them) implement an
+              // exact box reduction of each native cell followed by native
+              // bilinear weights.
               // No source resource or guest bytes are modified. Native inputs
               // take the original path and the shader variant is cache-keyed.
               const uint32_t native_temp = PushSystemTemp(0, 8);
@@ -1865,6 +1874,56 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
                   LoadSystemConstant(SystemConstants::Index::kTexturesResolutionScaled,
                       offsetof(SystemConstants, textures_resolution_scaled), dxbc::Src::kXXXX),
                   dxbc::Src::LU(uint32_t(1) << tfetch_index));
+              // The image bounds of a native filter fetch, in samples+2 (free
+              // until the reconstruction accumulates): the fetch's region
+              // constant, whose x also selects the mode (rule :source=native):
+              // -1 samples normally (no tracked native content), -2 picks the
+              // candidate rectangle containing this sample's native position
+              // (several native images may share one texture), none: normal.
+              const uint32_t region_temp = samples + 2;
+              if (native_filter_sampling) {
+                a_.OpMov(dxbc::Dest::R(region_temp),
+                    LoadSystemConstant(SystemConstants::Index::kNativeTextureRegions,
+                        offsetof(SystemConstants, native_texture_regions) +
+                            sizeof(float) * 4 * tfetch_index, dxbc::Src::kXYZW));
+                a_.OpNE(dxbc::Dest::R(fraction, 0b0001), dxbc::Src::R(region_temp, dxbc::Src::kXXXX),
+                    dxbc::Src::LF(-1.0f));
+                a_.OpAnd(dxbc::Dest::R(base, 0b1000), dxbc::Src::R(base, dxbc::Src::kWWWW),
+                    dxbc::Src::R(fraction, dxbc::Src::kXXXX));
+                a_.OpEq(dxbc::Dest::R(fraction, 0b0001), dxbc::Src::R(region_temp, dxbc::Src::kXXXX),
+                    dxbc::Src::LF(-2.0f));
+                a_.OpIf(true, dxbc::Src::R(fraction, dxbc::Src::kXXXX));
+                {
+                  a_.OpMov(dxbc::Dest::R(region_temp), dxbc::Src::LF(0.0f));
+                  a_.OpMul(dxbc::Dest::R(sample_coord, 0b0011), dxbc::Src::R(coord_and_sampler_temp),
+                      dxbc::Src::R(size_and_is_3d_temp));
+                  // Oldest first, so the newest containing rectangle wins.
+                  for (uint32_t candidate = 4; candidate--;) {
+                    const dxbc::Src candidate_src = LoadSystemConstant(
+                        SystemConstants::Index::kNativeFilterCandidateRegions,
+                        offsetof(SystemConstants, native_filter_candidate_regions) +
+                            sizeof(float) * 4 * candidate, dxbc::Src::kXYZW);
+                    a_.OpMov(dxbc::Dest::R(samples), candidate_src);
+                    a_.OpGE(dxbc::Dest::R(samples + 1, 0b0011), dxbc::Src::R(sample_coord),
+                        dxbc::Src::R(samples));
+                    a_.OpLT(dxbc::Dest::R(samples + 1, 0b1100),
+                        dxbc::Src::R(sample_coord, 0b01000100 /* XYXY */), dxbc::Src::R(samples));
+                    a_.OpAnd(dxbc::Dest::R(samples + 1, 0b0011), dxbc::Src::R(samples + 1),
+                        dxbc::Src::R(samples + 1, 0b11101110 /* ZWZW */));
+                    a_.OpAnd(dxbc::Dest::R(samples + 1, 0b0001),
+                        dxbc::Src::R(samples + 1, dxbc::Src::kXXXX),
+                        dxbc::Src::R(samples + 1, dxbc::Src::kYYYY));
+                    a_.OpMovC(dxbc::Dest::R(region_temp), dxbc::Src::R(samples + 1, dxbc::Src::kXXXX),
+                        dxbc::Src::R(samples), dxbc::Src::R(region_temp));
+                  }
+                  // No containing rectangle (zero width): sample normally.
+                  a_.OpLT(dxbc::Dest::R(fraction, 0b0001), dxbc::Src::R(region_temp, dxbc::Src::kXXXX),
+                      dxbc::Src::R(region_temp, dxbc::Src::kZZZZ));
+                  a_.OpAnd(dxbc::Dest::R(base, 0b1000), dxbc::Src::R(base, dxbc::Src::kWWWW),
+                      dxbc::Src::R(fraction, dxbc::Src::kXXXX));
+                }
+                a_.OpEndIf();
+              }
               if (native_region_sampling) {
                 // A shared SRV may contain both native results and genuinely
                 // scaled neighbors. Only reconstruct a complete native footprint.
@@ -1912,34 +1971,131 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
               a_.OpMov(dxbc::Dest::R(sample_coord), dxbc::Src::R(coord_and_sampler_temp));
               a_.OpAdd(dxbc::Dest::R(upper_center, 0b0011),
                   dxbc::Src::R(size_and_is_3d_temp), dxbc::Src::LF(-0.5f));
-              for (uint32_t corner = 0; corner < 4; ++corner) {
-                a_.OpAdd(dxbc::Dest::R(sample_coord, 0b0011), dxbc::Src::R(base),
-                    dxbc::Src::LF(float(corner & 1), float(corner >> 1), 0.0f, 0.0f));
-                // Clamp the logical cell, not a single host edge subpixel.
-                a_.OpMax(dxbc::Dest::R(sample_coord, 0b0011),
-                    dxbc::Src::R(sample_coord), dxbc::Src::LF(0.5f));
-                a_.OpMin(dxbc::Dest::R(sample_coord, 0b0011),
-                    dxbc::Src::R(sample_coord), dxbc::Src::R(upper_center));
-                a_.OpDiv(dxbc::Dest::R(sample_coord, 0b0011),
-                    dxbc::Src::R(sample_coord), dxbc::Src::R(size_and_is_3d_temp));
-                a_.OpSampleL(dxbc::Dest::R(samples + corner, used_result_nonzero_components),
-                    dxbc::Src::R(sample_coord), 3, srv_unsigned, sampler, dxbc::Src::LF(0.0f));
+              // Lower bound of the reconstructed texel centers, in samples+3.xy
+              // (free until the last corner is sampled, after its clamp).
+              const uint32_t lower_center = samples + 3;
+              a_.OpMov(dxbc::Dest::R(lower_center, 0b0011), dxbc::Src::LF(0.5f));
+              if (native_filter_sampling) {
+                // An explicit rule :region= (native cells, zero width: none)
+                // names the part of the texture holding the image: the
+                // reconstruction never blends cells outside it (a scaled
+                // output's edge rows would otherwise reach past the image).
+                // fraction.zw: region lower-center bounds, then the condition.
+                a_.OpAdd(dxbc::Dest::R(fraction, 0b1100),
+                    dxbc::Src::R(region_temp, 0b01000000 /* XXXY */),
+                    dxbc::Src::LF(0.0f, 0.0f, 0.5f, 0.5f));
+                a_.OpMax(dxbc::Dest::R(fraction, 0b1100), dxbc::Src::R(fraction),
+                    dxbc::Src::LF(0.5f));
+                a_.OpLT(dxbc::Dest::R(samples, 0b0001), dxbc::Src::LF(0.0f),
+                    dxbc::Src::R(region_temp, dxbc::Src::kZZZZ));
+                a_.OpMovC(dxbc::Dest::R(lower_center, 0b0011), dxbc::Src::R(samples, dxbc::Src::kXXXX),
+                    dxbc::Src::R(fraction, 0b11101110 /* ZWZW */), dxbc::Src::R(lower_center));
+                // Upper: min(texture edge, region right/bottom - 0.5).
+                a_.OpAdd(dxbc::Dest::R(fraction, 0b1100),
+                    dxbc::Src::R(region_temp, 0b11100000 /* XXZW */),
+                    dxbc::Src::LF(0.0f, 0.0f, -0.5f, -0.5f));
+                a_.OpMin(dxbc::Dest::R(fraction, 0b1100), dxbc::Src::R(fraction),
+                    dxbc::Src::R(upper_center, 0b01000000 /* XXXY */));
+                a_.OpMovC(dxbc::Dest::R(upper_center, 0b0011), dxbc::Src::R(samples, dxbc::Src::kXXXX),
+                    dxbc::Src::R(fraction, 0b11101110 /* ZWZW */), dxbc::Src::R(upper_center));
               }
-              // Lerp both rows, then between rows; keep the original swizzle,
-              // sign interpretation and exponent adjustment below this block.
-              for (uint32_t row = 0; row < 2; ++row) {
-                const uint32_t left = samples + row * 2;
-                a_.OpAdd(dxbc::Dest::R(left + 1, used_result_nonzero_components),
-                    dxbc::Src::R(left + 1), -dxbc::Src::R(left));
-                a_.OpMAd(dxbc::Dest::R(left, used_result_nonzero_components),
-                    dxbc::Src::R(left + 1), dxbc::Src::R(fraction, dxbc::Src::kXXXX),
-                    dxbc::Src::R(left));
+              // The two native cells of each axis: c0 in base.xy, c1 in
+              // fraction.zw, each clamped to its logical cell range (not a
+              // single host edge subpixel).
+              a_.OpAdd(dxbc::Dest::R(fraction, 0b1100),
+                  dxbc::Src::R(base, 0b01000000 /* XXXY */), dxbc::Src::LF(1.0f));
+              a_.OpMax(dxbc::Dest::R(fraction, 0b1100), dxbc::Src::R(fraction),
+                  dxbc::Src::R(lower_center, 0b01000000 /* XXXY */));
+              a_.OpMin(dxbc::Dest::R(fraction, 0b1100), dxbc::Src::R(fraction),
+                  dxbc::Src::R(upper_center, 0b01000000 /* XXXY */));
+              a_.OpMax(dxbc::Dest::R(base, 0b0011), dxbc::Src::R(base),
+                  dxbc::Src::R(lower_center));
+              a_.OpMin(dxbc::Dest::R(base, 0b0011), dxbc::Src::R(base),
+                  dxbc::Src::R(upper_center));
+              // When both cells clamp to one, the result no longer depends on
+              // the fraction: zero it so only c0's host texels are weighted.
+              a_.OpNE(dxbc::Dest::R(fraction, 0b1100), dxbc::Src::R(fraction),
+                  dxbc::Src::R(base, 0b01000000 /* XXXY */));
+              a_.OpAnd(dxbc::Dest::R(fraction, 0b0011), dxbc::Src::R(fraction),
+                  dxbc::Src::R(fraction, 0b11101110 /* ZWZW */));
+              // With an S-times scale, cells c0 and c0 + 1 are 2S contiguous
+              // host texels weighted (1 - f) / S and f / S. Each host bilinear
+              // read covers a pair of them: S reads per axis reproduce the
+              // native bilinear of box-reduced cells exactly (at 2x, the two
+              // reads are the native cell centers). A pair straddling the
+              // cells (odd S) always weighs 1/S, its position moves with f.
+              const uint32_t scale_x = draw_resolution_scale_x_;
+              const uint32_t scale_y = draw_resolution_scale_y_;
+              // Read positions are kept on the edge host texels of the clamp
+              // range: a zero-weight pair past an edge never reads outside.
+              const uint32_t bounds = samples + 1;
+              a_.OpAdd(dxbc::Dest::R(bounds, 0b0011), dxbc::Src::R(lower_center),
+                  dxbc::Src::LF(0.5f / float(scale_x) - 0.5f, 0.5f / float(scale_y) - 0.5f,
+                                0.0f, 0.0f));
+              a_.OpAdd(dxbc::Dest::R(bounds, 0b1100),
+                  dxbc::Src::R(upper_center, 0b01000000 /* XXXY */),
+                  dxbc::Src::LF(0.0f, 0.0f, 0.5f - 0.5f / float(scale_x),
+                                0.5f - 0.5f / float(scale_y)));
+              // Window origin: the lower edge of c0, in native texels.
+              a_.OpAdd(dxbc::Dest::R(base, 0b0011), dxbc::Src::R(base), dxbc::Src::LF(-0.5f));
+              const uint32_t accumulator = region_temp;  // Bounds no longer needed.
+              const uint32_t sample_value = lower_center;  // Free after bounds.
+              const uint32_t weight = upper_center;
+              struct PairRead {
+                float offset, offset_per_f, weight, weight_per_f;
+              };
+              auto pair_read = [](uint32_t scale, uint32_t pair) {
+                const float inverse = 1.0f / float(scale);
+                if (2 * pair + 1 < scale) {
+                  return PairRead{float(2 * pair + 1) * inverse, 0.0f, 2.0f * inverse,
+                                  -2.0f * inverse};
+                }
+                if (2 * pair + 1 == scale) {
+                  return PairRead{(float(scale) - 0.5f) * inverse, inverse, inverse, 0.0f};
+                }
+                return PairRead{float(2 * pair + 1) * inverse, 0.0f, 0.0f, 2.0f * inverse};
+              };
+              for (uint32_t pair_y = 0; pair_y < scale_y; ++pair_y) {
+                const PairRead read_y = pair_read(scale_y, pair_y);
+                for (uint32_t pair_x = 0; pair_x < scale_x; ++pair_x) {
+                  const PairRead read_x = pair_read(scale_x, pair_x);
+                  if (read_x.offset_per_f != 0.0f || read_y.offset_per_f != 0.0f) {
+                    a_.OpMAd(dxbc::Dest::R(sample_coord, 0b0011), dxbc::Src::R(fraction),
+                        dxbc::Src::LF(read_x.offset_per_f, read_y.offset_per_f, 0.0f, 0.0f),
+                        dxbc::Src::R(base));
+                    a_.OpAdd(dxbc::Dest::R(sample_coord, 0b0011), dxbc::Src::R(sample_coord),
+                        dxbc::Src::LF(read_x.offset, read_y.offset, 0.0f, 0.0f));
+                  } else {
+                    a_.OpAdd(dxbc::Dest::R(sample_coord, 0b0011), dxbc::Src::R(base),
+                        dxbc::Src::LF(read_x.offset, read_y.offset, 0.0f, 0.0f));
+                  }
+                  a_.OpMax(dxbc::Dest::R(sample_coord, 0b0011), dxbc::Src::R(sample_coord),
+                      dxbc::Src::R(bounds));
+                  a_.OpMin(dxbc::Dest::R(sample_coord, 0b0011), dxbc::Src::R(sample_coord),
+                      dxbc::Src::R(bounds, 0b11101110 /* ZWZW */));
+                  a_.OpDiv(dxbc::Dest::R(sample_coord, 0b0011),
+                      dxbc::Src::R(sample_coord), dxbc::Src::R(size_and_is_3d_temp));
+                  a_.OpSampleL(dxbc::Dest::R(sample_value, used_result_nonzero_components),
+                      dxbc::Src::R(sample_coord), 3, srv_unsigned, sampler, dxbc::Src::LF(0.0f));
+                  a_.OpMAd(dxbc::Dest::R(weight, 0b0011), dxbc::Src::R(fraction),
+                      dxbc::Src::LF(read_x.weight_per_f, read_y.weight_per_f, 0.0f, 0.0f),
+                      dxbc::Src::LF(read_x.weight, read_y.weight, 0.0f, 0.0f));
+                  a_.OpMul(dxbc::Dest::R(weight, 0b0001), dxbc::Src::R(weight, dxbc::Src::kXXXX),
+                      dxbc::Src::R(weight, dxbc::Src::kYYYY));
+                  if (!pair_x && !pair_y) {
+                    a_.OpMul(dxbc::Dest::R(accumulator, used_result_nonzero_components),
+                        dxbc::Src::R(sample_value), dxbc::Src::R(weight, dxbc::Src::kXXXX));
+                  } else {
+                    a_.OpMAd(dxbc::Dest::R(accumulator, used_result_nonzero_components),
+                        dxbc::Src::R(sample_value), dxbc::Src::R(weight, dxbc::Src::kXXXX),
+                        dxbc::Src::R(accumulator));
+                  }
+                }
               }
-              a_.OpAdd(dxbc::Dest::R(samples + 2, used_result_nonzero_components),
-                  dxbc::Src::R(samples + 2), -dxbc::Src::R(samples));
-              a_.OpMAd(dxbc::Dest::R(layer_value_temp, used_result_nonzero_components),
-                  dxbc::Src::R(samples + 2), dxbc::Src::R(fraction, dxbc::Src::kYYYY),
-                  dxbc::Src::R(samples));
+              // Keep the original swizzle, sign interpretation and exponent
+              // adjustment below this block.
+              a_.OpMov(dxbc::Dest::R(layer_value_temp, used_result_nonzero_components),
+                  dxbc::Src::R(accumulator));
               a_.OpElse();
               if (grad_v_temp != UINT32_MAX) {
                 a_.OpSampleD(dxbc::Dest::R(layer_value_temp, used_result_nonzero_components),

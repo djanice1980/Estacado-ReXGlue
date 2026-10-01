@@ -90,6 +90,10 @@ class TextureCache {
                                      native_resolve::Rect& region_out,
                                      bool for_sampling = false);
   bool IsNativeResolveSamplingEnabled() const;
+  // Every tracked native rectangle of the texture bound to a fetch (newest
+  // first), or 0 when it is not an ordinary tiled scaled resolve texture.
+  size_t GetActiveNativeResolveRegions(uint32_t index, native_resolve::Rect* out,
+                                       size_t max_count);
   // Ensures the memory backing the range in the scaled resolve address space is
   // allocated and returns whether it is.
   virtual bool EnsureScaledResolveMemoryCommitted(uint32_t /*start_unscaled*/,

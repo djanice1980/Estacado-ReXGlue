@@ -86,6 +86,14 @@ class RegionMap {
     }
     out = {}; return false;
   }
+  // Every tracked rectangle of a layout, newest first (up to max_count).
+  size_t All(const Layout& layout, Rect* out, size_t max_count) const {
+    size_t n = 0;
+    for (size_t i = count_; i-- && n < max_count;) {
+      if (entries_[i].layout == layout) out[n++] = entries_[i].rect;
+    }
+    return n;
+  }
   // Returning a candidate is not permission to sample outside it: the shader
   // must check the complete bilinear footprint, not only the center coordinate.
   bool Latest(const Layout& layout, Rect& out) const {
