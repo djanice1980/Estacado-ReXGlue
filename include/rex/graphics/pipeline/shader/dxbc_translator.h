@@ -195,7 +195,9 @@ class DxbcShaderTranslator : public ShaderTranslator {
       // packs their absolute maxima plus the product maximum at the guest
       // color-export boundary.
       uint32_t texture_sample_diagnostic : 3;
-      // 0: ordinary sampling; 1..32: annotated native-grid filter fetch slot+1.
+      // 0: ordinary sampling; 1..32: annotated native-grid filter fetch slot+1
+      // (the primary rule; the variant reconstructs every 2D fetch, enabled
+      // per fetch at runtime by its native_texture_regions mode).
       // Part of translation/PSO identity; never reuse an ordinary cached PS.
       uint32_t native_filter_fetch : 6;
       uint32_t native_region_sampling : 1;
@@ -414,7 +416,12 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // Appended so all existing vertex/geometry constant offsets stay intact.
     // Guest-texel rectangle per fetch: minXY inclusive, maxXY exclusive.
     // Zero means unknown/ordinary sampling. Checked per complete footprint.
+    // In a native filter variant, x = -1 samples the fetch normally and
+    // x = -2 picks from native_filter_candidate_regions.
     float native_texture_regions[32][4];
+    // Native image rectangles (as above) a native filter fetch with region
+    // mode -2 picks from by containment; zero width means unused.
+    float native_filter_candidate_regions[4][4];
 
    private:
     friend class DxbcShaderTranslator;
@@ -469,6 +476,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
       kEdramBlendConstant,
 
       kNativeTextureRegions,
+      kNativeFilterCandidateRegions,
 
       kCount,
     };

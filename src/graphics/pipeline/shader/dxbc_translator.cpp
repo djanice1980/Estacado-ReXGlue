@@ -2054,6 +2054,8 @@ const DxbcShaderTranslator::SystemConstantRdef DxbcShaderTranslator::system_cons
 
     {"xe_edram_blend_constant", ShaderRdefTypeIndex::kFloat4, sizeof(float) * 4},
     {"xe_native_texture_regions", ShaderRdefTypeIndex::kFloat4Array32, sizeof(float) * 4 * 32},
+    {"xe_native_filter_candidate_regions", ShaderRdefTypeIndex::kFloat4Array4,
+     sizeof(float) * 4 * 4},
 };
 
 void DxbcShaderTranslator::WriteResourceDefinition() {

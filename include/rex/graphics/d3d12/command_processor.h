@@ -665,7 +665,17 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   std::unique_ptr<D3D12RenderTargetCache> render_target_cache_;
   render_target::native_shader_scale_policy::Rules native_shader_grid_rules_;
-  uint32_t native_shader_grid_logged_mask_ = 0;
+  uint64_t native_shader_grid_logged_mask_ = 0;  // two bits per rule (MSAA class)
+  // Footprint reconstruction per fetch for the current draw's matched image
+  // filter rules. A filter variant compiles the reconstruction for every 2D
+  // fetch; each one's region constant selects at runtime: kOff samples
+  // normally, kRegion bounds it to a :region= rectangle, kSourceNative picks
+  // the tracked native rectangle containing the sample (constants are written
+  // after the bindings update, so the tracker sees the bound texture).
+  enum class NativeFilterFetchMode : uint8_t { kOff, kUnbounded, kRegion, kSourceNative };
+  bool native_filter_active_ = false;
+  NativeFilterFetchMode native_filter_fetch_modes_[32] = {};
+  float native_filter_fetch_regions_[32][4] = {};
   embedded_target_writer_capture_policy::Config embedded_target_writer_config_;
   embedded_target_writer_capture_policy::State embedded_target_writer_state_;
   embedded_depth_resolve_capture_policy::State embedded_depth_resolve_capture_state_;

@@ -507,6 +507,22 @@ bool TextureCache::GetActiveNativeResolveRegion(
   return native_resolve_regions_.Latest(layout, out);
 }
 
+size_t TextureCache::GetActiveNativeResolveRegions(uint32_t index, native_resolve::Rect* out,
+                                                   size_t max_count) {
+  if (!IsDrawResolutionScaled() || !REXCVAR_GET(native_resolve_region_tracking)) return 0;
+  const auto* binding = GetValidTextureBinding(index);
+  if (!binding || !binding->texture) return 0;
+  const auto& key = binding->texture->key();
+  if (!key.scaled_resolve || !key.tiled || key.mip_max_level ||
+      key.depth_or_array_size_minus_1 || key.dimension != xenos::DataDimension::k2DOrStacked) return 0;
+  const auto& format = *FormatInfo::Get(key.format);
+  if (format.block_width != 1 || format.block_height != 1 || format.bits_per_pixel < 8) return 0;
+  const native_resolve::Layout layout{uint32_t(key.base_page) << 12, uint32_t(key.pitch) << 5,
+      uint32_t(key.format), uint32_t(key.endianness), rex::log2_floor(format.bits_per_pixel >> 3)};
+  auto lock = global_critical_region_.Acquire();
+  return native_resolve_regions_.All(layout, out, max_count);
+}
+
 void TextureCache::GetUnscaledResolvePageRanges(
     uint32_t start_unscaled, uint32_t length_unscaled,
     std::vector<std::pair<uint32_t, uint32_t>>& ranges_out) {

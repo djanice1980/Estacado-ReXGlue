@@ -5638,12 +5638,25 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                              : std::chrono::steady_clock::time_point{};
   bool native_shader_grid = false;
   uint32_t native_filter_fetch = 0;
+  native_filter_active_ = false;
+  std::fill(std::begin(native_filter_fetch_modes_), std::end(native_filter_fetch_modes_),
+            NativeFilterFetchMode::kOff);
   if (pixel_shader && render_target_cache_->IsDrawResolutionScaled() &&
       render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
+    // The first matching rule selects the shader variant and rasterization;
+    // later image filter rules of the same draw (other fetches, scaled output)
+    // only add their fetch's runtime footprint mode.
+    bool primary_matched = false;
+    bool candidates_used = false;
     for (uint32_t i = 0; i < native_shader_grid_rules_.count; ++i) {
       const auto& rule = native_shader_grid_rules_.entries[i];
       if (vertex_shader->ucode_data_hash() != rule.vertex_hash ||
           pixel_shader->ucode_data_hash() != rule.pixel_hash) continue;
+      if (primary_matched &&
+          (!native_filter_active_ || native_shader_grid || !rule.image_filter ||
+           !rule.scaled_filter_output ||
+           native_filter_fetch_modes_[rule.fetch] != NativeFilterFetchMode::kOff ||
+           (rule.native_source && candidates_used))) continue;
       const auto fetch = regs.GetTextureFetch(rule.fetch);
       if (fetch.type != xenos::FetchConstantType::kTexture ||
           !render_target::native_shader_scale_policy::Matches(
@@ -5666,23 +5679,46 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                     fetch.sign_w == xenos::TextureSign::kUnsigned,
                 fetch.clamp_x == xenos::ClampMode::kClampToEdge &&
                     fetch.clamp_y == xenos::ClampMode::kClampToEdge)) continue;
-        native_filter_fetch = rule.fetch + 1;
+        if (!primary_matched) {
+          native_filter_fetch = rule.fetch + 1;
+        }
+        native_filter_active_ = true;
+        float* region = native_filter_fetch_regions_[rule.fetch];
+        if (rule.native_source) {
+          native_filter_fetch_modes_[rule.fetch] = NativeFilterFetchMode::kSourceNative;
+          candidates_used = true;
+        } else if (rule.has_region) {
+          native_filter_fetch_modes_[rule.fetch] = NativeFilterFetchMode::kRegion;
+          region[0] = float(rule.region_left);
+          region[1] = float(rule.region_top);
+          region[2] = float(rule.region_right);
+          region[3] = float(rule.region_bottom);
+        } else {
+          native_filter_fetch_modes_[rule.fetch] = NativeFilterFetchMode::kUnbounded;
+        }
       }
-      native_shader_grid =
-          render_target::native_shader_scale_policy::RequiresNativeRasterization(rule);
-      if (!(native_shader_grid_logged_mask_ & (1u << i))) {
-        native_shader_grid_logged_mask_ |= 1u << i;
+      const uint32_t msaa_log2 = uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples);
+      if (!primary_matched) {
+        native_shader_grid =
+            render_target::native_shader_scale_policy::RequiresNativeRasterization(rule, msaa_log2);
+      }
+      // Logged once per rule and MSAA class (a 4x draw keeps a scaled output).
+      const uint64_t logged_bit = uint64_t(1) << (i * 2 + (msaa_log2 > 1 ? 1 : 0));
+      if (!(native_shader_grid_logged_mask_ & logged_bit)) {
+        native_shader_grid_logged_mask_ |= logged_bit;
         std::fprintf(stderr,
                      "REX_NATIVE_SHADER_GRID rule=%u vs=0x%016llX ps=0x%016llX "
-                     "fetch=%u logical=%ux%u format=%u result=%s image_filter=%u\n",
+                     "fetch=%u logical=%ux%u format=%u msaa=%ux result=%s image_filter=%u\n",
                      i, static_cast<unsigned long long>(rule.vertex_hash),
                      static_cast<unsigned long long>(rule.pixel_hash), rule.fetch,
-                     rule.width, rule.height, rule.format,
+                     rule.width, rule.height, rule.format, 1u << msaa_log2,
                      native_shader_grid ? "native_rasterization" : "scaled_filter_output",
                      rule.image_filter ? 1u : 0u);
         std::fflush(stderr);
       }
-      break;
+      primary_matched = true;
+      // A data rule (native rasterization of a table) takes no further rules.
+      if (!native_filter_active_) break;
     }
   }
   auto scene_update = embedded_scene_update_budget.Begin(
@@ -10692,8 +10728,47 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     if (native_regions_possible) {
       texture_cache_->GetActiveNativeResolveRegion(texture_index, native_region, true);
     }
-    const float region_constants[4] = {float(native_region.left), float(native_region.top),
+    float region_constants[4] = {float(native_region.left), float(native_region.top),
         float(native_region.right), float(native_region.bottom)};
+    // A filter variant reconstructs every 2D fetch unless its region x is -1;
+    // only the matched rules' fetches are enabled (see NativeFilterFetchMode).
+    if (native_filter_active_) {
+      region_constants[1] = region_constants[2] = region_constants[3] = 0.0f;
+      switch (native_filter_fetch_modes_[texture_index]) {
+        case NativeFilterFetchMode::kOff:
+          region_constants[0] = -1.0f;
+          break;
+        case NativeFilterFetchMode::kUnbounded:
+          region_constants[0] = 0.0f;
+          break;
+        case NativeFilterFetchMode::kRegion:
+          std::memcpy(region_constants, native_filter_fetch_regions_[texture_index],
+                      sizeof(region_constants));
+          break;
+        case NativeFilterFetchMode::kSourceNative: {
+          // Mode -2: the shader picks the tracked native rectangle containing
+          // each sample; -1: no tracked native content, it samples normally.
+          native_resolve::Rect tracked[4];
+          const size_t tracked_count =
+              texture_cache_->GetActiveNativeResolveRegions(texture_index, tracked, 4);
+          float candidates[4][4] = {};
+          for (size_t i = 0; i < tracked_count; ++i) {
+            candidates[i][0] = float(tracked[i].left);
+            candidates[i][1] = float(tracked[i].top);
+            candidates[i][2] = float(tracked[i].right);
+            candidates[i][3] = float(tracked[i].bottom);
+          }
+          if (std::memcmp(system_constants_.native_filter_candidate_regions, candidates,
+                          sizeof(candidates))) {
+            std::memcpy(system_constants_.native_filter_candidate_regions, candidates,
+                        sizeof(candidates));
+            dirty = true;
+          }
+          region_constants[0] = tracked_count ? -2.0f : -1.0f;
+          break;
+        }
+      }
+    }
     if (std::memcmp(system_constants_.native_texture_regions[texture_index], region_constants,
                     sizeof(region_constants))) {
       std::memcpy(system_constants_.native_texture_regions[texture_index], region_constants,
